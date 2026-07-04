@@ -1,0 +1,58 @@
+[package]
+name = "siphon-sigtran"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "SIGTRAN/SS7 runtime: M3UA/M2PA transport, MTP3 routing, SCCP GTT, content routing, MAP/CAP termination on the published SS7 codec crates"
+authors = ["SIPhon Contributors"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/siphon-project/siphon-sigtran"
+homepage = "https://github.com/siphon-project/siphon-sigtran"
+keywords = ["sigtran", "ss7", "m3ua", "sccp", "routing"]
+categories = ["network-programming"]
+publish = false
+# Keep CI/dev scaffolding out of any future crates.io package.
+exclude = [".github/", "docs/", "scripts/"]
+
+[dependencies]
+# ── SS7 codec crates (published on crates.io) ───────────────────────────────
+# Point codes + the MTP3-user SAP (routing label, availability events).
+mtp3 = "1"
+# M3UA (RFC 4666): IP adaptation of the MTP3-user service. Phase-2 transport.
+m3ua = "1"
+# M2PA (RFC 4165): MTP3 over SCTP. Phase-2 transport.
+m2pa = "1"
+# SCCP (Q.71x): global titles, addresses, UDT. Drives the GTT resolver.
+sccp = "1"
+# TCAP (Q.773): transactions + components. Decoded for content routing.
+tcap = "1"
+# GSM MAP (TS 29.002): operation codes + argument types (content routing view).
+gsm_map = "1"
+# CAMEL CAP (TS 29.078): operation codes (content routing view for SCP).
+gsm_cap = "1"
+# Async SCTP (lksctp wrapper). Pulled in now for the phase-2 transport traits.
+async-sctp = "1"
+
+# ── config + errors ─────────────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+
+# ── async runtime (phase-2 transport; the routing brain itself is sync) ──────
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
+
+[dev-dependencies]
+# ASN.1 BER: the tests assemble real MAP/CAP arguments the way ss7-stack does.
+rasn = "0.28"
+# criterion drives the routing-brain benches (benches/routing.rs).
+criterion = "0.8"
+
+[[bench]]
+name = "routing"
+harness = false
+
+[lints.clippy]
+# Bug-catching tier denied; style/dead-code stay at default warn (CI runs
+# `cargo clippy --all-targets` and honours these levels).
+correctness = { level = "deny", priority = -1 }

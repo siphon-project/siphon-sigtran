@@ -1,0 +1,381 @@
+//! The shared routing decision types and the top-level [`Router`] that ties
+//! MTP3 transfer + SCCP GTT + content routing into one inbound-message answer.
+//!
+//! # The decision flow
+//!
+//! For an inbound message addressed by DPC + SCCP:
+//!
+//! 1. **MTP3 transfer.** If the DPC is *not* one of our own point codes, the
+//!    message transits: hand it to the [route resolver](crate::mtp3::route) and
+//!    forward on the chosen linkset (or [`RouteDecision::Drop`] if no route).
+//! 2. **SCCP GTT.** If the DPC *is* ours, translate the called-party global
+//!    title (after the E.214→E.164 pre-step) via [GTT](crate::sccp::gtt). A
+//!    concrete `(dpc, ssn)` or group result routes onward; `Local` (or a called
+//!    SSN we own) terminates here.
+//! 3. **Content routing.** When a decoded MAP/CAP view is available, the
+//!    [content engine](crate::content) can override with a rule action (route,
+//!    rewrite, screen, or defer-to-Python), evaluated first, before GTT, since
+//!    it routes on the richer application layer.
+//!
+//! The router is **synchronous and allocation-light**, the line-rate guarantee.
+//! Anything dynamic (a Python hook) surfaces as [`RouteDecision::Python`] for the
+//! async layer above to resolve.
+
+use crate::content::{Action, MapView};
+use crate::sccp::gtt::{GttResult, GttSelector};
+use crate::tenant::{Tenancy, TenantRuntime};
+
+/// A resolved routing decision for one inbound message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteDecision {
+    /// Forward via the given linkset (MTP3 transfer to a non-local DPC).
+    Route {
+        /// The egress linkset.
+        linkset: String,
+    },
+    /// Forward to a concrete destination after SCCP/content translation.
+    RouteTo {
+        /// Destination point code (decimal, in the deciding tenant's variant).
+        dpc: u32,
+        /// Subsystem number.
+        ssn: u8,
+        /// The egress linkset the DPC resolves to (if a route exists).
+        linkset: Option<String>,
+    },
+    /// Terminate locally (we own the subsystem).
+    Local,
+    /// Hand off to another routing domain. Carries whether PC + GT conversion
+    /// applies (the two domains' variants differ).
+    CrossTenant {
+        /// The destination tenant.
+        tenant: String,
+        /// Destination point code within that tenant.
+        dpc: u32,
+        /// Subsystem number.
+        ssn: u8,
+        /// Whether variant conversion applies.
+        conversion: bool,
+    },
+    /// Defer to a named Python hook (phase-3): the async layer calls it.
+    Python {
+        /// The hook name.
+        hook: String,
+    },
+    /// Drop the message, with a reason.
+    Drop {
+        /// Why it was dropped (no-route, screened, no-translation, …).
+        reason: String,
+    },
+}
+
+/// An inbound message to route, decoded to the fields the router needs.
+///
+/// The transport layer (phase-2) fills this in from a real MSU; the integration
+/// tests fill it from genuinely-assembled SS7 bytes.
+#[derive(Debug, Clone, Default)]
+pub struct Inbound {
+    /// Destination point code value from the routing label / M3UA protocol data.
+    pub dpc: u32,
+    /// Called-party GT selector (for GTT), if the message routes on GT.
+    pub cdpa: Option<GttSelector>,
+    /// The called-party SSN, if present (route-on-SSN or GTT result SSN).
+    pub called_ssn: Option<u8>,
+    /// A decoded MAP/CAP view for content routing, if the layer was decoded.
+    pub view: Option<MapView>,
+}
+
+/// The top-level router. Holds the compiled [`Tenancy`] and resolves inbound
+/// messages against a chosen tenant.
+#[derive(Debug)]
+pub struct Router {
+    tenancy: Tenancy,
+}
+
+impl Router {
+    /// Build a router from a validated [`Config`](crate::config::Config).
+    pub fn new(config: &crate::config::Config) -> Self {
+        Self {
+            tenancy: Tenancy::build(config),
+        }
+    }
+
+    /// Build directly from a compiled [`Tenancy`].
+    pub fn from_tenancy(tenancy: Tenancy) -> Self {
+        Self { tenancy }
+    }
+
+    /// The compiled tenancy (read-only).
+    pub fn tenancy(&self) -> &Tenancy {
+        &self.tenancy
+    }
+
+    /// Mutable tenancy access, the transport layer feeds route-state events in.
+    pub fn tenancy_mut(&mut self) -> &mut Tenancy {
+        &mut self.tenancy
+    }
+
+    /// Route an inbound message within the implicit-default tenant.
+    pub fn route(&self, msg: &Inbound) -> RouteDecision {
+        self.route_in(crate::config::DEFAULT_TENANT, msg)
+    }
+
+    /// Route an inbound message within a named tenant.
+    pub fn route_in(&self, tenant: &str, msg: &Inbound) -> RouteDecision {
+        let Some(rt) = self.tenancy.get(tenant) else {
+            return RouteDecision::Drop {
+                reason: format!("unknown tenant `{tenant}`"),
+            };
+        };
+
+        // 1. MTP3 transfer: DPC is not one of our point codes → transit.
+        if msg.dpc != rt.point_code {
+            return match resolve_linkset(rt, msg.dpc) {
+                Some(linkset) => RouteDecision::Route { linkset },
+                None => RouteDecision::Drop {
+                    reason: format!("no MTP3 route to {}", msg.dpc),
+                },
+            };
+        }
+
+        // The DPC is ours → SCCP. If addressed by a local SSN we own and there's
+        // no GT to translate, terminate.
+        if let Some(ssn) = msg.called_ssn {
+            if rt.gtt.owns_ssn(ssn) && msg.cdpa.is_none() {
+                return RouteDecision::Local;
+            }
+        }
+
+        // 2. Content routing overrides GTT when a decoded view is present, it
+        //    routes on the richer application layer.
+        if let (Some(engine), Some(view)) = (rt.content.as_ref(), msg.view.as_ref()) {
+            if let Some(hit) = engine.evaluate(view) {
+                if let Some(decision) = self.decision_from_action(rt, hit.action, msg) {
+                    return decision;
+                }
+            }
+        }
+
+        // 3. SCCP GTT on the called-party GT (E.214 → E.164 pre-step first).
+        if let Some(sel) = &msg.cdpa {
+            let sel = self.pre_convert(rt, sel);
+            match rt.gtt.translate(&sel) {
+                Some(result) => return self.decision_from_gtt(rt, result),
+                None => {
+                    return RouteDecision::Drop {
+                        reason: "no GTT translation".into(),
+                    }
+                }
+            }
+        }
+
+        // Addressed to us by SSN we own but with no GT → local.
+        if let Some(ssn) = msg.called_ssn {
+            if rt.gtt.owns_ssn(ssn) {
+                return RouteDecision::Local;
+            }
+        }
+
+        RouteDecision::Drop {
+            reason: "no route-on-GT and no owned SSN".into(),
+        }
+    }
+
+    /// Apply the inbound E.214 → E.164 conversion pre-step to a called-party
+    /// selector (np 0x03 marks E.214). A no-op if the digits aren't a known MGT.
+    fn pre_convert(&self, rt: &TenantRuntime, sel: &GttSelector) -> GttSelector {
+        // np == 3 is E.214 (mobile global title); convert before lookup.
+        if sel.np == Some(3) {
+            if let Some(e164) = rt.converter.e214_to_e164(&sel.digits) {
+                let mut out = sel.clone();
+                out.digits = e164;
+                out.np = Some(1); // E.164
+                return out;
+            }
+        }
+        sel.clone()
+    }
+
+    fn decision_from_gtt(&self, rt: &TenantRuntime, result: GttResult) -> RouteDecision {
+        match result {
+            GttResult::Local => RouteDecision::Local,
+            GttResult::Dpc { dpc, ssn } => RouteDecision::RouteTo {
+                dpc,
+                ssn,
+                linkset: resolve_linkset(rt, dpc),
+            },
+            GttResult::Tenant { tenant, dpc, ssn } => {
+                let conversion = self
+                    .tenancy
+                    .cross_tenant(&rt.id, &tenant)
+                    .map(|x| x.conversion)
+                    .unwrap_or(false);
+                RouteDecision::CrossTenant {
+                    tenant,
+                    dpc,
+                    ssn,
+                    conversion,
+                }
+            }
+        }
+    }
+
+    fn decision_from_action(
+        &self,
+        rt: &TenantRuntime,
+        action: Action,
+        _msg: &Inbound,
+    ) -> Option<RouteDecision> {
+        match action {
+            Action::Screen => Some(RouteDecision::Drop {
+                reason: "screened by content rule".into(),
+            }),
+            Action::Python { hook } => Some(RouteDecision::Python { hook }),
+            Action::Route { target, .. } => {
+                // A content route target resolves through the same GTT machinery
+                // as a `to:` clause: dpc, group (cost primary / share cursor),
+                // local, or cross-tenant.
+                let result = rt.gtt.resolve_target(&target)?;
+                Some(self.decision_from_gtt(rt, result))
+            }
+        }
+    }
+}
+
+/// Resolve a DPC to an egress linkset within a tenant, honouring availability.
+fn resolve_linkset(rt: &TenantRuntime, dpc_value: u32) -> Option<String> {
+    let dpc = mtp3::PointCode::from_value(dpc_value, rt.variant).ok()?;
+    rt.routes.resolve(dpc, &rt.route_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn router() -> Router {
+        let cfg = Config::parse(crate::config::tests::SAMPLE).unwrap();
+        Router::new(&cfg)
+    }
+
+    #[test]
+    fn transit_dpc_routes_on_linkset() {
+        let r = router();
+        // 2000 is not our PC (1000) → MTP3 transfer to linkset hlr.
+        let d = r.route(&Inbound {
+            dpc: 2000,
+            ..Default::default()
+        });
+        assert_eq!(
+            d,
+            RouteDecision::Route {
+                linkset: "hlr".into()
+            }
+        );
+    }
+
+    #[test]
+    fn transit_no_route_drops() {
+        let r = router();
+        let d = r.route(&Inbound {
+            dpc: 9999,
+            ..Default::default()
+        });
+        assert!(matches!(d, RouteDecision::Drop { .. }));
+    }
+
+    #[test]
+    fn local_ssn_terminates() {
+        let r = router();
+        // Addressed to our PC (1000), SSN 6 (HLR, owned), no GT → local.
+        let d = r.route(&Inbound {
+            dpc: 1000,
+            called_ssn: Some(6),
+            ..Default::default()
+        });
+        assert_eq!(d, RouteDecision::Local);
+    }
+
+    #[test]
+    fn gtt_translates_to_dpc() {
+        let r = router();
+        // Our PC, route-on-GT, digits match the "1555" rule → dpc 2000 ssn 6.
+        let d = r.route(&Inbound {
+            dpc: 1000,
+            cdpa: Some(GttSelector::from_digits("15559999")),
+            ..Default::default()
+        });
+        match d {
+            RouteDecision::RouteTo { dpc, ssn, linkset } => {
+                assert_eq!(dpc, 2000);
+                assert_eq!(ssn, 6);
+                assert_eq!(linkset.as_deref(), Some("hlr"));
+            }
+            other => panic!("expected RouteTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn e214_pre_conversion_before_gtt() {
+        let r = router();
+        // E.214 MGT: 00101 + MSIN, np=3. Converts to 15551+MSIN, then the
+        // "155501" rule (gti/tt/np/nai) would need those fields; with only
+        // digits the "1555" fallback rule matches → dpc 2000.
+        let d = r.route(&Inbound {
+            dpc: 1000,
+            cdpa: Some(GttSelector {
+                digits: "0010123456".into(),
+                np: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        match d {
+            RouteDecision::RouteTo { dpc, .. } => assert_eq!(dpc, 2000),
+            other => panic!("expected RouteTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_rule_overrides_with_python() {
+        let r = router();
+        // Our PC, sri-sm with a non-home cdpa GT and no imsi → sri-sm-np python.
+        let d = r.route(&Inbound {
+            dpc: 1000,
+            cdpa: Some(GttSelector::from_digits("15559999")),
+            view: Some(MapView {
+                operation: Some(crate::content::Operation::SriSm),
+                cdpa_gt: Some("19990001".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            d,
+            RouteDecision::Python {
+                hook: "on_np_dip".into()
+            }
+        );
+    }
+
+    #[test]
+    fn content_rule_routes_to_dpc() {
+        let r = router();
+        // updateLocation for buyer-a IMSI → buyer-a-home route dpc 2005 ssn 6.
+        let d = r.route(&Inbound {
+            dpc: 1000,
+            view: Some(MapView {
+                operation: Some(crate::content::Operation::UpdateLocation),
+                imsi: Some("001010000000042".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        match d {
+            RouteDecision::RouteTo { dpc, ssn, .. } => {
+                assert_eq!(dpc, 2005);
+                assert_eq!(ssn, 6);
+            }
+            other => panic!("expected RouteTo, got {other:?}"),
+        }
+    }
+}

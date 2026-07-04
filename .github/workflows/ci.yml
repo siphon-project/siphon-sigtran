@@ -1,0 +1,48 @@
+# .github/workflows/ci.yml, siphon-sigtran CI (Rust).
+#
+# Phase 1 is pure Rust with no Python bindings yet, so this is a single Rust job:
+# format, lint (correctness denied via [lints.clippy] + -D warnings), test,
+# keep the benches compiling, and run the counting-allocator leak gate.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # async-sctp links against libsctp; install it so the dependency builds
+      # (the phase-1 routing brain doesn't use SCTP, but the crate depends on it).
+      - name: Install libsctp
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Benches compile
+        run: cargo bench --no-run
+
+      - name: Memory-leak check
+        run: cargo run --release --example leak_check

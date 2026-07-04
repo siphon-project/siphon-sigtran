@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local project context, not shipped.
+CLAUDE.md
+
+# criterion output
+/criterion
+
+# Note: Cargo.lock IS tracked (the release workflow runs `cargo publish --locked`).
