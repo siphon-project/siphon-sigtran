@@ -5,6 +5,49 @@ All notable changes are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the policy.
 
+## [0.2.0]
+
+Phase 2: a working SIGTRAN transport over real kernel SCTP under the phase-1
+routing brain. A [`Config`] now starts a running node that binds/connects every
+association, brings its adaptation layers up, and routes + forwards real traffic.
+
+### Added
+- **Transport plane** (`transport`): `TransportHandle::start` turns a validated
+  `Config` into a live node on `async-sctp`.
+  - **M3UA** (RFC 4666): the ASPSM/ASPTM handshake in both directions (ASP-UP/
+    -ACK, ASP-ACTIVE/-ACK honouring the AS traffic mode, ASP-INACTIVE/-DOWN,
+    BEAT/-ACK), DATA carriage, and SSNM (DUNA/DAVA to PAUSE/RESUME, DAUD answered
+    from live route state, SCON/DUPU noted) folded into the router.
+  - **M2PA** (RFC 4165): link alignment (Alignment/Proving/Ready) driving linkset
+    availability, then MTP3 MSUs in User Data.
+  - **Egress selection** (`transport::registry`): an AS spreads over its active
+    ASPs by traffic mode (load-share keyed on SLS, override, broadcast); an M2PA
+    linkset load-spreads across its in-service links. Live ASP/link state drives
+    route availability and failover to the next-priority route.
+- **SI-agnostic transfer**: the transfer path routes by point code for any
+  Service Indicator; a non-SCCP MSU (ISUP `SI=5`, network management, …) transits
+  natively with its payload untouched. Only an SCCP MSU addressed to us is decoded
+  further.
+- **Loop guards**: the transfer path drops-and-counts a looping MSU, own-opc
+  (the MSU's OPC is our own point code) and route-reflect (the resolved egress is
+  the association the MSU arrived on), each warn-logged with OPC/DPC context.
+- **`metrics`**: process-wide `sigtran_loops_detected_total{kind}` counters plus a
+  Prometheus text renderer.
+- **On-the-wire test harness** (`tests/wire.rs`): genuinely-assembled SS7 MSUs
+  (SRI-SM, updateLocation, MO/MT-ForwardSM, initialDP) driven over real SCTP
+  loopback through a running node, asserting transit forwarding, load-share
+  across an AS's ASPs, failover to an M2PA linkset on ASP drop, SI-agnostic
+  transfer, and both loop guards, with a tshark dissection gate over the
+  forwarded frames (skips gracefully without SCTP or tshark).
+
+### Still deferred
+- **Dialogue** (`dialogue`): the MAP/CAP dialogue-termination SAP is a trait
+  skeleton (phase-4); local-termination decisions are handed to it over the
+  transport's local-delivery channel, ready to wire.
+- **Python bindings** (pyo3): phase-3.
+- **`sua`** stays reserved: parsed and accepted, but starting a node with a `sua`
+  association returns a clear "not implemented".
+
 ## [0.1.0]
 
 First release. Phase 1: the pure-Rust routing brain (config loader + resolvers +
@@ -53,4 +96,5 @@ sccp, tcap, gsm_map, gsm_cap, async-sctp, m2pa). Synchronous, no I/O.
   `tests/routing.rs`.
 - **Python bindings** (pyo3): phase-3.
 
+[0.2.0]: https://github.com/siphon-project/siphon-sigtran/releases/tag/v0.2.0
 [0.1.0]: https://github.com/siphon-project/siphon-sigtran/releases/tag/v0.1.0

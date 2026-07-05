@@ -11,26 +11,28 @@
 //!   │  content routing        (routes/screens on the decoded MAP/CAP │  src/content.rs
 //!   │                          application layer)                    │
 //!   ├──────────────────────────────────────────────────────────────┤
-//!   │  MAP / CAP termination  (dialogue SAP, phase-2)              │  src/dialogue.rs
+//!   │  MAP / CAP termination  (dialogue SAP, phase-4)              │  src/dialogue.rs
 //!   │      gsm_map · gsm_cap                                         │
 //!   ├──────────────────────────────────────────────────────────────┤
 //!   │  TCAP  transactions + components            tcap              │
 //!   ├──────────────────────────────────────────────────────────────┤
 //!   │  SCCP  GTT + E.214/E.164 conversion         sccp             │  src/sccp/gtt.rs
 //!   ├──────────────────────────────────────────────────────────────┤
-//!   │  MTP3  route resolver (DPC to linkset)      mtp3             │  src/mtp3/route.rs
+//!   │  MTP3  route resolver (DPC to AS/linkset)   mtp3             │  src/mtp3/route.rs
 //!   ├──────────────────────────────────────────────────────────────┤
-//!   │  M3UA (RFC 4666)  ·  M2PA (RFC 4165)        m3ua · m2pa      │  src/transport (phase-2)
+//!   │  M3UA (RFC 4666)  ·  M2PA (RFC 4165)        m3ua · m2pa      │  src/transport
 //!   ├──────────────────────────────────────────────────────────────┤
-//!   │  SCTP  (Linux lksctp)                       async-sctp       │  (phase-2)
+//!   │  SCTP  (Linux lksctp)                       async-sctp       │  src/transport
 //!   └──────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! ## Phase 1 (this release): the routing brain
+//! ## The routing brain (phase 1)
 //!
 //! - [`config`]: the typed `sigtran.yaml` model, its serde, and validation.
 //! - [`point_code`]: decimal-first helpers over [`mtp3::PointCode`].
-//! - [`mtp3::route`]: the MTP3 route resolver and its availability state.
+//! - [`mtp3::route`]: the MTP3 route resolver, its availability state, and the
+//!   [`Destination`](mtp3::route::Destination) it resolves to (an M3UA
+//!   Application Server or an M2PA linkset).
 //! - [`sccp::gtt`]: the GTT resolver and the E.214/E.164 converter.
 //! - [`content`]: the content-routing engine over a decoded MAP/CAP view.
 //! - [`tenant`]: the tenancy model (implicit default).
@@ -41,14 +43,25 @@
 //! guarantee. It is unit- and integration-tested against genuinely assembled
 //! SS7 traffic.
 //!
-//! ## Phase 2 / 3 (stubs)
+//! ## The transport plane (phase 2, this release)
 //!
-//! - [`transport`]: the SCTP-backed M3UA/M2PA serving loop (trait shapes only).
-//! - [`dialogue`]: the MAP/CAP dialogue-termination SAP (trait shapes only).
-//! - Python bindings (pyo3) are phase-3. The plan is to expose the same routing
-//!   brain so a script can program the Rust tables live, defer a rule to a hook,
-//!   or take a selector-gated general override. That is the three-way override
-//!   from the spec.
+//! - [`transport`]: a working SIGTRAN transport over real kernel SCTP. It binds
+//!   / connects each association, runs the M3UA ASPSM/ASPTM handshake (so an AS
+//!   goes active) or the M2PA link alignment, translates SSNM into route-state
+//!   events, and routes + forwards inbound DATA through the [`Router`](routing::Router).
+//!   Transfer is Service-Indicator-agnostic (any non-SCCP MSU transits by DPC),
+//!   and two loop guards drop-and-count a message that looped. Start it with
+//!   [`TransportHandle::start`](transport::TransportHandle::start).
+//! - [`metrics`]: the process-wide counters the transport increments
+//!   (`sigtran_loops_detected_total`) plus a Prometheus text renderer.
+//!
+//! ## Later phases
+//!
+//! - [`dialogue`]: the MAP/CAP dialogue-termination SAP is still a trait skeleton
+//!   (phase-4). Local-termination decisions are handed to it over the transport's
+//!   local-delivery channel, ready to wire.
+//! - Python bindings (pyo3) are a later phase: expose the same routing brain so a
+//!   script can program the Rust tables live or defer a rule to a hook.
 //!
 //! ## Quickstart
 //!
@@ -77,6 +90,7 @@ pub mod config;
 pub mod content;
 pub mod dialogue;
 pub mod error;
+pub mod metrics;
 pub mod mtp3;
 pub mod point_code;
 pub mod routing;
@@ -86,4 +100,6 @@ pub mod transport;
 
 pub use config::Config;
 pub use error::{Error, Result};
+pub use mtp3::route::Destination;
 pub use routing::{RouteDecision, Router};
+pub use transport::{LocalDelivery, TransportHandle};

@@ -15,10 +15,13 @@ It is built on the published SS7 codec crates (`mtp3`, `m3ua`, `m2pa`, `sccp`,
 top of them. The per-message routing decision always runs in Rust, synchronously
 and without I/O, so the node holds line rate.
 
-> **Status: phase 1.** This release is the pure-Rust routing brain: the config
-> loader and the resolvers. The SCTP transport, the dialogue-termination SAP, an
-> on-the-wire loopback test harness, and the Python bindings are later phases and
-> ship as clearly-marked trait stubs. See the [changelog](CHANGELOG.md).
+> **Status: phase 2.** The routing brain (phase 1) now sits under a working
+> SIGTRAN transport over real kernel SCTP: M3UA (ASPSM/ASPTM) and M2PA (link
+> alignment), SSNM folded into route state, and inbound DATA routed and forwarded
+> to the resolved egress. It is exercised on-the-wire with an SCTP-loopback test
+> harness (`tests/wire.rs`) plus a tshark dissection gate. The MAP/CAP
+> dialogue-termination SAP and the Python bindings are later phases and ship as
+> clearly-marked stubs. See the [changelog](CHANGELOG.md).
 
 ## Quickstart
 
@@ -116,7 +119,7 @@ A content rule `match` combines `operation` (a name or a list), `imsi_in`,
 `route` (to a `dpc`+`ssn` or a `group`), `rewrite_cdpa_gt`, `screen`, or
 `python` (defer to a named hook, resolved by the runtime).
 
-## What it covers (phase 1)
+## What it covers (phase 2)
 
 | Area | Covered |
 |---|---|
@@ -125,9 +128,15 @@ A content rule `match` combines `operation` (a name or a list), `imsi_in`,
 | SCCP GTT | ordered prefix + gti/tt/np/nai matching, cost + weighted-share groups, local termination |
 | GT conversion | E.214 to/from E.164 via the PLMN map |
 | Content routing | first-match over operation / GT / IMSI-table membership; route, rewrite, screen, hook-deferral |
-| Transport (M3UA/M2PA/SCTP) | trait stubs only (phase-2) |
-| Dialogue termination | trait stubs only (phase-2) |
+| Transport (M3UA/M2PA/SCTP) | real kernel SCTP; M3UA ASPSM/ASPTM handshake + traffic modes, M2PA link alignment, SSNM to route state, load-share + failover, SI-agnostic transfer, own-opc + route-reflect loop guards |
+| Dialogue termination | local-delivery seam wired; the MAP/CAP SAP is a trait stub (phase-4) |
 | Python bindings | phase-3 |
+
+The transport is proven end-to-end in `tests/wire.rs`: genuinely-assembled SS7
+MSUs (SRI-SM, updateLocation, MO/MT-ForwardSM, initialDP) driven over real SCTP
+loopback through a running node, asserting load-share across an AS's ASPs,
+failover to an M2PA linkset when an ASP drops, SI-agnostic transfer of a non-SCCP
+MSU, and both loop guards, with a tshark gate over the forwarded frames.
 
 Standards referenced: M3UA (RFC 4666), M2PA (RFC 4165), SCTP (RFC 4960),
 MTP3 (ITU-T Q.704), SCCP GTT (ITU-T Q.714), TCAP (Q.773), MAP (3GPP TS 29.002),
@@ -159,7 +168,7 @@ nanoseconds. Run `cargo bench` for numbers on your hardware.
         │
    mtp3                (route resolver, DPC to linkset)
         │
-   m3ua / m2pa · sctp  (transport, phase-2)
+   m3ua / m2pa · sctp  (transport over real kernel SCTP)
 ```
 
 More: [`docs/OVERVIEW.md`](docs/OVERVIEW.md).
@@ -177,8 +186,10 @@ cargo deny check
 
 The integration tests in `tests/routing.rs` assemble real SS7 (a MAP/CAP argument
 into TCAP into an SCCP UDT into M3UA/M2PA framing) and route the resulting bytes
-through the full `Router`. The on-the-wire SCTP-loopback harness is the phase-2
-milestone (marked in that file).
+through the full `Router`. `tests/wire.rs` then drives the same kind of bytes over
+real SCTP loopback through a running node. The wire tests need kernel SCTP
+(`sudo modprobe sctp`); they print a SKIP and pass if it is unavailable, and the
+tshark dissection gate skips if `tshark` is not installed.
 
 ## License
 

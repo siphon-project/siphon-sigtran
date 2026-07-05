@@ -67,11 +67,12 @@ node: { point_code: 1000, variant: ITU, network_indicator: international }
 associations:
   - { id: hlr-a, adaptation: m3ua, role: server, addrs: [10.1.0.10], port: 2905 }
   - { id: xit-1, adaptation: m2pa, role: client, addrs: [10.0.1.1], port: 3565, adjacent_pc: 3000 }
+application_servers:
+  - { name: hlr, traffic_mode: loadshare, routing_context: 100, asps: [hlr-a] }
 linksets:
-  - { name: hlr,     adaptation: m3ua, traffic_mode: loadshare, links: [{assoc: hlr-a, slc: 0}] }
-  - { name: transit, adaptation: m2pa, traffic_mode: loadshare, links: [{assoc: xit-1, slc: 0}] }
+  - { name: transit, links: [{assoc: xit-1, slc: 0}] }
 mtp3_routes:
-  - { dpc: 2000, linkset: hlr,     priority: 1 }
+  - { dpc: 2000, as: hlr,          priority: 1 }
   - { dpc: 2000, linkset: transit, priority: 2 }
 sccp:
   local_ssns: [6, 8]

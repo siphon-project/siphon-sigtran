@@ -16,8 +16,8 @@
 //! the GTT lookup and the reverse outbound, purely from the `plmn_map`. It runs
 //! in Rust at line rate, no per-message hook.
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::{GroupMode, GtConversion, GttGroup, GttRule, RouteTarget, Sccp, TenantId};
 
@@ -77,8 +77,9 @@ struct GroupState {
     /// Members expanded for selection: `(dpc, ssn)` repeated per weight (share)
     /// or ordered by cost (cost).
     members: Vec<(u32, u8)>,
-    /// Round-robin cursor for share mode.
-    cursor: Cell<usize>,
+    /// Round-robin cursor for share mode. Atomic so a shared `Arc<Router>` can
+    /// advance it from concurrent transport tasks (`GttResolver` must be `Sync`).
+    cursor: AtomicUsize,
 }
 
 impl GroupState {
@@ -107,7 +108,7 @@ impl GroupState {
         Self {
             mode: group.mode,
             members,
-            cursor: Cell::new(0),
+            cursor: AtomicUsize::new(0),
         }
     }
 
@@ -120,9 +121,8 @@ impl GroupState {
         match self.mode {
             GroupMode::Cost => Some(self.members[0]),
             GroupMode::Share => {
-                let i = self.cursor.get() % self.members.len();
-                self.cursor.set(i + 1);
-                Some(self.members[i])
+                let n = self.cursor.fetch_add(1, Ordering::Relaxed);
+                Some(self.members[n % self.members.len()])
             }
         }
     }

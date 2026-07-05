@@ -88,6 +88,11 @@ pub enum Adaptation {
     M3ua,
     /// M2PA (RFC 4165), SCTP PPID 5.
     M2pa,
+    /// SUA (RFC 3868), SCTP PPID 4. **Reserved only** in this release: the
+    /// config accepts it so a plan can name it, but no SUA transport exists yet
+    /// (it needs a SUA codec crate that is not published). Starting a node with
+    /// a `sua` association returns a clear "not implemented" from the transport.
+    Sua,
 }
 
 /// Whether we open the SCTP association or accept it.
@@ -120,18 +125,36 @@ pub struct Association {
     pub adjacent_pc: Option<RawPc>,
 }
 
-// ── Linksets / Application Servers ──────────────────────────────────────────
+// ── Application Servers (M3UA) / Linksets (M2PA) ────────────────────────────
 
-/// M3UA traffic mode across the links of a linkset.
+/// M3UA traffic mode across the ASPs of an Application Server (RFC 4666 §1.4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrafficMode {
-    /// Share traffic across active links (SLS-keyed).
+    /// Share traffic across the active ASPs (SLS-keyed).
     Loadshare,
-    /// One active link; others stand by.
+    /// One active ASP; the others stand by.
     Override,
-    /// Send to every active link.
+    /// Send to every active ASP.
     Broadcast,
+}
+
+/// One `application_servers:` entry: an M3UA **Application Server** (RFC 4666).
+///
+/// An AS is a logical destination served by one or more **ASPs**. Each ASP is
+/// an M3UA association (referenced by id in [`asps`](ApplicationServer::asps)),
+/// and the per-ASP ASPSM/ASPTM state machine brings it up. The traffic mode is
+/// an AS property, not a per-ASP one.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApplicationServer {
+    /// AS name, referenced by `mtp3_routes` (`as:`).
+    pub name: String,
+    /// How traffic is spread over the AS's active ASPs.
+    pub traffic_mode: TrafficMode,
+    /// The Routing Context that identifies this AS in ASPAC/DATA (RFC 4666 §3.1).
+    pub routing_context: u32,
+    /// The member ASPs: association ids, each an m3ua association.
+    pub asps: Vec<String>,
 }
 
 /// A link within a linkset: an association bound to a signalling-link code.
@@ -143,28 +166,32 @@ pub struct Link {
     pub slc: u8,
 }
 
-/// One `linksets:` entry: an M3UA AS or an M2PA linkset.
+/// One `linksets:` entry: an **M2PA linkset** (RFC 4165). M2PA replaces MTP2, so
+/// the linkset/link model applies directly. There is no traffic mode: SLS spreads
+/// traffic across the in-service links, and each link's adjacent point code comes
+/// from its association's `adjacent_pc`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Linkset {
-    /// Linkset name, referenced by mtp3_routes and results.
+    /// Linkset name, referenced by `mtp3_routes` (`linkset:`).
     pub name: String,
-    /// The adaptation layer of its links.
-    pub adaptation: Adaptation,
-    /// How traffic is spread over the links.
-    pub traffic_mode: TrafficMode,
-    /// The member links.
+    /// The member links (each an m2pa association).
     pub links: Vec<Link>,
 }
 
 // ── MTP3 routes ─────────────────────────────────────────────────────────────
 
-/// One `mtp3_routes:` entry: a static route to a DPC via a linkset.
+/// One `mtp3_routes:` entry: a static route to a DPC via an Application Server
+/// (`as:`) **or** an M2PA linkset (`linkset:`). Exactly one of the two is set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Mtp3Route {
     /// Destination point code (decimal).
     pub dpc: RawPc,
-    /// The linkset to reach it.
-    pub linkset: String,
+    /// The M3UA Application Server to reach it, if this route targets an AS.
+    #[serde(default, rename = "as")]
+    pub as_: Option<String>,
+    /// The M2PA linkset to reach it, if this route targets a linkset.
+    #[serde(default)]
+    pub linkset: Option<String>,
     /// Priority, **1 = primary**, higher numbers are alternates.
     pub priority: u8,
 }
@@ -469,7 +496,10 @@ pub struct Tenant {
     /// Default network indicator.
     #[serde(default = "default_ni")]
     pub network_indicator: NetworkIndicator,
-    /// The tenant's linksets.
+    /// The tenant's M3UA Application Servers.
+    #[serde(default)]
+    pub application_servers: Vec<ApplicationServer>,
+    /// The tenant's M2PA linksets.
     #[serde(default)]
     pub linksets: Vec<Linkset>,
     /// The tenant's MTP3 route table.
@@ -498,6 +528,8 @@ struct RawFile {
     node: Option<Node>,
     #[serde(default)]
     associations: Vec<Association>,
+    #[serde(default)]
+    application_servers: Vec<ApplicationServer>,
     #[serde(default)]
     linksets: Vec<Linkset>,
     #[serde(default)]
@@ -556,14 +588,15 @@ impl Config {
                 }
                 // An explicit tenants map: the flat routing fields must not also
                 // be set (that would be ambiguous).
-                if !raw.linksets.is_empty()
+                if !raw.application_servers.is_empty()
+                    || !raw.linksets.is_empty()
                     || !raw.mtp3_routes.is_empty()
                     || raw.sccp.is_some()
                     || raw.content_routing.is_some()
                 {
                     return Err(Error::validation(
-                        "top-level routing fields (linksets/mtp3_routes/sccp/content_routing) \
-                         cannot be mixed with an explicit `tenants:` block",
+                        "top-level routing fields (application_servers/linksets/mtp3_routes/\
+                         sccp/content_routing) cannot be mixed with an explicit `tenants:` block",
                     ));
                 }
                 map
@@ -580,6 +613,7 @@ impl Config {
                         point_code: node.point_code,
                         variant: node.variant,
                         network_indicator: node.network_indicator,
+                        application_servers: raw.application_servers,
                         linksets: raw.linksets,
                         mtp3_routes: raw.mtp3_routes,
                         sccp: raw.sccp.unwrap_or_default(),
@@ -604,11 +638,6 @@ impl Config {
     /// The implicit-default tenant (present for a flat single-tenant file).
     pub fn default_tenant(&self) -> Option<&Tenant> {
         self.tenants.get(DEFAULT_TENANT)
-    }
-
-    /// The set of association ids (for link-reference validation).
-    fn association_ids(&self) -> BTreeSet<&str> {
-        self.associations.iter().map(|a| a.id.as_str()).collect()
     }
 
     /// Semantic validation across the whole config: point codes fit their
@@ -637,10 +666,14 @@ impl Config {
             }
         }
 
-        let assoc_ids = self.association_ids();
+        let assoc_adapt: BTreeMap<&str, Adaptation> = self
+            .associations
+            .iter()
+            .map(|a| (a.id.as_str(), a.adaptation))
+            .collect();
 
         for (tid, tenant) in &self.tenants {
-            self.validate_tenant(tid, tenant, &assoc_ids)?;
+            self.validate_tenant(tid, tenant, &assoc_adapt)?;
         }
         Ok(())
     }
@@ -649,7 +682,7 @@ impl Config {
         &self,
         tid: &str,
         tenant: &Tenant,
-        assoc_ids: &BTreeSet<&str>,
+        assoc_adapt: &BTreeMap<&str, Adaptation>,
     ) -> Result<()> {
         let where_ = |msg: String| Error::validation(format!("tenant `{tid}`: {msg}"));
 
@@ -658,35 +691,115 @@ impl Config {
             .resolved_point_code()
             .map_err(|e| where_(format!("point_code: {e}")))?;
 
-        // Linkset names unique; links reference known associations.
-        let mut linkset_names = BTreeSet::new();
-        for ls in &tenant.linksets {
-            if !linkset_names.insert(ls.name.as_str()) {
-                return Err(where_(format!("duplicate linkset `{}`", ls.name)));
+        // Route-destination names live in one namespace across Application
+        // Servers and linksets, so `mtp3_routes` can reference either and a name
+        // never resolves two ways.
+        let mut dest_names = BTreeSet::new();
+
+        // Application Servers: names unique; each ASP is a known m3ua association.
+        let mut as_names = BTreeSet::new();
+        for a in &tenant.application_servers {
+            if !dest_names.insert(a.name.as_str()) {
+                return Err(where_(format!("duplicate route destination `{}`", a.name)));
             }
-            if ls.links.is_empty() {
-                return Err(where_(format!("linkset `{}` has no links", ls.name)));
+            as_names.insert(a.name.as_str());
+            if a.asps.is_empty() {
+                return Err(where_(format!(
+                    "application_server `{}` has no asps",
+                    a.name
+                )));
             }
-            for link in &ls.links {
-                if !assoc_ids.contains(link.assoc.as_str()) {
-                    return Err(where_(format!(
-                        "linkset `{}` references unknown association `{}`",
-                        ls.name, link.assoc
-                    )));
+            for asp in &a.asps {
+                match assoc_adapt.get(asp.as_str()) {
+                    None => {
+                        return Err(where_(format!(
+                            "application_server `{}` references unknown association `{}`",
+                            a.name, asp
+                        )))
+                    }
+                    Some(Adaptation::M3ua) => {}
+                    Some(other) => {
+                        return Err(where_(format!(
+                            "application_server `{}` asp `{}` is a {other:?} association, \
+                             an AS is served by m3ua ASPs",
+                            a.name, asp
+                        )))
+                    }
                 }
             }
         }
 
-        // MTP3 routes: dpc fits, linkset exists.
+        // Linksets: names unique (across the AS namespace too); each link is a
+        // known m2pa association.
+        let mut linkset_names = BTreeSet::new();
+        for ls in &tenant.linksets {
+            if !dest_names.insert(ls.name.as_str()) {
+                let kind = if as_names.contains(ls.name.as_str()) {
+                    "collides with application_server"
+                } else {
+                    "duplicate route destination"
+                };
+                return Err(where_(format!("{kind} `{}`", ls.name)));
+            }
+            linkset_names.insert(ls.name.as_str());
+            if ls.links.is_empty() {
+                return Err(where_(format!("linkset `{}` has no links", ls.name)));
+            }
+            for link in &ls.links {
+                match assoc_adapt.get(link.assoc.as_str()) {
+                    None => {
+                        return Err(where_(format!(
+                            "linkset `{}` references unknown association `{}`",
+                            ls.name, link.assoc
+                        )))
+                    }
+                    Some(Adaptation::M2pa) => {}
+                    Some(other) => {
+                        return Err(where_(format!(
+                            "linkset `{}` link `{}` is a {other:?} association, \
+                             a linkset carries m2pa links",
+                            ls.name, link.assoc
+                        )))
+                    }
+                }
+            }
+        }
+
+        // MTP3 routes: dpc fits, exactly one of `as:`/`linkset:` set, and the
+        // named destination exists.
         for r in &tenant.mtp3_routes {
             r.dpc
                 .resolve(tenant.variant)
                 .map_err(|e| where_(format!("mtp3_route dpc: {e}")))?;
-            if !linkset_names.contains(r.linkset.as_str()) {
-                return Err(where_(format!(
-                    "mtp3_route to {} references unknown linkset `{}`",
-                    r.dpc.0, r.linkset
-                )));
+            match (&r.as_, &r.linkset) {
+                (Some(a), None) => {
+                    if !as_names.contains(a.as_str()) {
+                        return Err(where_(format!(
+                            "mtp3_route to {} references unknown application_server `{}`",
+                            r.dpc.0, a
+                        )));
+                    }
+                }
+                (None, Some(l)) => {
+                    if !linkset_names.contains(l.as_str()) {
+                        return Err(where_(format!(
+                            "mtp3_route to {} references unknown linkset `{}`",
+                            r.dpc.0, l
+                        )));
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    return Err(where_(format!(
+                        "mtp3_route to {} sets both `as:` and `linkset:` (pick one)",
+                        r.dpc.0
+                    )));
+                }
+                (None, None) => {
+                    return Err(where_(format!(
+                        "mtp3_route to {} sets neither `as:` nor `linkset:`",
+                        r.dpc.0
+                    )));
+                }
             }
         }
 
@@ -828,15 +941,17 @@ associations:
   - { id: xit-1, adaptation: m2pa, role: client, addrs: [10.0.1.1], port: 3565, adjacent_pc: 3000 }
   - { id: xit-2, adaptation: m2pa, role: client, addrs: [10.0.1.2], port: 3565, adjacent_pc: 3001 }
 
+application_servers:
+  - { name: hlr, traffic_mode: loadshare, routing_context: 100, asps: [hlr-a, hlr-b] }
+  - { name: msc, traffic_mode: override,  routing_context: 101, asps: [msc] }
+
 linksets:
-  - { name: hlr,     adaptation: m3ua, traffic_mode: loadshare, links: [{assoc: hlr-a, slc: 0}, {assoc: hlr-b, slc: 1}] }
-  - { name: msc,     adaptation: m3ua, traffic_mode: override,  links: [{assoc: msc, slc: 0}] }
-  - { name: transit, adaptation: m2pa, traffic_mode: loadshare, links: [{assoc: xit-1, slc: 0}, {assoc: xit-2, slc: 1}] }
+  - { name: transit, links: [{assoc: xit-1, slc: 0}, {assoc: xit-2, slc: 1}] }
 
 mtp3_routes:
-  - { dpc: 2000, linkset: hlr,     priority: 1 }
+  - { dpc: 2000, as: hlr,          priority: 1 }
   - { dpc: 2000, linkset: transit, priority: 2 }
-  - { dpc: 2002, linkset: msc,     priority: 1 }
+  - { dpc: 2002, as: msc,          priority: 1 }
 
 sccp:
   local_ssns: [6, 8]
@@ -883,7 +998,8 @@ content_routing:
         // Implicit default tenant present.
         let t = cfg.default_tenant().expect("default tenant");
         assert_eq!(t.resolved_point_code().unwrap().value(), 1000);
-        assert_eq!(t.linksets.len(), 3);
+        assert_eq!(t.application_servers.len(), 2);
+        assert_eq!(t.linksets.len(), 1);
         assert_eq!(t.mtp3_routes.len(), 3);
         assert_eq!(t.sccp.gtt_groups.len(), 2);
         assert_eq!(t.sccp.gtt.len(), 2);
@@ -909,17 +1025,17 @@ tenants:
   default:
     point_code: 1000
     variant: ITU
-    linksets:
-      - { name: ls, adaptation: m3ua, traffic_mode: override, links: [{assoc: a1, slc: 0}] }
+    application_servers:
+      - { name: as1, traffic_mode: override, routing_context: 10, asps: [a1] }
     mtp3_routes:
-      - { dpc: 2000, linkset: ls, priority: 1 }
+      - { dpc: 2000, as: as1, priority: 1 }
   partner-ansi:
     point_code: 5000
     variant: ANSI
-    linksets:
-      - { name: ls, adaptation: m3ua, traffic_mode: override, links: [{assoc: a1, slc: 0}] }
+    application_servers:
+      - { name: as1, traffic_mode: override, routing_context: 20, asps: [a1] }
     mtp3_routes:
-      - { dpc: 6000, linkset: ls, priority: 1 }
+      - { dpc: 6000, as: as1, priority: 1 }
 "#;
         let cfg = Config::parse(yaml).unwrap();
         assert_eq!(cfg.tenants.len(), 2);
@@ -955,9 +1071,9 @@ tenants:
         let yaml = r#"
 node: { point_code: 1000, variant: ITU }
 associations:
-  - { id: a1, adaptation: m3ua, role: server, addrs: [10.0.0.1], port: 2905 }
+  - { id: x1, adaptation: m2pa, role: client, addrs: [10.0.0.1], port: 3565, adjacent_pc: 3000 }
 linksets:
-  - { name: ls, adaptation: m3ua, traffic_mode: override, links: [{assoc: a1, slc: 0}] }
+  - { name: ls, links: [{assoc: x1, slc: 0}] }
 mtp3_routes:
   - { dpc: 2000, linkset: nope, priority: 1 }
 "#;
@@ -967,13 +1083,96 @@ mtp3_routes:
     }
 
     #[test]
-    fn rejects_unknown_association_ref() {
+    fn rejects_unknown_as_ref() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: a1, adaptation: m3ua, role: server, addrs: [10.0.0.1], port: 2905 }
+application_servers:
+  - { name: as1, traffic_mode: override, routing_context: 1, asps: [a1] }
+mtp3_routes:
+  - { dpc: 2000, as: nope, priority: 1 }
+"#;
+        let err = Config::parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("unknown application_server"));
+    }
+
+    #[test]
+    fn rejects_route_with_both_as_and_linkset() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: a1, adaptation: m3ua, role: server, addrs: [10.0.0.1], port: 2905 }
+  - { id: x1, adaptation: m2pa, role: client, addrs: [10.0.0.2], port: 3565, adjacent_pc: 3000 }
+application_servers:
+  - { name: as1, traffic_mode: override, routing_context: 1, asps: [a1] }
+linksets:
+  - { name: ls, links: [{assoc: x1, slc: 0}] }
+mtp3_routes:
+  - { dpc: 2000, as: as1, linkset: ls, priority: 1 }
+"#;
+        let err = Config::parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("both `as:` and `linkset:`"));
+    }
+
+    #[test]
+    fn rejects_route_with_neither_as_nor_linkset() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations: []
+mtp3_routes:
+  - { dpc: 2000, priority: 1 }
+"#;
+        let err = Config::parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("neither `as:` nor `linkset:`"));
+    }
+
+    #[test]
+    fn rejects_as_asp_that_is_not_m3ua() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: x1, adaptation: m2pa, role: client, addrs: [10.0.0.1], port: 3565, adjacent_pc: 3000 }
+application_servers:
+  - { name: as1, traffic_mode: override, routing_context: 1, asps: [x1] }
+"#;
+        let err = Config::parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("served by m3ua ASPs"));
+    }
+
+    #[test]
+    fn rejects_linkset_link_that_is_not_m2pa() {
         let yaml = r#"
 node: { point_code: 1000, variant: ITU }
 associations:
   - { id: a1, adaptation: m3ua, role: server, addrs: [10.0.0.1], port: 2905 }
 linksets:
-  - { name: ls, adaptation: m3ua, traffic_mode: override, links: [{assoc: ghost, slc: 0}] }
+  - { name: ls, links: [{assoc: a1, slc: 0}] }
+"#;
+        let err = Config::parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("carries m2pa links"));
+    }
+
+    #[test]
+    fn accepts_reserved_sua_association() {
+        // `sua` is reserved: parse/validate accept it (the transport rejects it
+        // at start). An unreferenced sua association is fine on its own.
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: s1, adaptation: sua, role: client, addrs: [10.0.0.1], port: 14001 }
+"#;
+        assert!(Config::parse(yaml).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_association_ref() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: x1, adaptation: m2pa, role: client, addrs: [10.0.0.1], port: 3565, adjacent_pc: 3000 }
+linksets:
+  - { name: ls, links: [{assoc: ghost, slc: 0}] }
 "#;
         let err = Config::parse(yaml).unwrap_err();
         assert!(err.to_string().contains("unknown association"));
@@ -984,13 +1183,13 @@ linksets:
         let yaml = r#"
 node: { point_code: 1000, variant: ITU }
 associations:
-  - { id: a1, adaptation: m3ua, role: server, addrs: [10.0.0.1], port: 2905 }
+  - { id: x1, adaptation: m2pa, role: client, addrs: [10.0.0.1], port: 3565, adjacent_pc: 3000 }
 linksets:
-  - { name: ls, adaptation: m3ua, traffic_mode: override, links: [{assoc: a1, slc: 0}] }
-  - { name: ls, adaptation: m3ua, traffic_mode: override, links: [{assoc: a1, slc: 1}] }
+  - { name: ls, links: [{assoc: x1, slc: 0}] }
+  - { name: ls, links: [{assoc: x1, slc: 1}] }
 "#;
         let err = Config::parse(yaml).unwrap_err();
-        assert!(err.to_string().contains("duplicate linkset"));
+        assert!(err.to_string().contains("duplicate route destination"));
     }
 
     #[test]

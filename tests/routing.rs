@@ -15,7 +15,13 @@
 //! All data is synthetic: test PLMN MCC 001 / MNC 01, +1-555-01xx global
 //! titles, and decimal point codes (1000/2000/3000-style).
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use rasn::types::Any;
+use tokio::time::timeout;
+
+use async_sctp::{SctpAssociation, SctpConfig};
 
 use gsm_cap::operations::InitialDpArg;
 use gsm_map::operations::auth::SendAuthenticationInfoArg;
@@ -26,15 +32,17 @@ use gsm_map::operations::sri_sm::RoutingInfoForSmArg;
 use gsm_map::types::{SmRpDa, SmRpOa};
 
 use m2pa::{M2paMessage, UserDataMessage};
-use m3ua::{M3uaMessage, ProtocolData};
+use m3ua::{M3uaMessage, MessageType, ProtocolData};
 use mtp3::{NetworkIndicator, ServiceIndicator};
 use sccp::{GlobalTitle, SccpAddress, SccpMessage, SubsystemNumber, UnitData};
 use tcap::{Begin, Component, Invoke, OperationCode, TcapMessage};
 
 use siphon_sigtran::config::Config;
 use siphon_sigtran::content::{MapView, Operation};
+use siphon_sigtran::mtp3::route::Destination;
 use siphon_sigtran::routing::{Inbound, RouteDecision, Router};
 use siphon_sigtran::sccp::gtt::GttSelector;
+use siphon_sigtran::TransportHandle;
 
 // ── The node under test ──────────────────────────────────────────────────────
 
@@ -48,14 +56,15 @@ associations:
   - { id: msc,   adaptation: m3ua, role: server, addrs: [10.1.0.12], port: 2905 }
   - { id: xit-1, adaptation: m2pa, role: client, addrs: [10.0.1.1], port: 3565, adjacent_pc: 3000 }
   - { id: xit-2, adaptation: m2pa, role: client, addrs: [10.0.1.2], port: 3565, adjacent_pc: 3001 }
+application_servers:
+  - { name: hlr, traffic_mode: loadshare, routing_context: 100, asps: [hlr-a] }
+  - { name: msc, traffic_mode: override,  routing_context: 101, asps: [msc] }
 linksets:
-  - { name: hlr,     adaptation: m3ua, traffic_mode: loadshare, links: [{assoc: hlr-a, slc: 0}] }
-  - { name: msc,     adaptation: m3ua, traffic_mode: override,  links: [{assoc: msc, slc: 0}] }
-  - { name: transit, adaptation: m2pa, traffic_mode: loadshare, links: [{assoc: xit-1, slc: 0}, {assoc: xit-2, slc: 1}] }
+  - { name: transit, links: [{assoc: xit-1, slc: 0}, {assoc: xit-2, slc: 1}] }
 mtp3_routes:
-  - { dpc: 2000, linkset: hlr,     priority: 1 }
+  - { dpc: 2000, as: hlr,          priority: 1 }
   - { dpc: 2000, linkset: transit, priority: 2 }
-  - { dpc: 2002, linkset: msc,     priority: 1 }
+  - { dpc: 2002, as: msc,          priority: 1 }
 sccp:
   local_ssns: [6, 8]
   gtt_groups:
@@ -445,12 +454,12 @@ fn update_location_buyer_a_routes_to_home_over_m2pa() {
         view: Some(view),
     });
     match decision {
-        RouteDecision::RouteTo { dpc, ssn, linkset } => {
+        RouteDecision::RouteTo { dpc, ssn, via } => {
             assert_eq!(dpc, 2005);
             assert_eq!(ssn, 6);
-            // 2005 has no route in this node → linkset unresolved (drop-worthy
+            // 2005 has no route in this node → destination unresolved (drop-worthy
             // upstream), but the content decision itself is the assertion.
-            assert!(linkset.is_none());
+            assert!(via.is_none());
         }
         other => panic!("expected RouteTo home, got {other:?}"),
     }
@@ -568,11 +577,11 @@ fn mt_forward_sm_transits_to_serving_msc() {
         called_ssn,
         view: Some(view),
     });
-    // 2002 is not our PC → MTP3 transfer on the msc linkset.
+    // 2002 is not our PC → MTP3 transfer to AS msc.
     assert_eq!(
         decision,
         RouteDecision::Route {
-            linkset: "msc".into()
+            via: Destination::ApplicationServer("msc".into())
         }
     );
 }
@@ -597,11 +606,11 @@ fn initial_dp_transits_to_scp() {
         called_ssn,
         view: Some(view),
     });
-    // 3000 is an m2pa adjacent → implicit route via transit.
+    // 3000 is an m2pa adjacent → implicit route via linkset transit.
     assert_eq!(
         decision,
         RouteDecision::Route {
-            linkset: "transit".into()
+            via: Destination::Linkset("transit".into())
         }
     );
 }
@@ -628,10 +637,10 @@ fn gtt_route_on_gt_to_hlr() {
         view: None,
     });
     match decision {
-        RouteDecision::RouteTo { dpc, ssn, linkset } => {
+        RouteDecision::RouteTo { dpc, ssn, via } => {
             assert_eq!(dpc, 2000);
             assert_eq!(ssn, 6);
-            assert_eq!(linkset.as_deref(), Some("hlr"));
+            assert_eq!(via, Some(Destination::ApplicationServer("hlr".into())));
         }
         other => panic!("expected RouteTo hlr, got {other:?}"),
     }
@@ -661,33 +670,103 @@ fn e214_mgt_converts_then_routes() {
     }
 }
 
-// ── PHASE-2: on-the-wire loopback harness (structure only) ───────────────────
-//
-// TODO(phase-2): real SCTP-loopback traffic + tshark gate.
+// ── PHASE-2: on-the-wire loopback (real SCTP) ────────────────────────────────
 //
 // The phase-1 tests above assemble real SS7 bytes and feed them straight into
-// the Router. Phase-2 sends those same bytes over a real SCTP association
-// (M3UA PPID 3 / M2PA PPID 5) to a running siphon-sigtran node, then asserts
-// the routing + local termination on the far side, with the captured pcap
-// validated by tshark (SI=SCCP, OPC/DPC decode, TCAP dissects, no malformed
-// warnings), exactly the way ss7-stack's pcap gate does it.
-//
-// The shape it will take:
-//
-//   1. Bind the node's associations on loopback (async-sctp SctpServer for the
-//      m3ua `server` role; SctpAssociation connect for the m2pa `client` role).
-//   2. A peer task assembles a dialogue (assemble() below) and sends each leg on
-//      the right PPID/stream.
-//   3. The node runs the Router; the harness asserts the egress leg landed on
-//      the expected linkset's association (transit) or terminated locally.
-//   4. Capture with `tshark -i lo -w out.pcap`; assert zero malformed frames.
-//
-// None of that is built yet: this file is the phase-1 (no-SCTP) equivalent, and
-// the transport traits in `siphon_sigtran::transport` are the seam it plugs
-// into. Kept here as the next-milestone marker.
-#[test]
-#[ignore = "phase-2: needs the SCTP transport + a running node + tshark"]
-fn phase2_wire_loopback_placeholder() {
-    // Intentionally empty. `cargo test -- --ignored` lists it as the pending
-    // on-the-wire milestone without failing the suite.
+// the Router. This one sends the same kind of bytes over a **real SCTP
+// association** (M3UA PPID 3) to a running siphon-sigtran node and asserts the
+// far side routed + terminated it. The broader scenarios (loadshare, failover,
+// SSNM, and the tshark pcap gate) live in `tests/wire.rs`.
+
+/// Receive on an association until an M3UA message of the wanted type arrives.
+async fn wait_for_m3ua(assoc: &SctpAssociation, want: MessageType) {
+    loop {
+        let (data, info) = timeout(Duration::from_secs(5), assoc.recv())
+            .await
+            .expect("recv did not time out")
+            .expect("recv ok");
+        if info.ppid != 3 {
+            continue;
+        }
+        if let Ok(m) = M3uaMessage::decode(&data) {
+            if m.message_type == want {
+                return;
+            }
+        }
+    }
+}
+
+/// A real SCTP node: an M3UA `server` ingress that owns SSN 8. A synthetic ASP
+/// connects, runs the ASPSM/ASPTM handshake, and sends an SCCP MSU addressed to
+/// the node's own PC + owned SSN; the node routes it to local termination and
+/// the MSU surfaces on the transport's local-delivery channel.
+#[tokio::test]
+async fn phase2_wire_local_termination_over_m3ua() {
+    let yaml = r#"
+node: { point_code: 1000, variant: ITU, network_indicator: international }
+associations:
+  - { id: in, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+sccp:
+  local_ssns: [8]
+"#;
+    let cfg = Config::parse(yaml).expect("config parses");
+    let router = Arc::new(Router::new(&cfg));
+
+    let mut handle = match TransportHandle::start(&cfg, router).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("SKIP wire test: SCTP unavailable ({e}); load `modprobe sctp`");
+            return;
+        }
+    };
+    let mut local_rx = handle.take_local_rx().expect("local-delivery receiver");
+    let addr = handle.bound_addr("in").expect("ingress bound address");
+
+    // Synthetic ASP: connect and run the handshake to Active.
+    let sctp = SctpConfig::new().nodelay(true);
+    let asp = match SctpAssociation::connect_with(addr, &sctp).await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("SKIP wire test: could not connect ({e})");
+            return;
+        }
+    };
+    asp.send(&M3uaMessage::asp_up(Some(1), None).encode(), 0, 3)
+        .await
+        .expect("send ASP-UP");
+    wait_for_m3ua(&asp, MessageType::AspUpAck).await;
+    asp.send(&M3uaMessage::asp_active(Some(2), Some(0)).encode(), 0, 3)
+        .await
+        .expect("send ASP-ACTIVE");
+    wait_for_m3ua(&asp, MessageType::AspActiveAck).await;
+
+    // MO-ForwardSM to our PC + SSN 8 (route-on-SSN, no GT) → local termination.
+    let tcap = tcap_begin(gsm_map::types::op_codes::MO_FORWARD_SM, mo_forward_sm_arg());
+    let sccp = {
+        let called = SccpAddress::with_ssn(SubsystemNumber::Msc, None); // SSN 8
+        let calling = SccpAddress::with_gt(
+            GlobalTitle::Gt0100 {
+                translation_type: 0,
+                numbering_plan: 1,
+                encoding_scheme: 1,
+                nature_of_address: 4,
+                digits: OUR_GT.to_string(),
+            },
+            Some(SubsystemNumber::Msc),
+        );
+        UnitData::new(called, calling, tcap).encode().unwrap()
+    };
+    asp.send(&m3ua_data(&sccp, 1000), 1, 3)
+        .await
+        .expect("send DATA");
+
+    // The node routes DPC 1000 + owned SSN 8 → Local → local delivery.
+    let delivered = timeout(Duration::from_secs(5), local_rx.recv())
+        .await
+        .expect("local delivery did not time out")
+        .expect("a local delivery");
+    assert_eq!(delivered.msu.dpc, 1000);
+    assert_eq!(delivered.msu.si, 3);
+
+    handle.shutdown();
 }

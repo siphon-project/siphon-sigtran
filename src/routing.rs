@@ -22,16 +22,18 @@
 //! async layer above to resolve.
 
 use crate::content::{Action, MapView};
+use crate::mtp3::route::Destination;
 use crate::sccp::gtt::{GttResult, GttSelector};
 use crate::tenant::{Tenancy, TenantRuntime};
 
 /// A resolved routing decision for one inbound message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteDecision {
-    /// Forward via the given linkset (MTP3 transfer to a non-local DPC).
+    /// Forward via the given egress destination (MTP3 transfer to a non-local
+    /// DPC): an M3UA Application Server or an M2PA linkset.
     Route {
-        /// The egress linkset.
-        linkset: String,
+        /// The egress destination.
+        via: Destination,
     },
     /// Forward to a concrete destination after SCCP/content translation.
     RouteTo {
@@ -39,8 +41,8 @@ pub enum RouteDecision {
         dpc: u32,
         /// Subsystem number.
         ssn: u8,
-        /// The egress linkset the DPC resolves to (if a route exists).
-        linkset: Option<String>,
+        /// The egress destination the DPC resolves to (if a route exists).
+        via: Option<Destination>,
     },
     /// Terminate locally (we own the subsystem).
     Local,
@@ -114,6 +116,71 @@ impl Router {
         &mut self.tenancy
     }
 
+    // ── Live availability seam (the async transport drives these) ────────────
+    //
+    // The route state is interior-mutable (RwLock), so a *shared* `Arc<Router>`
+    // can both route (read) and fold in ASP / link / SSNM changes (write). All
+    // of these no-op on an unknown tenant.
+
+    /// Mark an Application Server up (≥ 1 of its ASPs reached ASP-Active).
+    pub fn note_as_up(&self, tenant: &str, name: &str) {
+        if let Some(rt) = self.tenancy.get(tenant) {
+            rt.state_write().set_as_up(name);
+        }
+    }
+
+    /// Mark an Application Server down (no ASP active).
+    pub fn note_as_down(&self, tenant: &str, name: &str) {
+        if let Some(rt) = self.tenancy.get(tenant) {
+            rt.state_write().set_as_down(name);
+        }
+    }
+
+    /// Mark an M2PA linkset up (≥ 1 link in service).
+    pub fn note_linkset_up(&self, tenant: &str, name: &str) {
+        if let Some(rt) = self.tenancy.get(tenant) {
+            rt.state_write().set_linkset_up(name);
+        }
+    }
+
+    /// Mark an M2PA linkset down (all links out of service).
+    pub fn note_linkset_down(&self, tenant: &str, name: &str) {
+        if let Some(rt) = self.tenancy.get(tenant) {
+            rt.state_write().set_linkset_down(name);
+        }
+    }
+
+    /// Fold an MTP3-user network-management event (from M3UA SSNM / native MTP3)
+    /// into a tenant's route state: PAUSE→prohibit, RESUME→allow, STATUS→level.
+    pub fn apply_mtp3_event(&self, tenant: &str, event: &mtp3::Mtp3Event) {
+        if let Some(rt) = self.tenancy.get(tenant) {
+            rt.state_write().apply_event(event);
+        }
+    }
+
+    /// Reset a tenant's route state to all-down. The transport calls this at
+    /// startup before any ASP / link has come into service.
+    pub fn reset_availability_down(&self, tenant: &str) {
+        if let Some(rt) = self.tenancy.get(tenant) {
+            rt.state_write().set_all_down();
+        }
+    }
+
+    /// A tenant's own point code value (the node's PC in that routing domain).
+    /// Used by the transfer path's own-OPC loop guard.
+    pub fn node_point_code(&self, tenant: &str) -> Option<u32> {
+        self.tenancy.get(tenant).map(|rt| rt.point_code)
+    }
+
+    /// Whether a DPC currently resolves to any available egress (used by the
+    /// transport to answer an M3UA DAUD audit).
+    pub fn is_reachable(&self, tenant: &str, dpc_value: u32) -> bool {
+        self.tenancy
+            .get(tenant)
+            .map(|rt| resolve_destination(rt, dpc_value).is_some())
+            .unwrap_or(false)
+    }
+
     /// Route an inbound message within the implicit-default tenant.
     pub fn route(&self, msg: &Inbound) -> RouteDecision {
         self.route_in(crate::config::DEFAULT_TENANT, msg)
@@ -127,10 +194,13 @@ impl Router {
             };
         };
 
-        // 1. MTP3 transfer: DPC is not one of our point codes → transit.
+        // 1. MTP3 transfer: DPC is not one of our point codes → transit. This is
+        //    point-code routing and applies to *any* Service Indicator (ISUP,
+        //    SNM, …), not just SCCP; only a message addressed to us climbs the
+        //    SCCP stack below.
         if msg.dpc != rt.point_code {
-            return match resolve_linkset(rt, msg.dpc) {
-                Some(linkset) => RouteDecision::Route { linkset },
+            return match resolve_destination(rt, msg.dpc) {
+                Some(via) => RouteDecision::Route { via },
                 None => RouteDecision::Drop {
                     reason: format!("no MTP3 route to {}", msg.dpc),
                 },
@@ -201,7 +271,7 @@ impl Router {
             GttResult::Dpc { dpc, ssn } => RouteDecision::RouteTo {
                 dpc,
                 ssn,
-                linkset: resolve_linkset(rt, dpc),
+                via: resolve_destination(rt, dpc),
             },
             GttResult::Tenant { tenant, dpc, ssn } => {
                 let conversion = self
@@ -241,10 +311,12 @@ impl Router {
     }
 }
 
-/// Resolve a DPC to an egress linkset within a tenant, honouring availability.
-fn resolve_linkset(rt: &TenantRuntime, dpc_value: u32) -> Option<String> {
+/// Resolve a DPC to an egress [`Destination`] within a tenant, honouring live
+/// availability (reads the interior-mutable route state).
+fn resolve_destination(rt: &TenantRuntime, dpc_value: u32) -> Option<Destination> {
     let dpc = mtp3::PointCode::from_value(dpc_value, rt.variant).ok()?;
-    rt.routes.resolve(dpc, &rt.route_state)
+    let state = rt.state_read();
+    rt.routes.resolve(dpc, &state)
 }
 
 #[cfg(test)]
@@ -258,9 +330,9 @@ mod tests {
     }
 
     #[test]
-    fn transit_dpc_routes_on_linkset() {
+    fn transit_dpc_routes_on_application_server() {
         let r = router();
-        // 2000 is not our PC (1000) → MTP3 transfer to linkset hlr.
+        // 2000 is not our PC (1000) → MTP3 transfer to AS hlr (route priority 1).
         let d = r.route(&Inbound {
             dpc: 2000,
             ..Default::default()
@@ -268,7 +340,7 @@ mod tests {
         assert_eq!(
             d,
             RouteDecision::Route {
-                linkset: "hlr".into()
+                via: Destination::ApplicationServer("hlr".into())
             }
         );
     }
@@ -305,10 +377,10 @@ mod tests {
             ..Default::default()
         });
         match d {
-            RouteDecision::RouteTo { dpc, ssn, linkset } => {
+            RouteDecision::RouteTo { dpc, ssn, via } => {
                 assert_eq!(dpc, 2000);
                 assert_eq!(ssn, 6);
-                assert_eq!(linkset.as_deref(), Some("hlr"));
+                assert_eq!(via, Some(Destination::ApplicationServer("hlr".into())));
             }
             other => panic!("expected RouteTo, got {other:?}"),
         }

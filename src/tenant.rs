@@ -10,6 +10,7 @@
 //! [`ContentEngine`].
 
 use std::collections::BTreeMap;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use mtp3::Variant;
 
@@ -29,8 +30,10 @@ pub struct TenantRuntime {
     pub point_code: u32,
     /// MTP3 route resolver.
     pub routes: RouteResolver,
-    /// Live MTP3 availability state.
-    pub route_state: RouteState,
+    /// Live MTP3 availability state. Interior-mutable so the async transport can
+    /// drive AS / linkset up-down and fold in SSNM events while the (shared,
+    /// synchronous) router reads it per message.
+    pub route_state: RwLock<RouteState>,
     /// SCCP GTT resolver.
     pub gtt: GttResolver,
     /// E.214 ↔ E.164 converter.
@@ -44,6 +47,17 @@ impl TenantRuntime {
     /// (their SS7 variants differ → PC + GT conversion required).
     pub fn needs_conversion_to(&self, other: &TenantRuntime) -> bool {
         self.variant != other.variant
+    }
+
+    /// A read guard on the live route state (poison-recovering: a panic in a
+    /// writer must not wedge the router).
+    pub fn state_read(&self) -> RwLockReadGuard<'_, RouteState> {
+        self.route_state.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A write guard on the live route state (poison-recovering).
+    pub fn state_write(&self) -> RwLockWriteGuard<'_, RouteState> {
+        self.route_state.write().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -71,9 +85,13 @@ impl Tenancy {
         let mut tenants = BTreeMap::new();
         for (id, tenant) in &config.tenants {
             let routes = RouteResolver::build(tenant, &config.associations);
-            // Start every linkset up; the transport layer (phase-2) will drive
-            // this down/up from real association state.
+            // Start every AS + linkset up so a config-only `Router` (no running
+            // transport) resolves. When the transport starts it resets this to
+            // all-down and drives each destination up from real ASP / link state.
             let mut route_state = RouteState::default();
+            for a in &tenant.application_servers {
+                route_state.set_as_up(&a.name);
+            }
             for ls in &tenant.linksets {
                 route_state.set_linkset_up(&ls.name);
             }
@@ -91,7 +109,7 @@ impl Tenancy {
                     variant: tenant.variant,
                     point_code,
                     routes,
-                    route_state,
+                    route_state: RwLock::new(route_state),
                     gtt,
                     converter,
                     content,
@@ -157,17 +175,17 @@ tenants:
   default:
     point_code: 1000
     variant: ITU
-    linksets:
-      - { name: ls, adaptation: m3ua, traffic_mode: override, links: [{assoc: a1, slc: 0}] }
+    application_servers:
+      - { name: as1, traffic_mode: override, routing_context: 10, asps: [a1] }
     mtp3_routes:
-      - { dpc: 2000, linkset: ls, priority: 1 }
+      - { dpc: 2000, as: as1, priority: 1 }
   partner-ansi:
     point_code: 5000
     variant: ANSI
-    linksets:
-      - { name: ls, adaptation: m3ua, traffic_mode: override, links: [{assoc: a1, slc: 0}] }
+    application_servers:
+      - { name: as1, traffic_mode: override, routing_context: 20, asps: [a1] }
     mtp3_routes:
-      - { dpc: 6000, linkset: ls, priority: 1 }
+      - { dpc: 6000, as: as1, priority: 1 }
 "#;
         Config::parse(yaml).unwrap()
     }
