@@ -11,7 +11,7 @@
 //!   │  content routing        (routes/screens on the decoded MAP/CAP │  src/content.rs
 //!   │                          application layer)                    │
 //!   ├──────────────────────────────────────────────────────────────┤
-//!   │  MAP / CAP termination  (dialogue SAP, phase-4)              │  src/dialogue.rs
+//!   │  MAP / CAP termination  (dialogue SAP)                         │  src/dialogue.rs
 //!   │      gsm_map · gsm_cap                                         │
 //!   ├──────────────────────────────────────────────────────────────┤
 //!   │  TCAP  transactions + components            tcap              │
@@ -52,16 +52,30 @@
 //!   Transfer is Service-Indicator-agnostic (any non-SCCP MSU transits by DPC),
 //!   and two loop guards drop-and-count a message that looped. Start it with
 //!   [`TransportHandle::start`](transport::TransportHandle::start).
-//! - [`metrics`]: the process-wide counters the transport increments
-//!   (`sigtran_loops_detected_total`) plus a Prometheus text renderer.
+//! - [`metrics`]: the full Prometheus family set the transport, router, and
+//!   dialogue engine maintain (association / ASP / linkset state, route
+//!   availability, MSU rate, GTT translations/errors, content-rule hits, active
+//!   dialogues, dialogue / invoke timeouts, aborts, loop guards), plus a text
+//!   renderer.
+//!
+//! ## The dialogue-termination SAP (phase 3, this release)
+//!
+//! - [`dialogue`]: a synchronous TCAP transaction engine. When the router returns
+//!   [`RouteDecision::Local`](routing::RouteDecision::Local) the transport hands
+//!   the MSU to a [`DialogueEngine`](dialogue::DialogueEngine): it decodes the
+//!   SCCP UDT + TCAP, dispatches the decoded MAP/CAP operation to a registered
+//!   [`TerminationHandler`](dialogue::TerminationHandler), and the handler answers
+//!   through a [`Dialogue`](dialogue::Dialogue) handle (`reply` / `invoke` +
+//!   `send` / `end` / `abort`). It drives single request/response, held-open
+//!   multi-leg, and originating flows, with the config
+//!   [`Tcap`](config::Tcap) invoke / dialogue timers.
 //!
 //! ## Later phases
 //!
-//! - [`dialogue`]: the MAP/CAP dialogue-termination SAP is still a trait skeleton
-//!   (phase-4). Local-termination decisions are handed to it over the transport's
-//!   local-delivery channel, ready to wire.
-//! - Python bindings (pyo3) are a later phase: expose the same routing brain so a
-//!   script can program the Rust tables live or defer a rule to a hook.
+//! - Python bindings (pyo3) are a later phase: expose the routing brain and the
+//!   `@gsm_map.on_*` / `@gsm_cap.on_*` termination decorators so a script can
+//!   program the Rust tables live, defer a rule to a hook, or terminate a
+//!   dialogue.
 //!
 //! ## Quickstart
 //!
@@ -99,6 +113,10 @@ pub mod tenant;
 pub mod transport;
 
 pub use config::Config;
+pub use dialogue::{
+    Dialogue, DialogueEngine, IncomingOp, OutgoingBegin, PeerComponent, PeerTurn, Role,
+    TerminationHandler,
+};
 pub use error::{Error, Result};
 pub use mtp3::route::Destination;
 pub use routing::{RouteDecision, Router};

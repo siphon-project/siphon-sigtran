@@ -366,6 +366,38 @@ pub struct Sccp {
     pub gt_conversion: GtConversion,
 }
 
+// ── TCAP dialogue termination ────────────────────────────────────────────────
+
+/// The `tcap:` block: the dialogue-termination engine's timers and ceiling.
+///
+/// These are node-wide (shared across tenants, like the SCTP transport), not
+/// per-tenant. The defaults are the Q.774 default operation-timer neighbourhood
+/// and a generous dialogue ceiling; a low-volume HLR/SMSC/SCP rarely needs to
+/// touch them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Tcap {
+    /// How long an outstanding invoke waits for its result before it is aged out
+    /// and `sigtran_invoke_timeouts_total` counts it. Milliseconds.
+    pub invoke_timer_ms: u64,
+    /// How long a dialogue may sit with no activity before it is aged out and
+    /// `sigtran_dialogue_timeouts_total` counts it. Milliseconds.
+    pub dialogue_timer_ms: u64,
+    /// The maximum number of concurrently open dialogues. A Begin over this
+    /// ceiling is rejected with a P-Abort (counted as a local abort).
+    pub max_dialogues: usize,
+}
+
+impl Default for Tcap {
+    fn default() -> Self {
+        Self {
+            invoke_timer_ms: 15_000,
+            dialogue_timer_ms: 30_000,
+            max_dialogues: 100_000,
+        }
+    }
+}
+
 // ── Content routing ─────────────────────────────────────────────────────────
 
 /// An `address_tables:` entry: a named set of GT digit strings.
@@ -539,6 +571,8 @@ struct RawFile {
     #[serde(default)]
     content_routing: Option<ContentRouting>,
     #[serde(default)]
+    tcap: Option<Tcap>,
+    #[serde(default)]
     tenants: Option<BTreeMap<TenantId, Tenant>>,
 }
 
@@ -554,6 +588,8 @@ pub struct Config {
     /// The SCTP transport plane, shared across tenants and demultiplexed by
     /// M3UA network appearance.
     pub associations: Vec<Association>,
+    /// The node-wide TCAP dialogue-termination settings (timers + ceiling).
+    pub tcap: Tcap,
     /// The per-tenant routing tables, keyed by tenant id. Always contains
     /// `default` when the file was written flat.
     pub tenants: BTreeMap<TenantId, Tenant>,
@@ -626,6 +662,7 @@ impl Config {
 
         Ok(Config {
             associations: raw.associations,
+            tcap: raw.tcap.unwrap_or_default(),
             tenants,
         })
     }
@@ -1014,6 +1051,28 @@ content_routing:
         let cfg = Config::parse(SAMPLE).unwrap();
         assert_eq!(cfg.tenants.len(), 1);
         assert!(cfg.tenant(DEFAULT_TENANT).is_some());
+    }
+
+    #[test]
+    fn tcap_defaults_when_absent() {
+        let cfg = Config::parse(SAMPLE).unwrap();
+        assert_eq!(cfg.tcap.invoke_timer_ms, 15_000);
+        assert_eq!(cfg.tcap.dialogue_timer_ms, 30_000);
+        assert_eq!(cfg.tcap.max_dialogues, 100_000);
+    }
+
+    #[test]
+    fn tcap_block_parses() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+tcap: { invoke_timer_ms: 5000, dialogue_timer_ms: 12000, max_dialogues: 512 }
+sccp:
+  local_ssns: [6, 8]
+"#;
+        let cfg = Config::parse(yaml).unwrap();
+        assert_eq!(cfg.tcap.invoke_timer_ms, 5000);
+        assert_eq!(cfg.tcap.dialogue_timer_ms, 12000);
+        assert_eq!(cfg.tcap.max_dialogues, 512);
     }
 
     #[test]

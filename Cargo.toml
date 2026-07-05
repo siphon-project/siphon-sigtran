@@ -1,6 +1,6 @@
 [package]
 name = "siphon-sigtran"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 description = "SIGTRAN/SS7 runtime: M3UA/M2PA transport, MTP3 routing, SCCP GTT, content routing, MAP/CAP termination on the published SS7 codec crates"
@@ -33,6 +33,11 @@ gsm_map = "1"
 gsm_cap = "1"
 # Async SCTP (lksctp wrapper). Pulled in now for the phase-2 transport traits.
 async-sctp = "1"
+# ASN.1 BER. The tcap component/dialogue API exposes `rasn` types directly (an
+# Invoke parameter is a `rasn::types::Any`, an application context a
+# `rasn::types::Oid`), so the dialogue engine names them to build genuine
+# TCAP + MAP/CAP responses.
+rasn = "0.28"
 
 # ── config + errors ─────────────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
@@ -43,8 +48,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
 
 [dev-dependencies]
-# ASN.1 BER: the tests assemble real MAP/CAP arguments the way ss7-stack does.
-rasn = "0.28"
 # criterion drives the routing-brain benches (benches/routing.rs).
 criterion = "0.8"
 

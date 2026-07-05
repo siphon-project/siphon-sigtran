@@ -250,6 +250,12 @@ impl RouteResolver {
         self.variant
     }
 
+    /// The DPC values this table has a route for (explicit or adjacent). Used to
+    /// refresh the per-DPC route-availability metric on a state change.
+    pub fn dpcs(&self) -> impl Iterator<Item = u32> + '_ {
+        self.routes.keys().copied()
+    }
+
     /// Resolve a DPC to the best currently-available destination, or `None` if
     /// the DPC is prohibited or every candidate route is down / has no route.
     pub fn resolve(&self, dpc: PointCode, state: &RouteState) -> Option<Destination> {

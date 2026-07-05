@@ -38,17 +38,18 @@ use gsm_cap::operations::InitialDpArg;
 use gsm_map::operations::location::UpdateLocationArg;
 use gsm_map::operations::mo_forward_sm::MoForwardSmArg;
 use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
-use gsm_map::operations::sri_sm::RoutingInfoForSmArg;
-use gsm_map::types::{SmRpDa, SmRpOa};
+use gsm_map::operations::sri_sm::{RoutingInfoForSmArg, RoutingInfoForSmRes};
+use gsm_map::types::{LocationInfoWithLmsi, SmRpDa, SmRpOa};
 
 use m2pa::{LinkState, LinkStatusMessage, M2paMessage, M2paStateMachine};
 use m3ua::{M3uaMessage, MessageType, ProtocolData};
 use mtp3::NetworkIndicator;
 use sccp::{GlobalTitle, SccpAddress, SccpMessage, SubsystemNumber, UnitData};
-use tcap::dialogue::DialoguePortion;
-use tcap::{Begin, Component, Invoke, OperationCode, TcapMessage};
+use tcap::dialogue::{DialoguePdu, DialoguePortion};
+use tcap::{Begin, Component, Invoke, OperationCode, ReturnResult, ReturnResultValue, TcapMessage};
 
-use siphon_sigtran::config::Config;
+use siphon_sigtran::config::{Config, Tcap};
+use siphon_sigtran::dialogue::{Dialogue, DialogueEngine, IncomingOp, TerminationHandler};
 use siphon_sigtran::metrics::{self, LoopKind};
 use siphon_sigtran::mtp3::route::Destination;
 use siphon_sigtran::routing::{Inbound, RouteDecision, Router};
@@ -936,6 +937,155 @@ associations:
         msg.contains("sua") && msg.contains("not implemented"),
         "unexpected error for reserved sua: {msg}"
     );
+}
+
+// ── Scenario 8: MAP/CAP dialogue termination over the wire ───────────────────
+
+/// A node that owns HLR (SSN 6) locally: an SRI-SM addressed to it terminates in
+/// the dialogue engine rather than being forwarded.
+const TERMINATION_NODE: &str = r#"
+node: { point_code: 1000, variant: ITU, network_indicator: international }
+associations:
+  - { id: ingress, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+sccp:
+  local_ssns: [6]
+"#;
+
+const HLR_IMSI: &str = "001010000000042";
+const SERVING_MSC: &str = "15550180";
+
+/// A fake HLR answering SRI-SM with an imsi + serving-MSC number in a TCAP End.
+struct WireHlr;
+impl TerminationHandler for WireHlr {
+    fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
+        let res = RoutingInfoForSmRes {
+            imsi: imsi_bytes(HLR_IMSI).into(),
+            location_info_with_lmsi: LocationInfoWithLmsi {
+                network_node_number: isdn(SERVING_MSC).into(),
+                lmsi: None,
+                gprs_node_indicator: None,
+                additional_number: None,
+            },
+        };
+        dlg.reply(op.operation_code, Some(rasn::ber::encode(&res).unwrap()));
+        dlg.end();
+    }
+}
+
+/// An SCCP UDT addressed route-on-SSN to a subsystem we own (no called-party GT,
+/// so the router terminates it locally by SSN).
+fn sccp_udt_to_ssn(called_ssn: SubsystemNumber, tcap_bytes: &[u8]) -> Vec<u8> {
+    let called = SccpAddress::with_ssn(called_ssn, Some(NODE_PC as u16));
+    let calling = SccpAddress::with_gt(
+        GlobalTitle::Gt0100 {
+            translation_type: 0,
+            numbering_plan: 1,
+            encoding_scheme: 1,
+            nature_of_address: 4,
+            digits: OUR_GT.to_string(),
+        },
+        Some(SubsystemNumber::Msc),
+    );
+    UnitData::new(called, calling, tcap_bytes.to_vec())
+        .encode()
+        .expect("encode sccp udt")
+}
+
+/// The (operation, imsi, node) recovered from a forwarded/terminated M3UA DATA
+/// frame carrying a TCAP End with a ReturnResultLast.
+fn decode_sri_sm_reply(payload: &[u8]) -> Option<(i64, Vec<u8>, Vec<u8>)> {
+    let msg = M3uaMessage::decode(payload).ok()?;
+    let pd = msg.protocol_data().ok()?;
+    let udt = match SccpMessage::decode(&pd.user_data).ok()? {
+        SccpMessage::Udt(u) => u,
+        _ => return None,
+    };
+    let end = match tcap::decode(&udt.data).ok()? {
+        TcapMessage::End(e) => e,
+        _ => return None,
+    };
+    // An AARE must be present on the terminating End.
+    let has_aare = matches!(
+        end.dialogue_portion
+            .as_ref()
+            .and_then(|dp| dp.dialogue_pdu()),
+        Some(DialoguePdu::Aare { .. })
+    );
+    assert!(has_aare, "the terminating End carries an AARE");
+    match end.components?.into_iter().next()? {
+        Component::ReturnResultLast(ReturnResult {
+            result:
+                Some(ReturnResultValue {
+                    operation_code: OperationCode::Local(op),
+                    parameter: Some(param),
+                }),
+            ..
+        }) => {
+            let res: RoutingInfoForSmRes = rasn::ber::decode(param.as_bytes()).ok()?;
+            Some((
+                op,
+                res.imsi.to_vec(),
+                res.location_info_with_lmsi.network_node_number.to_vec(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_terminates_sri_sm_in_the_dialogue_engine() {
+    let rx_before = metrics::msu_total(metrics::Dir::Rx, SI_SCCP);
+
+    let Some(mut handle) = start_node(TERMINATION_NODE, "wire_terminate").await else {
+        return;
+    };
+
+    // Register the fake HLR and attach the engine to the running node.
+    let mut engine = DialogueEngine::new(Tcap::default());
+    engine.register(
+        6,
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        Arc::new(WireHlr),
+    );
+    let engine = Arc::new(engine);
+    handle.serve_dialogues(engine.clone());
+
+    let ingress = handle.bound_addr("ingress").expect("ingress bound");
+    let Some(mut peer) = AspPeer::connect(ingress, 0).await else {
+        eprintln!("SKIP wire_terminate: ingress connect failed");
+        return;
+    };
+    // Let the ASP reach Active so the SG delivers our DATA up the stack.
+    sleep(Duration::from_millis(150)).await;
+
+    // A genuine SRI-SM Begin (AARQ + Invoke), addressed to us route-on-SSN 6.
+    let sccp = sccp_udt_to_ssn(
+        SubsystemNumber::Hlr,
+        &tcap_begin(
+            gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+            sri_sm_arg("15559999"),
+            &AC_SRI_SM,
+        ),
+    );
+    peer.send_in(&m3ua_sccp(&sccp, OPC_UPSTREAM, NODE_PC, 0))
+        .await;
+
+    // The node terminates it and sends the ReturnResultLast back to us.
+    let reply = peer.recv_out().await.expect("terminated reply frame");
+    let (op, imsi, node) = decode_sri_sm_reply(&reply).expect("reply decodes to an SRI-SM result");
+    assert_eq!(op, gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM);
+    assert_eq!(imsi, imsi_bytes(HLR_IMSI), "the HLR IMSI came back");
+    assert_eq!(node, isdn(SERVING_MSC), "the serving MSC number came back");
+
+    // The single-shot dialogue is closed, and the inbound MSU was counted.
+    assert_eq!(engine.open_dialogues(), 0, "the terminated dialogue closed");
+    assert!(
+        metrics::msu_total(metrics::Dir::Rx, SI_SCCP) > rx_before,
+        "the terminated MSU was counted on the rx path"
+    );
+
+    peer.close();
+    handle.shutdown();
 }
 
 // ── tshark gate: the forwarded frames dissect clean ──────────────────────────

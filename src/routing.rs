@@ -155,6 +155,44 @@ impl Router {
     pub fn apply_mtp3_event(&self, tenant: &str, event: &mtp3::Mtp3Event) {
         if let Some(rt) = self.tenancy.get(tenant) {
             rt.state_write().apply_event(event);
+            match event {
+                mtp3::Mtp3Event::Pause { affected } => {
+                    crate::metrics::mtp3mg_event(
+                        affected.value(),
+                        crate::metrics::Mtp3MgKind::Pause,
+                    );
+                }
+                mtp3::Mtp3Event::Resume { affected } => {
+                    crate::metrics::mtp3mg_event(
+                        affected.value(),
+                        crate::metrics::Mtp3MgKind::Resume,
+                    );
+                }
+                mtp3::Mtp3Event::Status { affected, .. } => {
+                    crate::metrics::mtp3mg_event(
+                        affected.value(),
+                        crate::metrics::Mtp3MgKind::Congestion,
+                    );
+                }
+                mtp3::Mtp3Event::Transfer(_) => {}
+            }
+            self.refresh_route_metrics(tenant);
+        }
+    }
+
+    /// Refresh the `sigtran_route_available{dpc}` gauge for every DPC in a
+    /// tenant's route table. Cheap and rare (called on a state change, never per
+    /// MSU), so it walks the whole table.
+    pub fn refresh_route_metrics(&self, tenant: &str) {
+        if let Some(rt) = self.tenancy.get(tenant) {
+            let state = rt.state_read();
+            for dpc_value in rt.routes.dpcs() {
+                let up = mtp3::PointCode::from_value(dpc_value, rt.variant)
+                    .ok()
+                    .and_then(|dpc| rt.routes.resolve(dpc, &state))
+                    .is_some();
+                crate::metrics::set_route_available(dpc_value, up);
+            }
         }
     }
 
@@ -219,6 +257,7 @@ impl Router {
         //    routes on the richer application layer.
         if let (Some(engine), Some(view)) = (rt.content.as_ref(), msg.view.as_ref()) {
             if let Some(hit) = engine.evaluate(view) {
+                crate::metrics::content_rule_hit(&hit.rule, action_label(&hit.action));
                 if let Some(decision) = self.decision_from_action(rt, hit.action, msg) {
                     return decision;
                 }
@@ -231,9 +270,10 @@ impl Router {
             match rt.gtt.translate(&sel) {
                 Some(result) => return self.decision_from_gtt(rt, result),
                 None => {
+                    crate::metrics::gtt_error(crate::metrics::GttError::NoTranslation);
                     return RouteDecision::Drop {
                         reason: "no GTT translation".into(),
-                    }
+                    };
                 }
             }
         }
@@ -266,14 +306,22 @@ impl Router {
     }
 
     fn decision_from_gtt(&self, rt: &TenantRuntime, result: GttResult) -> RouteDecision {
+        use crate::metrics::{self, GttError, GttResultKind};
         match result {
-            GttResult::Local => RouteDecision::Local,
-            GttResult::Dpc { dpc, ssn } => RouteDecision::RouteTo {
-                dpc,
-                ssn,
-                via: resolve_destination(rt, dpc),
-            },
+            GttResult::Local => {
+                metrics::gtt_translation(GttResultKind::Local);
+                RouteDecision::Local
+            }
+            GttResult::Dpc { dpc, ssn } => {
+                metrics::gtt_translation(GttResultKind::Dpc);
+                let via = resolve_destination(rt, dpc);
+                if via.is_none() {
+                    metrics::gtt_error(GttError::NoRoute);
+                }
+                RouteDecision::RouteTo { dpc, ssn, via }
+            }
             GttResult::Tenant { tenant, dpc, ssn } => {
+                metrics::gtt_translation(GttResultKind::Tenant);
                 let conversion = self
                     .tenancy
                     .cross_tenant(&rt.id, &tenant)
@@ -308,6 +356,19 @@ impl Router {
                 Some(self.decision_from_gtt(rt, result))
             }
         }
+    }
+}
+
+/// The `action` metric label for a matched content action.
+fn action_label(action: &Action) -> &'static str {
+    match action {
+        Action::Route {
+            rewrite_cdpa_gt: Some(_),
+            ..
+        } => "rewrite",
+        Action::Route { .. } => "route",
+        Action::Screen => "screen",
+        Action::Python { .. } => "python",
     }
 }
 

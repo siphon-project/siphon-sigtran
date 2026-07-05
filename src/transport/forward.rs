@@ -94,6 +94,9 @@ fn selector_from_gt(gt: &GlobalTitle) -> GttSelector {
 /// Route one inbound MSU and act on the decision. `inbound_assoc` is the id of
 /// the association the MSU arrived on; it feeds the route-reflect loop guard.
 pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
+    // Count every inbound MSU by Service Indicator (fixed-array atomic, no alloc).
+    metrics::msu(metrics::Dir::Rx, msu.si);
+
     // Loop guard 1 (own-OPC): a message whose OPC is our own point code is one
     // we originated coming back to us. Drop it before it can loop.
     if let Some(our_pc) = ctx.router.node_point_code(&ctx.tenant) {
@@ -140,8 +143,16 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
             eprintln!("siphon-sigtran: no MTP3 route to translated DPC {dpc}, dropping");
         }
         RouteDecision::Local => {
-            // Local termination: hand the MSU to the (phase-4) dialogue SAP seam.
-            let _ = ctx.local_tx.send(LocalDelivery { msu }).await;
+            // Local termination: hand the MSU (and the association it arrived on,
+            // for the reply path) to the dialogue SAP over the local-delivery
+            // channel.
+            let _ = ctx
+                .local_tx
+                .send(LocalDelivery {
+                    msu,
+                    ingress_assoc: inbound_assoc.to_string(),
+                })
+                .await;
         }
         RouteDecision::CrossTenant { tenant, .. } => {
             eprintln!(
@@ -200,6 +211,8 @@ async fn send_via(via: &Destination, msu: &Msu, ctx: &TaskCtx) {
         };
         if let Err(e) = sel.assoc.send(&bytes, stream, ppid).await {
             eprintln!("siphon-sigtran: egress send on {via} failed: {e}");
+        } else {
+            metrics::msu(metrics::Dir::Tx, msu.si);
         }
     }
 }

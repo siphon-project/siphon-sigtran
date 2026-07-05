@@ -5,6 +5,71 @@ All notable changes are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the policy.
 
+## [0.3.0]
+
+Phase 3: the MAP/CAP dialogue-termination SAP and the full Prometheus metric
+family set. When the router decides a message terminates here, a synchronous TCAP
+transaction engine now drives the dialogue and answers it; every layer feeds a
+process-wide metric set a scrape endpoint renders.
+
+### Added
+- **Dialogue termination** (`dialogue`): a synchronous TCAP (Q.771-775)
+  transaction engine on the published `tcap` / `sccp` / `gsm_map` / `gsm_cap`
+  codecs. `DialogueEngine::deliver` decodes a locally-terminated SCCP UDT, reads
+  the AARQ application context, decodes the `Invoke` operation (MAP TS 29.002 /
+  CAP TS 29.078), and dispatches to a `TerminationHandler` registered per
+  (SSN, operation).
+  - **`Dialogue` handle**: `reply` (a ReturnResultLast in a closing End with an
+    AARE), `invoke` + `send` (a Continue that holds the dialogue open), `end`,
+    `abort`, keyed by transaction id (OTID/DTID) with per-dialogue invoke-id
+    bookkeeping.
+  - **Multi-leg flows**: a held-open dialogue (updateLocation answered with an
+    insertSubscriberData leg, then the result on the peer's ack), the SMSC
+    multi-segment MT-ForwardSM (one dialogue, `moreMessagesToSend` NULL on all
+    but the last, each segment acked, End on the last), and the CAMEL SCP
+    (initialDP answered with a connect in the closing End).
+  - **Originating side**: `DialogueEngine::begin` opens a dialogue the node
+    initiates (an SMSC's SRI-SM then MT-ForwardSM); the handler stages the
+    opening invoke in `on_start`, and each peer Continue/End re-enters
+    `on_continue`.
+  - **Timers + ceiling**: the config `tcap` block (`invoke_timer_ms`,
+    `dialogue_timer_ms`, `max_dialogues`). `DialogueEngine::sweep` ages out a
+    dialogue whose outstanding invoke or idle time expired (returning a TCAP
+    Abort); a Begin over the ceiling, or for an operation with no registered
+    handler, is refused with an Abort rather than dropped.
+  - Wired into the transport with `TransportHandle::serve_dialogues`: it pumps
+    each locally-terminated MSU into the engine and sends the reply back to the
+    peer that asked, over the association the request arrived on, plus a periodic
+    sweep.
+- **Metrics** (`metrics`): the full family set, maintained in Rust and rendered
+  in Prometheus text-exposition format, with no per-transit-MSU allocation and no
+  tenant label. Transport / link state gauges (`sigtran_association_state`,
+  `sigtran_asp_state`, `sigtran_linkset_available` / `_active_links`,
+  `sigtran_m2pa_link_state`), routing (`sigtran_route_available`,
+  `sigtran_mtp3mg_events_total`), traffic (`sigtran_msu_total{dir,si}`,
+  `sigtran_gtt_translations_total` / `_errors_total`,
+  `sigtran_content_rule_hits_total`), and dialogue / TCAP
+  (`sigtran_active_dialogues`, `sigtran_dialogue_timeouts_total`,
+  `sigtran_invoke_timeouts_total`, `sigtran_abort_total`) alongside the existing
+  `sigtran_loops_detected_total`.
+- **Dialogue test harness** (`tests/dialogue.rs`): genuinely-assembled TCAP
+  (Begin + AARQ + Invoke over SCCP UDT) driven through the engine end to end for
+  SRI-SM, updateLocation with the ISD leg, the multi-segment MT-ForwardSM flow,
+  initialDP to connect, and the originating SRI-SM, plus dialogue-ceiling and
+  invoke / dialogue timer coverage. `tests/wire.rs` gains an over-the-wire
+  termination scenario: an SRI-SM Begin driven over real SCTP into a running
+  node, terminated in the engine, and the ReturnResultLast decoded off the wire.
+
+### Changed
+- `LocalDelivery` now carries the ingress association id so a reply routes back
+  to the peer that asked.
+
+### Still deferred
+- **Python bindings** (pyo3): a later phase, exposing the routing brain and the
+  `@gsm_map.on_*` / `@gsm_cap.on_*` termination decorators.
+- **`sua`** stays reserved: parsed and accepted, but starting a node with a `sua`
+  association returns a clear "not implemented".
+
 ## [0.2.0]
 
 Phase 2: a working SIGTRAN transport over real kernel SCTP under the phase-1
@@ -96,5 +161,6 @@ sccp, tcap, gsm_map, gsm_cap, async-sctp, m2pa). Synchronous, no I/O.
   `tests/routing.rs`.
 - **Python bindings** (pyo3): phase-3.
 
+[0.3.0]: https://github.com/siphon-project/siphon-sigtran/releases/tag/v0.3.0
 [0.2.0]: https://github.com/siphon-project/siphon-sigtran/releases/tag/v0.2.0
 [0.1.0]: https://github.com/siphon-project/siphon-sigtran/releases/tag/v0.1.0

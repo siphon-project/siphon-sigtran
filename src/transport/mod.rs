@@ -55,12 +55,15 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_sctp::{SctpAssociation, SctpConfig, SctpListener};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::{Adaptation, Association, Config, Role, DEFAULT_TENANT};
+use crate::dialogue::DialogueEngine;
+use crate::metrics;
 use crate::routing::Router;
 
 mod forward;
@@ -115,13 +118,16 @@ pub enum TransportError {
 /// Transport result alias.
 pub type Result<T> = std::result::Result<T, TransportError>;
 
-/// A message the router decided terminates locally, handed to the (phase-4)
-/// dialogue SAP over the transport's local-delivery channel. Carries the decoded
-/// MSU; the SCCP/TCAP dialogue coordinator consumes it.
+/// A message the router decided terminates locally, handed to the dialogue SAP
+/// over the transport's local-delivery channel. Carries the decoded MSU plus the
+/// association it arrived on, so the dialogue engine's reply goes back to the
+/// peer that asked.
 #[derive(Debug, Clone)]
 pub struct LocalDelivery {
     /// The MSU that terminated locally (its `payload` is the SCCP bytes for SI=3).
     pub msu: Msu,
+    /// The id of the association the MSU arrived on (the reply egress).
+    pub ingress_assoc: String,
 }
 
 /// Shared context handed to every association task.
@@ -263,10 +269,45 @@ impl TransportHandle {
     }
 
     /// Take the local-delivery receiver: the stream of MSUs the router decided
-    /// terminate here, for the dialogue SAP (phase-4) to consume. `None` after
-    /// the first call.
+    /// terminate here, for a custom consumer. `None` after the first call (and
+    /// after [`serve_dialogues`](Self::serve_dialogues), which takes it).
     pub fn take_local_rx(&mut self) -> Option<mpsc::Receiver<LocalDelivery>> {
         self.local_rx.take()
+    }
+
+    /// Attach a [`DialogueEngine`] to the running node: spawn a task that pumps
+    /// every locally-terminated MSU into [`DialogueEngine::deliver`], sends the
+    /// engine's replies back to the peer that asked (over the ingress
+    /// association), and periodically ages out expired dialogues via
+    /// [`DialogueEngine::sweep`]. Takes the local-delivery receiver, so call it
+    /// once, after registering the engine's handlers.
+    pub fn serve_dialogues(&mut self, engine: Arc<DialogueEngine>) {
+        let Some(mut rx) = self.local_rx.take() else {
+            return;
+        };
+        let registry = self.registry.clone();
+        let mut shutdown = self.shutdown_tx.subscribe();
+        let task = tokio::spawn(async move {
+            // Age dialogues once a second; the timers themselves are seconds.
+            let mut sweep = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    maybe = rx.recv() => {
+                        let Some(delivery) = maybe else { break };
+                        for out in engine.deliver(&delivery.msu, &delivery.ingress_assoc) {
+                            send_reply(&registry, &delivery.ingress_assoc, &out).await;
+                        }
+                    }
+                    _ = sweep.tick() => {
+                        for (assoc, out) in engine.sweep(Instant::now()) {
+                            send_reply(&registry, &assoc, &out).await;
+                        }
+                    }
+                }
+            }
+        });
+        self.tasks.push(task);
     }
 
     /// Signal every task to stop and abort them. Idempotent.
@@ -340,6 +381,38 @@ fn bind(addrs: &[SocketAddr], cfg: &SctpConfig) -> Result<SctpListener> {
         SctpListener::bind_multi_with(addrs, cfg)?
     };
     Ok(listener)
+}
+
+/// Send one dialogue-engine reply MSU back on the association it should egress
+/// (the ingress association of the request), framing it for that adaptation.
+async fn send_reply(registry: &Registry, assoc_id: &str, msu: &Msu) {
+    let Some(slot) = registry.slot(assoc_id) else {
+        eprintln!("siphon-sigtran: dialogue reply for unknown association `{assoc_id}`");
+        return;
+    };
+    let Some(sender) = slot.sender() else {
+        eprintln!("siphon-sigtran: dialogue reply but `{assoc_id}` has no live sender");
+        return;
+    };
+    let (bytes, stream, ppid) = match slot.adaptation {
+        Adaptation::M3ua => {
+            let rc = registry.as_membership(assoc_id).map(|(rc, _)| rc);
+            (framing::wrap_m3ua(msu, rc), 1u16, 3u32)
+        }
+        Adaptation::M2pa => match framing::wrap_m2pa(msu) {
+            Ok(b) => (b, 1u16, 5u32),
+            Err(e) => {
+                eprintln!("siphon-sigtran: dialogue reply m2pa framing failed: {e}");
+                return;
+            }
+        },
+        Adaptation::Sua => return,
+    };
+    if let Err(e) = sender.send(&bytes, stream, ppid).await {
+        eprintln!("siphon-sigtran: dialogue reply send on `{assoc_id}` failed: {e}");
+    } else {
+        metrics::msu(metrics::Dir::Tx, msu.si);
+    }
 }
 
 /// Connect an association, single- or multi-homed.

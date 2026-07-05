@@ -194,15 +194,47 @@ impl Registry {
             .map(|l| Destination::Linkset(l.name.clone()))
     }
 
-    /// Recompute AS + linkset availability from the current slot states and push
-    /// it into the router's route state.
+    /// Recompute AS + linkset availability from the current slot states, push it
+    /// into the router's route state, and refresh the Prometheus state gauges.
     pub fn recompute(&self, router: &Router) {
+        use crate::metrics;
+
+        // Per-association transport state, plus the M2PA link-liveness gauge.
+        for slot in self.assocs.values() {
+            let assoc_state = if slot.is_carrying() {
+                2
+            } else if slot.sender().is_some() {
+                1
+            } else {
+                0
+            };
+            metrics::set_association_state(
+                &slot.id,
+                adaptation_label(slot.adaptation),
+                assoc_state,
+            );
+            if slot.adaptation == Adaptation::M2pa {
+                let ls = if slot.is_carrying() {
+                    metrics::M2paLinkState::InService
+                } else if slot.sender().is_some() {
+                    metrics::M2paLinkState::Aligned
+                } else {
+                    metrics::M2paLinkState::Failed
+                };
+                metrics::set_m2pa_link_state(&slot.id, ls);
+            }
+        }
+
         for a in &self.application_servers {
             let up = a
                 .asps
                 .iter()
                 .filter_map(|id| self.assocs.get(id))
                 .any(|s| s.is_carrying());
+            for asp in &a.asps {
+                let active = self.assocs.get(asp).is_some_and(|s| s.is_carrying());
+                metrics::set_asp_state(asp, &a.name, active);
+            }
             if up {
                 router.note_as_up(&self.tenant, &a.name);
             } else {
@@ -210,17 +242,23 @@ impl Registry {
             }
         }
         for l in &self.linksets {
-            let up = l
+            let active_links = l
                 .links
                 .iter()
                 .filter_map(|id| self.assocs.get(id))
-                .any(|s| s.is_carrying());
+                .filter(|s| s.is_carrying())
+                .count();
+            let up = active_links > 0;
+            metrics::set_linkset(&l.name, up, active_links);
             if up {
                 router.note_linkset_up(&self.tenant, &l.name);
             } else {
                 router.note_linkset_down(&self.tenant, &l.name);
             }
         }
+
+        // The route-availability gauge follows from the AS / linkset state above.
+        router.refresh_route_metrics(&self.tenant);
     }
 
     /// Choose the egress association(s) for a resolved destination and SLS. An
@@ -268,6 +306,15 @@ impl Registry {
                     .collect()
             }
         }
+    }
+}
+
+/// The metric label for an adaptation layer.
+fn adaptation_label(a: Adaptation) -> &'static str {
+    match a {
+        Adaptation::M3ua => "m3ua",
+        Adaptation::M2pa => "m2pa",
+        Adaptation::Sua => "sua",
     }
 }
 

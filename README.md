@@ -15,13 +15,16 @@ It is built on the published SS7 codec crates (`mtp3`, `m3ua`, `m2pa`, `sccp`,
 top of them. The per-message routing decision always runs in Rust, synchronously
 and without I/O, so the node holds line rate.
 
-> **Status: phase 2.** The routing brain (phase 1) now sits under a working
-> SIGTRAN transport over real kernel SCTP: M3UA (ASPSM/ASPTM) and M2PA (link
+> **Status: phase 3.** The routing brain (phase 1) sits under a working SIGTRAN
+> transport over real kernel SCTP (phase 2): M3UA (ASPSM/ASPTM) and M2PA (link
 > alignment), SSNM folded into route state, and inbound DATA routed and forwarded
-> to the resolved egress. It is exercised on-the-wire with an SCTP-loopback test
-> harness (`tests/wire.rs`) plus a tshark dissection gate. The MAP/CAP
-> dialogue-termination SAP and the Python bindings are later phases and ship as
-> clearly-marked stubs. See the [changelog](CHANGELOG.md).
+> to the resolved egress. This release adds the MAP/CAP dialogue-termination SAP,
+> a synchronous TCAP transaction engine that terminates the messages addressed to
+> a subsystem we own (SRI-SM, updateLocation with an ISD leg, multi-segment
+> MT-ForwardSM, CAMEL initialDP to connect), plus the full Prometheus metric
+> family set. It is exercised on-the-wire (`tests/wire.rs`, with a tshark
+> dissection gate) and against assembled TCAP end to end (`tests/dialogue.rs`).
+> The Python bindings are a later phase. See the [changelog](CHANGELOG.md).
 
 ## Quickstart
 
@@ -119,28 +122,31 @@ A content rule `match` combines `operation` (a name or a list), `imsi_in`,
 `route` (to a `dpc`+`ssn` or a `group`), `rewrite_cdpa_gt`, `screen`, or
 `python` (defer to a named hook, resolved by the runtime).
 
-## What it covers (phase 2)
+## What it covers (phase 3)
 
 | Area | Covered |
 |---|---|
-| Config | full `sigtran.yaml` parse + semantic validation (dangling refs, duplicate names, point-code range, unknown operations) |
+| Config | full `sigtran.yaml` parse + semantic validation (dangling refs, duplicate names, point-code range, unknown operations); `tcap` timers + ceiling |
 | MTP3 routing | implicit adjacent routes, explicit routes by priority, availability from Pause/Resume/Status + linkset up/down, failover |
 | SCCP GTT | ordered prefix + gti/tt/np/nai matching, cost + weighted-share groups, local termination |
 | GT conversion | E.214 to/from E.164 via the PLMN map |
 | Content routing | first-match over operation / GT / IMSI-table membership; route, rewrite, screen, hook-deferral |
 | Transport (M3UA/M2PA/SCTP) | real kernel SCTP; M3UA ASPSM/ASPTM handshake + traffic modes, M2PA link alignment, SSNM to route state, load-share + failover, SI-agnostic transfer, own-opc + route-reflect loop guards |
-| Dialogue termination | local-delivery seam wired; the MAP/CAP SAP is a trait stub (phase-4) |
-| Python bindings | phase-3 |
+| Dialogue termination | TCAP transaction engine: Begin/Continue/End + AARQ/AARE, per-(SSN, operation) handlers, single response, held-open multi-leg, originating dialogues, invoke / dialogue timers + ceiling, aborts |
+| Metrics | full Prometheus family set (association / ASP / linkset state, route availability, MSU rate, GTT + content + MTP3-management counters, active dialogues, dialogue / invoke timeouts, aborts, loop guards) with a text renderer |
+| Python bindings | later phase |
 
 The transport is proven end-to-end in `tests/wire.rs`: genuinely-assembled SS7
 MSUs (SRI-SM, updateLocation, MO/MT-ForwardSM, initialDP) driven over real SCTP
 loopback through a running node, asserting load-share across an AS's ASPs,
 failover to an M2PA linkset when an ASP drops, SI-agnostic transfer of a non-SCCP
-MSU, and both loop guards, with a tshark gate over the forwarded frames.
+MSU, both loop guards, and an SRI-SM terminated in the dialogue engine with the
+result read back off the wire, with a tshark gate over the forwarded frames. The
+dialogue engine is driven against assembled TCAP end to end in `tests/dialogue.rs`.
 
 Standards referenced: M3UA (RFC 4666), M2PA (RFC 4165), SCTP (RFC 4960),
-MTP3 (ITU-T Q.704), SCCP GTT (ITU-T Q.714), TCAP (Q.773), MAP (3GPP TS 29.002),
-CAMEL (TS 29.078).
+MTP3 (ITU-T Q.704), SCCP GTT (ITU-T Q.714), TCAP (ITU-T Q.771-775),
+MAP (3GPP TS 29.002), CAMEL (TS 29.078).
 
 ## Performance
 
