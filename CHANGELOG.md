@@ -5,6 +5,18 @@ All notable changes are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the policy.
 
+## [0.5.1]
+
+Internal refactor, no wire change. The M2PA framing path now encodes and decodes
+the MTP3 MSU through `mtp3::Mtp3Msu::encode` / `Mtp3Msu::decode` instead of its
+own routing-label bit-packing. The `mtp3` crate (1.1.0) owns the Q.704 layout, so
+this drops the duplicated logic and inherits the crate's ANSI/China layouts for
+free when a non-ITU linkset is wired up later. ITU output stays byte-identical.
+
+### Changed
+- `transport::framing` builds and parses the M2PA MTP3 MSU via `mtp3::Mtp3Msu`;
+  the hand-rolled `build_itu_msu` / `parse_itu_msu` helpers are gone.
+
 ## [0.5.0]
 
 Rounds out the siphon addon so a full HLR, SMSC and CAMEL SCP are genuinely

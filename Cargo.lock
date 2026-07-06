@@ -1745,9 +1745,9 @@ dependencies = [
 
 [[package]]
 name = "mtp3"
-version = "1.0.1"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18e5faa676f77d562a32871dc0fb3f44f9a03360b5b5250764c6764c156c871e"
+checksum = "aaa5e221ff33f662a04e099c665b413b2063d994a46e0b9ded9f24ab4ac3ae57"
 dependencies = [
  "async-trait",
  "serde",
@@ -2966,7 +2966,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "siphon-sigtran"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-sctp",
  "criterion",

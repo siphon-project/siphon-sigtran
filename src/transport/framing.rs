@@ -2,20 +2,22 @@
 //!
 //! Inbound, we extract the Q.704 routing label (OPC/DPC/SLS/SI/NI) and the
 //! MTP3-user payload from either an **M3UA DATA** message (the Protocol Data
-//! parameter, RFC 4666 §3.3.1) or an **M2PA User Data** message carrying a
-//! hand-rolled MTP3 MSU (RFC 4165 §3.2). Outbound, we wrap an [`Msu`] for the
-//! egress transport again.
+//! parameter, RFC 4666 §3.3.1) or an **M2PA User Data** message carrying an
+//! MTP3 MSU (RFC 4165 §3.2). Outbound, we wrap an [`Msu`] for the egress
+//! transport again.
 //!
 //! # Point-code width
 //!
 //! M3UA carries OPC/DPC as 32-bit fields, so that path is variant-independent.
-//! The M2PA MSU routing label is packed to a specific width; this module packs
-//! the **ITU 14-bit** layout (14-bit PCs, 4-bit SLS), the same layout the codec
-//! crates' point codes use for ITU. ANSI (24-bit) M2PA MSUs are not framed yet;
-//! [`wrap_m2pa`] / [`extract_m2pa`] assume ITU. The M3UA path has no such limit.
+//! The M2PA MSU routing label has a variant-specific width; the `mtp3` crate's
+//! [`Mtp3Msu`] codec owns that layout. This module frames the **ITU 14-bit**
+//! variant (14-bit PCs, 4-bit SLS). ANSI (24-bit) M2PA MSUs are not framed yet;
+//! [`wrap_m2pa`] / [`extract_m2pa`] pass [`Variant::Itu`]. The M3UA path has no
+//! such limit.
 
 use m2pa::{M2paMessage, UserDataMessage};
 use m3ua::{M3uaMessage, MessageType, ProtocolData};
+use mtp3::{Mtp3Msu, NetworkIndicator, PointCode, ServiceIndicator, Variant};
 
 use super::TransportError;
 
@@ -71,7 +73,19 @@ pub fn extract_m3ua(payload: &[u8]) -> Result<Msu, TransportError> {
 /// a Link Status message (alignment, handled elsewhere).
 pub fn extract_m2pa(payload: &[u8]) -> Result<Option<Msu>, TransportError> {
     match M2paMessage::decode(payload)? {
-        M2paMessage::UserData { message, .. } => Ok(Some(parse_itu_msu(&message.msu)?)),
+        M2paMessage::UserData { message, .. } => {
+            let m = Mtp3Msu::decode(&message.msu, Variant::Itu)
+                .map_err(|e| TransportError::Framing(e.to_string()))?;
+            Ok(Some(Msu {
+                opc: m.opc.value(),
+                dpc: m.dpc.value(),
+                si: m.si.0,
+                ni: m.ni.bits(),
+                mp: m.mp,
+                sls: m.sls,
+                payload: m.data,
+            }))
+        }
         M2paMessage::LinkStatus { .. } => Ok(None),
     }
 }
@@ -91,10 +105,19 @@ pub fn wrap_m3ua(msu: &Msu, routing_context: Option<u32>) -> Vec<u8> {
     M3uaMessage::data(None, routing_context, pd, None).encode()
 }
 
-/// Wrap an [`Msu`] in an **M2PA User Data** message carrying a hand-rolled ITU
-/// MTP3 MSU. SCTP stream 1, PPID 5. BSN/FSN idle (`0xFFFFFF`).
+/// Wrap an [`Msu`] in an **M2PA User Data** message carrying an ITU MTP3 MSU
+/// (encoded by [`Mtp3Msu`]). SCTP stream 1, PPID 5. BSN/FSN idle (`0xFFFFFF`).
 pub fn wrap_m2pa(msu: &Msu) -> Result<Vec<u8>, TransportError> {
-    let raw = build_itu_msu(msu);
+    let raw = Mtp3Msu {
+        si: ServiceIndicator(msu.si),
+        ni: NetworkIndicator::from_bits(msu.ni),
+        mp: msu.mp,
+        opc: itu_pc(msu.opc)?,
+        dpc: itu_pc(msu.dpc)?,
+        sls: msu.sls,
+        data: msu.payload.clone(),
+    }
+    .encode(Variant::Itu);
     M2paMessage::UserData {
         bsn: 0xFF_FFFF,
         fsn: 0xFF_FFFF,
@@ -104,43 +127,11 @@ pub fn wrap_m2pa(msu: &Msu) -> Result<Vec<u8>, TransportError> {
     .map_err(TransportError::from)
 }
 
-/// Build the ITU-14-bit Q.704 MSU bytes for an [`Msu`]: SIO + 32-bit routing
-/// label (little-endian: DPC[0..14] OPC[14..28] SLS[28..32]) + SIF.
-fn build_itu_msu(msu: &Msu) -> Vec<u8> {
-    let sio = ((msu.ni & 0x03) << 6) | (msu.si & 0x0F);
-    let label: u32 =
-        (msu.dpc & 0x3FFF) | ((msu.opc & 0x3FFF) << 14) | (((msu.sls as u32) & 0x0F) << 28);
-    let mut out = Vec::with_capacity(5 + msu.payload.len());
-    out.push(sio);
-    out.extend_from_slice(&label.to_le_bytes());
-    out.extend_from_slice(&msu.payload);
-    out
-}
-
-/// Parse the ITU-14-bit MSU bytes back into an [`Msu`].
-fn parse_itu_msu(raw: &[u8]) -> Result<Msu, TransportError> {
-    if raw.len() < 5 {
-        return Err(TransportError::Framing(format!(
-            "MTP3 MSU too short: {} bytes",
-            raw.len()
-        )));
-    }
-    let sio = raw[0];
-    let si = sio & 0x0F;
-    let ni = (sio >> 6) & 0x03;
-    let label = u32::from_le_bytes([raw[1], raw[2], raw[3], raw[4]]);
-    let dpc = label & 0x3FFF;
-    let opc = (label >> 14) & 0x3FFF;
-    let sls = ((label >> 28) & 0x0F) as u8;
-    Ok(Msu {
-        opc,
-        dpc,
-        si,
-        ni,
-        mp: 0,
-        sls,
-        payload: raw[5..].to_vec(),
-    })
+/// Build an ITU point code from a routing-label value, masking to the 14-bit
+/// field (the ITU M2PA layout carries 14 bits, so a wider value can't be framed).
+fn itu_pc(value: u32) -> Result<PointCode, TransportError> {
+    PointCode::from_value(value & 0x3FFF, Variant::Itu)
+        .map_err(|e| TransportError::Framing(e.to_string()))
 }
 
 #[cfg(test)]
