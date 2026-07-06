@@ -1,8 +1,15 @@
-# .github/workflows/ci.yml, siphon-sigtran CI (Rust).
+# .github/workflows/ci.yml, siphon-sigtran CI.
 #
-# Phase 1 is pure Rust with no Python bindings yet, so this is a single Rust job:
-# format, lint (correctness denied via [lints.clippy] + -D warnings), test,
-# keep the benches compiling, and run the counting-allocator leak gate.
+# Two faces from one source tree:
+#   * the pure-Rust routing brain (crates.io): the default build pulls neither
+#     pyo3 nor siphon.
+#   * the siphon addon (`--features python`): links siphon-sip + pyo3 and drives
+#     the scriptable `ss7` / `gsm_map` / `gsm_cap` namespaces end to end against
+#     siphon-sip, the way siphon-smpp / siphon-http are.
+#
+# `--features python` links libpython (the tests boot the interpreter via pyo3's
+# auto-initialize). There is no wheel, no maturin, and no `extension-module`
+# feature, so `--all-features` is safe.
 name: CI
 
 on:
@@ -27,19 +34,36 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # async-sctp links against libsctp; install it so the dependency builds
-      # (the phase-1 routing brain doesn't use SCTP, but the crate depends on it).
+      # async-sctp links against libsctp; install it so the dependency builds.
       - name: Install libsctp
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+
+      # SCTP kernel module for the on-the-wire transport tests.
+      - name: Load SCTP module
+        run: sudo modprobe sctp
+
+      # libpython for the `--features python` build/link and the addon tests
+      # that boot the interpreter.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
 
       - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      # Lint both faces of the crate. Clippy honours [lints.clippy] in Cargo.toml
+      # (correctness denied; style/dead-code warn).
+      - name: Clippy (routing brain)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test
+      - name: Clippy (siphon addon)
+        run: cargo clippy --features python --all-targets -- -D warnings
+
+      - name: Test (routing brain)
         run: cargo test
+
+      - name: Test (siphon addon, driven against siphon-sip)
+        run: cargo test --features python
 
       - name: Benches compile
         run: cargo bench --no-run

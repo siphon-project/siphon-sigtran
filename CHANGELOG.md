@@ -5,6 +5,64 @@ All notable changes are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the policy.
 
+## [0.4.0]
+
+Phase 4: the siphon addon face. siphon-sigtran becomes a scriptable siphon node,
+built and tested against siphon-sip the way the sibling addons `siphon-smpp` and
+`siphon-http` are. It is an addon, not a package: there is no wheel and no PyPI,
+a composing siphon binary links the crate and mounts its namespaces. The default
+crate build pulls neither pyo3 nor siphon, so consumers of the pure-Rust routing
+brain stay lean.
+
+### Added
+- **The `python` module** (feature `python`), the addon face. The single seam is
+  `python::register(py, parent)`: a composing siphon binary calls it once at
+  startup with the `siphon` package module as `parent`, mounting the `ss7` /
+  `gsm_map` / `gsm_cap` namespace singletons, the `configure` / `metrics`
+  functions, the `SigtranError` exception, and the shared types onto it. Scripts
+  reach them with `from siphon import ss7, gsm_map, gsm_cap`. Links siphon-sip
+  (git, `branch = main`), pyo3 0.29 (`auto-initialize`), and pyo3-async-runtimes
+  0.29 (`tokio-runtime`), the same pins as the sibling addons.
+  - **`ss7`**, the routing surface. Program the Rust tables live
+    (`ss7.routes.add` / `.cache`, `ss7.gtt.add`, `ss7.content.add_rule` /
+    `.address_table(...).add`), defer a config rule to a hook
+    (`@ss7.content.on(name)`) or take a selector-gated general override
+    (`@ss7.on_route(when=...)`), and build decisions (`ss7.route` / `ss7.drop` /
+    `ss7.route_default` / `ss7.allow`). A read-only `MapView` is handed to hooks.
+  - **`gsm_map` / `gsm_cap`**, MAP/CAP termination decorators
+    (`@gsm_map.on_mo_forward_sm`, `@gsm_cap.on_initial_dp`, ...) that register a
+    Python handler (sync or `async def`, driven to completion) per operation. The
+    handler drives a `Dialogue` handle (`invoke` / `reply` / `send` / `end`); the
+    engine replays the staged components onto the real Rust dialogue to build
+    wire-real TCAP. Application-context helpers (`gsm_map.AC`), the originating
+    helpers (`gsm_map.begin`, `mt_forward_sm`, `gsm_cap.connect`), and
+    `ss7.gt(...)` addressing.
+  - **Originating awaitables**: `gsm_map.send_routing_info_for_sm` and
+    `dlg.result()` return an awaitable bridged onto tokio via pyo3-async-runtimes
+    (the shape the sibling addons' send helpers use). Awaiting one needs a live
+    SCTP transport driven by the composing siphon binary; without one it resolves
+    to a clear error.
+  - **`configure`** builds the node from a `sigtran.yaml` (a path, inline YAML,
+    or a dict, validated through the same typed deserialiser); `metrics()`
+    renders the Prometheus text.
+- **Live routing-table programming** on the Rust side: `RouteResolver::add`,
+  `GttResolver::add_rule`, `ContentEngine::add_rule` / `address_table_add` /
+  `imsi_table_add` / `empty`, so a script mutates the tables the resolver reads
+  without a restart.
+- **Addon test harness** (`tests/python.rs`, feature `python`): compiled against
+  siphon-sip, it mounts the namespaces through `register`, then drives a script
+  end to end: the import surface, the decision constructors, live table
+  programming and its error paths, a content hook firing, a genuine MO-ForwardSM
+  Begin terminated through the engine, CAP `connect` staging, and the
+  tokio-bridged originating awaitable. A second test names a siphon host type to
+  prove the linkage.
+- **Example scripts** (`examples/`): `stp.py` (a thin STP, the three override
+  styles), `smsc.py` (MAP termination + multi-segment MT origination), and
+  `scp.py` (a CAMEL SCP).
+- **CI**: the `rust` job lints and tests both faces: the pyo3-free routing brain
+  and `--features python` (which links siphon-sip and runs the addon tests). No
+  wheel, maturin, or PyPI jobs.
+
 ## [0.3.0]
 
 Phase 3: the MAP/CAP dialogue-termination SAP and the full Prometheus metric

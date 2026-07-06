@@ -165,6 +165,46 @@ impl ContentEngine {
         }
     }
 
+    /// An empty engine (no rules, no tables). A script can then program it live
+    /// via [`add_rule`](Self::add_rule) / [`address_table_add`](Self::address_table_add),
+    /// so a node whose config carried no `content_routing` block can still gain
+    /// content rules from `ss7.content.*`.
+    pub fn empty() -> Self {
+        Self {
+            rules: Vec::new(),
+            address_tables: std::collections::BTreeMap::new(),
+            imsi_tables: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Prepend a content rule live (a script programming the table via
+    /// `ss7.content.add_rule(...)`). New rules go to the front so a
+    /// freshly-programmed override wins over the static config rules
+    /// (first-match-wins).
+    pub fn add_rule(&mut self, rule: &ContentRule) {
+        self.rules.insert(0, CompiledRule::from(rule));
+    }
+
+    /// Add a global-title digit string to an address table live
+    /// (`ss7.content.address_table(name).add(addr)`), creating the table if it
+    /// did not exist. Idempotent.
+    pub fn address_table_add(&mut self, table: &str, addr: impl Into<String>) {
+        let addr = addr.into();
+        let entries = self.address_tables.entry(table.to_string()).or_default();
+        if !entries.contains(&addr) {
+            entries.push(addr);
+        }
+    }
+
+    /// Add an IMSI prefix to an imsi table live, creating it if absent. Idempotent.
+    pub fn imsi_table_add(&mut self, table: &str, prefix: impl Into<String>) {
+        let prefix = prefix.into();
+        let entries = self.imsi_tables.entry(table.to_string()).or_default();
+        if !entries.contains(&prefix) {
+            entries.push(prefix);
+        }
+    }
+
     /// Evaluate the ordered rules against a decoded view. First match wins.
     pub fn evaluate(&self, view: &MapView) -> Option<Hit> {
         for rule in &self.rules {

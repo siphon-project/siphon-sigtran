@@ -275,6 +275,18 @@ impl RouteResolver {
     pub fn has_route(&self, dpc: PointCode) -> bool {
         self.routes.contains_key(&dpc.value())
     }
+
+    /// Add (or extend) a route to a DPC live: a script programming the table via
+    /// `ss7.routes.add(...)`. `priority` follows the config rule (1 = primary,
+    /// higher numbers are alternates). Idempotent for an identical
+    /// destination + priority, so re-running a start hook does not duplicate.
+    pub fn add(&mut self, dpc: u32, dest: Destination, priority: u8) {
+        let candidates = self.routes.entry(dpc).or_default();
+        let candidate = Candidate { dest, priority };
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
 }
 
 #[cfg(test)]

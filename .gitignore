@@ -8,4 +8,7 @@ CLAUDE.md
 # criterion output
 /criterion
 
+# Python bytecode from running the example scripts under an embedding siphon.
+**/__pycache__
+
 # Note: Cargo.lock IS tracked (the release workflow runs `cargo publish --locked`).

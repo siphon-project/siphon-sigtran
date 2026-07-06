@@ -1,6 +1,6 @@
 [package]
 name = "siphon-sigtran"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 description = "SIGTRAN/SS7 runtime: M3UA/M2PA transport, MTP3 routing, SCCP GTT, content routing, MAP/CAP termination on the published SS7 codec crates"
@@ -12,8 +12,14 @@ homepage = "https://github.com/siphon-project/siphon-sigtran"
 keywords = ["sigtran", "ss7", "m3ua", "sccp", "routing"]
 categories = ["network-programming"]
 publish = false
-# Keep CI/dev scaffolding out of any future crates.io package.
-exclude = [".github/", "docs/", "scripts/"]
+# Operator-facing assets (docs, CI scaffolding, the leak-gate script, the Python
+# example scripts) aren't part of the crate a composing siphon binary links.
+exclude = [".github/", "docs/", "scripts/", "examples/*.py"]
+
+# siphon addon: a composing siphon binary calls `python::register(py, parent)`
+# at startup to mount the `ss7` / `gsm_map` / `gsm_cap` namespaces, then the
+# hot-reloaded scripts program the routing tables and terminate MAP/CAP
+# dialogues. There is no wheel and no PyPI package.
 
 [dependencies]
 # ── SS7 codec crates (published on crates.io) ───────────────────────────────
@@ -47,9 +53,35 @@ thiserror = "2"
 # ── async runtime (phase-2 transport; the routing brain itself is sync) ──────
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
 
+# ── siphon addon face (feature = "python") ───────────────────────────────────
+# Kept out of the default build so `cargo add siphon-sigtran` and crates.io
+# consumers of the pure-Rust routing brain pull ZERO pyo3 or siphon. Enabling
+# `python` links the crate against siphon-sip and exposes the scriptable
+# `ss7` / `gsm_map` / `gsm_cap` namespaces.
+#
+# Canonical repo URL after the siphon → siphon-sip rename. The URL string must
+# match byte-for-byte across every crate that depends on siphon-sip in one build
+# graph (a composing siphon binary), or cargo resolves two separate copies.
+# branch=main tracks the latest lib; the consumer's Cargo.lock still pins a
+# concrete SHA.
+siphon-sip = { git = "https://github.com/siphon-project/siphon-sip", branch = "main", optional = true }
+# pyo3 must track siphon-sip's pin (currently 0.29): both link the `python`
+# native library, and cargo refuses two versions of a `links` crate in one graph.
+# auto-initialize boots the interpreter for the Rust integration tests.
+pyo3 = { version = "0.29", optional = true, features = ["auto-initialize"] }
+# Bridges an async handler / an originating helper's future onto tokio, the same
+# way the sibling addons (siphon-smpp, siphon-http) expose their awaitables.
+pyo3-async-runtimes = { version = "0.29", optional = true, features = ["tokio-runtime"] }
+
 [dev-dependencies]
 # criterion drives the routing-brain benches (benches/routing.rs).
 criterion = "0.8"
+
+[features]
+default = []
+# The siphon addon face: links siphon-sip + pyo3 and compiles the `python`
+# module. Used by `cargo {test,clippy} --features python`.
+python = ["dep:siphon-sip", "dep:pyo3", "dep:pyo3-async-runtimes"]
 
 [[bench]]
 name = "routing"
@@ -59,3 +91,6 @@ harness = false
 # Bug-catching tier denied; style/dead-code stay at default warn (CI runs
 # `cargo clippy --all-targets` and honours these levels).
 correctness = { level = "deny", priority = -1 }
+
+[package.metadata.docs.rs]
+all-features = true

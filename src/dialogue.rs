@@ -283,6 +283,11 @@ impl Dialogue {
         self.closed
     }
 
+    /// Whether we opened this dialogue (the initiator/originating side).
+    pub fn is_initiator(&self) -> bool {
+        self.role == Role::Initiator
+    }
+
     /// Stage an `Invoke` of `operation_code` carrying `argument`; returns the
     /// allocated invoke id. The dialogue must still be flushed with `send`/`end`.
     pub fn invoke(&mut self, operation_code: i64, argument: Option<Vec<u8>>) -> i64 {

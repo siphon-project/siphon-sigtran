@@ -15,16 +15,18 @@ It is built on the published SS7 codec crates (`mtp3`, `m3ua`, `m2pa`, `sccp`,
 top of them. The per-message routing decision always runs in Rust, synchronously
 and without I/O, so the node holds line rate.
 
-> **Status: phase 3.** The routing brain (phase 1) sits under a working SIGTRAN
+> **Status: phase 4.** The routing brain (phase 1) sits under a working SIGTRAN
 > transport over real kernel SCTP (phase 2): M3UA (ASPSM/ASPTM) and M2PA (link
 > alignment), SSNM folded into route state, and inbound DATA routed and forwarded
-> to the resolved egress. This release adds the MAP/CAP dialogue-termination SAP,
-> a synchronous TCAP transaction engine that terminates the messages addressed to
-> a subsystem we own (SRI-SM, updateLocation with an ISD leg, multi-segment
+> to the resolved egress. Phase 3 added the MAP/CAP dialogue-termination SAP, a
+> synchronous TCAP transaction engine that terminates the messages addressed to a
+> subsystem we own (SRI-SM, updateLocation with an ISD leg, multi-segment
 > MT-ForwardSM, CAMEL initialDP to connect), plus the full Prometheus metric
-> family set. It is exercised on-the-wire (`tests/wire.rs`, with a tshark
-> dissection gate) and against assembled TCAP end to end (`tests/dialogue.rs`).
-> The Python bindings are a later phase. See the [changelog](CHANGELOG.md).
+> family set. This release adds the **siphon addon face**: a `register(py,
+> parent)` seam, built and tested against siphon-sip the way the sibling addons
+> `siphon-smpp` and `siphon-http` are, that makes siphon-sigtran a scriptable
+> siphon node. See [the siphon addon](#the-siphon-addon) and the
+> [changelog](CHANGELOG.md).
 
 ## Quickstart
 
@@ -122,7 +124,58 @@ A content rule `match` combines `operation` (a name or a list), `imsi_in`,
 `route` (to a `dpc`+`ssn` or a `group`), `rewrite_cdpa_gt`, `screen`, or
 `python` (defer to a named hook, resolved by the runtime).
 
-## What it covers (phase 3)
+## The siphon addon
+
+The `python` feature turns siphon-sigtran into a scriptable siphon node. It is a
+siphon addon, not a package. There is no wheel and no PyPI. It builds and is
+tested against siphon-sip, the way the sibling addons `siphon-smpp` and
+`siphon-http` are. A composing siphon binary calls the one seam at startup:
+
+```rust
+// once, with the siphon package module as `parent`
+siphon_sigtran::python::register(py, parent)?;
+```
+
+That mounts the `ss7` / `gsm_map` / `gsm_cap` namespaces (plus `configure` /
+`metrics` and the shared types) onto `siphon`, so scripts import them with
+`from siphon import ...`. The default crate build pulls neither pyo3 nor siphon,
+so `cargo add siphon-sigtran` for the pure-Rust routing brain stays lean.
+Configure the node from a `sigtran.yaml`, then program it:
+
+```python
+import siphon
+from siphon import ss7, gsm_map
+
+siphon.configure("sigtran.yaml")   # a path, inline YAML, or a dict
+
+# 1. Program the Rust routing tables live (routing stays in Rust at line rate).
+ss7.routes.add(dpc=2000, linkset="transit", priority=3)
+ss7.gtt.add(match={"gt_prefix": "155502"}, to={"dpc": 2006, "ssn": 6})
+ss7.content.address_table("home-subs").add("15550199")
+
+# 2. Defer a config rule (action `{python: on_np_dip}`) to a hook.
+@ss7.content.on("on_np_dip")
+async def np_dip(msg):
+    return ss7.route(dpc=2006, ssn=6) if ported(msg.msisdn) else ss7.route_default()
+
+# 3. Terminate a MAP/CAP dialogue.
+@gsm_map.on_mo_forward_sm
+async def on_mo(dlg, arg):
+    await forward_to_smpp(sender=arg.sm_rp_oa, dest=arg.sm_rp_da, tpdu=arg.sm_rp_ui)
+    dlg.reply(gsm_map.mo_forward_sm_res())
+    dlg.end()
+```
+
+Routing decisions (`ss7.route` / `ss7.drop` / `ss7.route_default` / `ss7.allow`)
+and the general override `@ss7.on_route(when=...)` round out the three override
+styles. The runnable tutorial lives under [`examples/`](examples): `stp.py`
+(a thin STP), `smsc.py` (MAP termination + multi-segment MT), and `scp.py`
+(a CAMEL SCP). An `async def` handler runs on siphon's runtime; an originating
+helper (`gsm_map.send_routing_info_for_sm`, `dlg.result()`) returns an awaitable
+bridged onto tokio, and the SCTP transport that fulfils it is driven by the
+composing siphon binary.
+
+## What it covers (phase 4)
 
 | Area | Covered |
 |---|---|
@@ -134,7 +187,7 @@ A content rule `match` combines `operation` (a name or a list), `imsi_in`,
 | Transport (M3UA/M2PA/SCTP) | real kernel SCTP; M3UA ASPSM/ASPTM handshake + traffic modes, M2PA link alignment, SSNM to route state, load-share + failover, SI-agnostic transfer, own-opc + route-reflect loop guards |
 | Dialogue termination | TCAP transaction engine: Begin/Continue/End + AARQ/AARE, per-(SSN, operation) handlers, single response, held-open multi-leg, originating dialogues, invoke / dialogue timers + ceiling, aborts |
 | Metrics | full Prometheus family set (association / ASP / linkset state, route availability, MSU rate, GTT + content + MTP3-management counters, active dialogues, dialogue / invoke timeouts, aborts, loop guards) with a text renderer |
-| Python bindings | later phase |
+| siphon addon | `register(py, parent)` seam (built + tested against siphon-sip, no wheel/PyPI); live table programming (`ss7.routes` / `ss7.gtt` / `ss7.content`), deferred + general routing hooks, MAP/CAP termination decorators driving a `Dialogue` handle |
 
 The transport is proven end-to-end in `tests/wire.rs`: genuinely-assembled SS7
 MSUs (SRI-SM, updateLocation, MO/MT-ForwardSM, initialDP) driven over real SCTP

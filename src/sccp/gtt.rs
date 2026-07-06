@@ -196,6 +196,14 @@ impl GttResolver {
         self.result_of(target)
     }
 
+    /// Prepend a GTT rule live: a script programming the table via
+    /// `ss7.gtt.add(...)` (or caching a dip result with `ss7.routes.cache(...)`).
+    /// New rules go to the front so a freshly-programmed override wins over the
+    /// static rules compiled from config, matching first-match-wins.
+    pub fn add_rule(&mut self, rule: GttRule) {
+        self.rules.insert(0, rule);
+    }
+
     fn result_of(&self, target: &RouteTarget) -> Option<GttResult> {
         if let Some(tenant) = &target.tenant {
             // Cross-tenant hand-off carries a concrete dpc/ssn in the target.

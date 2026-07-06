@@ -6,8 +6,9 @@
 #     Publishing. Idempotent: skips if the tag's version is already on crates.io.
 #   * sbom          , SPDX + CycloneDX, attached to the release.
 #   * github-release, notes + SBOMs.
-#   * build-wheels* , the PyPI wheels for the (phase-3) Python bindings, GATED
-#     behind the repo variable `PYPI_PUBLISH`. Dormant until the bindings land.
+#
+# There is no PyPI job: siphon-sigtran is a siphon addon, consumed as a git/path
+# dependency by a composing siphon binary, not a wheel.
 #
 # NOTE: while `Cargo.toml` has `publish = false`, the crates-io job's
 # `cargo publish` will refuse to run, the machinery is here so a later release
@@ -96,72 +97,6 @@ jobs:
           path: |
             siphon-sigtran-*.spdx.json
             siphon-sigtran-*.cdx.json
-
-  # ── PyPI wheels (phase-3 Python bindings; gated on the PYPI_PUBLISH variable) ─
-  build-wheels:
-    name: wheels ${{ matrix.platform.runner }} ${{ matrix.platform.target }}
-    if: vars.PYPI_PUBLISH == 'true'
-    needs: verify-version
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - { runner: ubuntu-latest, target: x86_64 }
-          - { runner: ubuntu-latest, target: aarch64 }
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.x"
-      - uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist
-          manylinux: auto
-          sccache: "true"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
-          path: dist
-
-  build-sdist:
-    if: vars.PYPI_PUBLISH == 'true'
-    needs: verify-version
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist
-      - uses: actions/upload-artifact@v7
-        with:
-          name: sdist
-          path: dist
-
-  pypi-publish:
-    name: Publish to PyPI (Trusted Publishing)
-    if: vars.PYPI_PUBLISH == 'true'
-    needs: [build-wheels, build-sdist]
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write # mint the PyPI publish token via OIDC, no stored secret
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          pattern: "wheels-*"
-          merge-multiple: true
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          pattern: "sdist"
-          merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
 
   github-release:
     needs: [crates-io, sbom]
