@@ -1,0 +1,104 @@
+site_name: siphon-sigtran
+site_description: SIGTRAN/SS7 addon for SIPhon. Build an STP, HLR, SMSC or CAMEL SCP in hot-reloaded Python, with the transport, the codecs and every per-message routing decision in Rust.
+site_url: https://sigtran.siphon-sip.org/
+repo_url: https://github.com/siphon-project/siphon-sigtran
+repo_name: siphon-project/siphon-sigtran
+edit_uri: edit/main/docs/
+copyright: MIT-licensed. An addon for SIPhon.
+
+docs_dir: docs
+
+# OVERVIEW.md is the GitHub-facing architecture note the root README links to;
+# it is not part of the rendered site.
+exclude_docs: |
+  OVERVIEW.md
+
+# Make `mkdocs build --strict` fail on broken cross-references, including
+# in-page anchors, so CI catches a renamed heading before it ships.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/siphon-project/siphon-sigtran
+    - icon: material/web
+      link: https://siphon-sip.org/
+      name: SIPhon
+
+nav:
+  - Home: README.md
+  - Getting started:
+      - Concepts & architecture: concepts.md
+      - Quickstart: quickstart.md
+      - Configuration: configuration.md
+  - Cookbook:
+      - Overview: cookbook/index.md
+      - Building an STP: cookbook/stp.md
+      - Building an HLR: cookbook/hlr.md
+      - Building an SMSC: cookbook/smsc.md
+      - Building a CAMEL SCP: cookbook/scp.md
+  - Reference:
+      - Script API: script-api.md
+      - Routing model & coverage: routing.md
+  - Running in production:
+      - Deployment: deployment.md
+      - Kubernetes & scaling: kubernetes.md
+      - Performance: performance.md
+  - Using it in a SIPhon build: integration.md
+  - Commercial support: support.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
