@@ -58,21 +58,27 @@ node:
 # SCTP transport plane. m2pa links carry their adjacent PC inline.
 associations:
   - { id: hlr-a, adaptation: m3ua, role: server, addrs: [10.1.0.10], port: 2905 }
+  - { id: hlr-b, adaptation: m3ua, role: server, addrs: [10.1.0.11], port: 2905 }
   - { id: msc,   adaptation: m3ua, role: server, addrs: [10.1.0.12], port: 2905 }
   - { id: xit-1, adaptation: m2pa, role: client, addrs: [10.0.1.1], port: 3565, adjacent_pc: 3000 }
 
-# Linksets (m3ua = an application server with a traffic mode; m2pa = a linkset).
-linksets:
-  - { name: hlr,     adaptation: m3ua, traffic_mode: loadshare, links: [{assoc: hlr-a, slc: 0}] }
-  - { name: msc,     adaptation: m3ua, traffic_mode: override,  links: [{assoc: msc, slc: 0}] }
-  - { name: transit, adaptation: m2pa, traffic_mode: loadshare, links: [{assoc: xit-1, slc: 0}] }
+# M3UA Application Servers: one AS per destination, served by its ASPs (the m3ua
+# associations), with a traffic mode (RFC 4666).
+application_servers:
+  - { name: hlr, traffic_mode: loadshare, routing_context: 100, asps: [hlr-a, hlr-b] }
+  - { name: msc, traffic_mode: override,  routing_context: 101, asps: [msc] }
 
-# MTP3 routes: dpc -> linkset, priority (1 = primary, higher = alternate). The
-# adjacent PC of an m2pa link (3000) is an implicit route; no entry needed.
+# M2PA linksets (RFC 4165): links grouped toward an adjacent PC. SLS spreads
+# traffic across the links, so there is no traffic mode here.
+linksets:
+  - { name: transit, links: [{assoc: xit-1, slc: 0}] }
+
+# MTP3 routes: dpc -> an AS or a linkset, priority (1 = primary, higher = alternate).
+# The adjacent PC of an m2pa link (3000) is an implicit route; no entry needed.
 mtp3_routes:
-  - { dpc: 2000, linkset: hlr,     priority: 1 }
-  - { dpc: 2000, linkset: transit, priority: 2 }   # alternate to the HLR
-  - { dpc: 2002, linkset: msc,     priority: 1 }
+  - { dpc: 2000, as: hlr,          priority: 1 }
+  - { dpc: 2000, linkset: transit, priority: 2 }   # alternate to the HLR via M2PA transit
+  - { dpc: 2002, as: msc,          priority: 1 }
 
 # SCCP: local subsystems, GTT groups, GTT rules, and E.214/E.164 conversion.
 sccp:
@@ -111,8 +117,9 @@ content_routing:
 |---|---|
 | `node` | `point_code` (decimal), `variant` (`itu`/`ansi`/`china`), `network_indicator` |
 | `associations` | `id`, `adaptation` (`m3ua`/`m2pa`), `role` (`server`/`client`), `addrs`, `port`, `adjacent_pc` (m2pa) |
-| `linksets` | `name`, `adaptation`, `traffic_mode` (`loadshare`/`override`/`broadcast`), `links` (`assoc` + `slc`) |
-| `mtp3_routes` | `dpc`, `linkset`, `priority` (1 = primary) |
+| `application_servers` | `name`, `traffic_mode` (`loadshare`/`override`/`broadcast`), `routing_context`, `asps` (m3ua association ids) |
+| `linksets` | `name`, `links` (`assoc` + `slc`); M2PA only, adjacent PC comes from the association |
+| `mtp3_routes` | `dpc`, `as` or `linkset`, `priority` (1 = primary) |
 | `sccp.local_ssns` | the subsystems the node owns |
 | `sccp.gtt_groups` | `name`, `mode` (`cost`/`share`), `members` (`dpc` + `ssn` + `cost`/`weight`) |
 | `sccp.gtt` | ordered rules: `match` (`gt_prefix`, `gti`, `tt`, `np`, `nai`) to a `dpc`+`ssn`, a `group`, or `local` |
