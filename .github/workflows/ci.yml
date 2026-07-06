@@ -24,7 +24,9 @@ env:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    # Self-hosted runner: unmetered CI (off the org Actions spending limit) and it
+    # provides the sctp kernel module + libsctp the on-the-wire transport tests need.
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v7
 
