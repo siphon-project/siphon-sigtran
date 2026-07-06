@@ -65,21 +65,25 @@ bytes.
 import tpdu
 from siphon import ss7, gsm_map
 
-OUR_GT = b"\x15\x55\x01\x00"
+OUR_GT = b"\x91\x15\x55\x01\x00"          # our E.164 address, TBCD
 
 @gsm_map.on_mo_forward_sm
 async def on_mo(dlg, arg):
-    # arg.sm_rp_ui is the opaque SMS TPDU: decode it with tpdu to read the message.
-    rp = tpdu.parse_rp_data(arg.sm_rp_ui)              # RP-DATA carrying SMS-SUBMIT
+    # arg.sm_rp_ui is the opaque RP-DATA carrying an SMS-SUBMIT. tpdu decodes it.
+    rp = tpdu.parse_rp_data(arg.sm_rp_ui)
     submit = rp.sms_submit
-    await forward_to_store(dest=submit.tp_destination_address,
-                           text=submit.tp_user_data)
+    dest = submit.tp_destination_address.to_e164()     # the recipient MSISDN
+    text = submit.text()                               # decoded for GSM-7 / UCS-2 DCS
+    await spool(sender=rp.rp_originator_address, dest=dest, text=text)
     dlg.reply(gsm_map.mo_forward_sm_res())             # returnResultLast, in a closing End
     dlg.end()
 ```
 
 The moment you have the decoded TPDU, the message is yours: spool it, route it,
-hand it to another transport. The MAP side is two lines, `reply` then `end`.
+hand it to another transport. The MAP side is two lines, `reply` then `end`. A
+TPDU that arrives without the RP wrapper (an SMPP `submit_sm`, or a bare
+`sm-RP-UI`) parses just as well with `tpdu.parse_sms_submit(...)` /
+`tpdu.destination_from_tpdu(...)`.
 
 ## Originate multi-segment MT delivery
 
@@ -93,30 +97,38 @@ together, are built with `tpdu`. moreMessagesToSend and the dialogue lifetime
 are siphon-sigtran's job.
 
 The SMS-DELIVER segments are built by a small helper that calls `tpdu`. It packs
-the body (GSM-7 or UCS-2), splits it, and writes the concatenation
-User-Data-Header, all TS 23.040 / TS 23.038 work that belongs to `tpdu`:
+the body (`pack_gsm7`), builds each SMS-DELIVER, writes the concatenation
+User-Data-Header for a multi-segment message, and wraps each in an RP-DATA
+Network->MS, all TS 23.040 / TS 23.038 / TS 24.011 work that belongs to `tpdu`:
 
 ```python
-def sms_deliver_segments(sender, text):
-    """Return one or more SMS-DELIVER TPDU byte strings for `text`.
+def sms_deliver_segments(sender_msisdn, text):
+    """Return one or more RP-DATA(SMS-DELIVER) byte strings for `text`."""
+    oa = tpdu.Address(sender_msisdn, ton=1, npi=1)
 
-    tpdu owns the content: pack_gsm7 for the body, the SMS-DELIVER builder for
-    each TPDU, and a concatenation UserDataHeader when the message spans
-    multiple segments. siphon-sigtran never inspects these bytes.
-    """
-    ...   # your tpdu builder calls
+    # Short message: one SMS-DELIVER, no UDH. The builder packs the body and
+    # sets the septet TP-UDL for you.
+    if len(text) <= 160:
+        deliver = tpdu.SmsDeliver.builder(oa).gsm7_text(text).dcs(0x00).build()
+        return [tpdu.RpDataNetworkToMs(deliver).encode()]
+
+    # Concatenated: split into segments, each carrying the 8-bit concat IE
+    # (05 00 03 <ref> <total> <seq>). The full split is in examples/smsc.py.
+    return _concat_segments(oa, text)
 ```
 
-The delivery itself is one MAP dialogue held open across those segments:
+The `RpDataNetworkToMs(...).encode()` is what MAP calls the `sm-RP-UI`: the RPDU
+that carries the SMS-DELIVER. The delivery itself is one MAP dialogue held open
+across those segments:
 
 ```python
-async def deliver_mt(msisdn, text):
+async def deliver_mt(recipient_msisdn, sender_msisdn, text):
     # 1. Ask the HLR where the subscriber is (routed by GTT to the HLR).
-    res = await gsm_map.send_routing_info_for_sm(msisdn=msisdn, sc_addr=OUR_GT)
+    res = await gsm_map.send_routing_info_for_sm(msisdn=recipient_msisdn, sc_addr=OUR_GT)
     imsi, msc = res.imsi, res.network_node_number
 
-    # 2. Build the SMS-DELIVER segments with tpdu.
-    segments = sms_deliver_segments(sender=OUR_GT, text=text)
+    # 2. Build the RP-DATA(SMS-DELIVER) segments with tpdu.
+    segments = sms_deliver_segments(sender_msisdn, text)
 
     # 3. ONE MT dialogue to the serving MSC, held open across segments.
     dlg = gsm_map.begin(to=ss7.gt(msc), ssn=8, ac=gsm_map.AC.short_msg_mt_relay)
@@ -125,7 +137,7 @@ async def deliver_mt(msisdn, text):
         dlg.invoke(gsm_map.mt_forward_sm(
             imsi=imsi,
             sc_addr=OUR_GT,
-            tpdu=seg,                                # the SMS-DELIVER bytes from tpdu
+            tpdu=seg,                                # RP-DATA(SMS-DELIVER) bytes from tpdu
             more_messages_to_send=(i != last),
         ))
         dlg.send() if i != last else dlg.end()       # Continue while more, End on the last

@@ -116,30 +116,72 @@ whichever subsystem the message was addressed to.
 | `@gsm_map.on_mo_forward_sm` | MO-ForwardSM |
 | `@gsm_map.on_mt_forward_sm` | MT-ForwardSM |
 | `@gsm_map.on_send_routing_info_for_sm` | SendRoutingInfoForSM (SRI-SM) |
+| `@gsm_map.on_report_sm_delivery_status` | reportSM-DeliveryStatus |
+| `@gsm_map.on_ready_for_sm` | readyForSM |
 | `@gsm_map.on_update_location` | updateLocation |
+| `@gsm_map.on_cancel_location` | cancelLocation |
+| `@gsm_map.on_purge_ms` | purgeMS |
+| `@gsm_map.on_send_authentication_info` | sendAuthenticationInfo |
+| `@gsm_map.on_provide_subscriber_info` | provideSubscriberInfo |
 
-Each handler is `def on(dlg, arg)` where `dlg` is a [`Dialogue`](#dialogue) and
-`arg` is the decoded [`IncomingOp`](#incomingop).
+On the opening leg the handler is `def on(dlg, arg)` where `dlg` is a
+[`Dialogue`](#dialogue) and `arg` is the decoded [`IncomingOp`](#incomingop). On a
+follow-up leg of a held-open dialogue the same handler is re-entered with a
+[`PeerTurn`](#peerturn) in place of `arg`; branch on `arg.is_peer_turn`. See the
+[HLR held-open flow](cookbook/hlr.md#the-held-open-success-flow).
 
-### Builders and helpers
+### Result builders
+
+Each returns a [`Result`](#staged) to `dlg.reply(...)` with. It builds and encodes
+the real MAP result argument.
+
+| Call | Result |
+|---|---|
+| `gsm_map.mo_forward_sm_res()` | MO-ForwardSM ack. |
+| `gsm_map.mt_forward_sm_res()` | MT-ForwardSM ack. |
+| `gsm_map.send_routing_info_for_sm_res(imsi=…, network_node_number=…, lmsi=None)` | SRI-SM: the recipient IMSI and serving MSC/SGSN. |
+| `gsm_map.update_location_res(hlr_number=…)` | updateLocation: the HLR number. |
+| `gsm_map.send_authentication_info_res(quintuplets=None, triplets=None)` | Authentication vectors (each quintuplet `(rand, xres, ck, ik, autn)`, each triplet `(rand, sres, kc)`). |
+| `gsm_map.insert_subscriber_data_res()` | The VLR accepting pushed subscriber data. |
+| `gsm_map.cancel_location_res()` | cancelLocation ack. |
+| `gsm_map.purge_ms_res(freeze_tmsi=False, freeze_p_tmsi=False)` | purgeMS ack. |
+| `gsm_map.ready_for_sm_res()` | readyForSM ack. |
+
+### Invoke builders and helpers
 
 | Call | Returns / effect |
 |---|---|
-| `gsm_map.mo_forward_sm_res()` | A [`Result`](#staged) to `dlg.reply(...)` with. |
-| `gsm_map.mt_forward_sm_res()` | Same, for MT-ForwardSM. |
+| `gsm_map.insert_subscriber_data(imsi=None, msisdn=None)` | A staged [`Invoke`](#staged): the HLR pushing subscriber data inside a held-open updateLocation. |
 | `gsm_map.mt_forward_sm(imsi=…, sc_addr=…, tpdu=…, more_messages_to_send=False)` | A staged [`Invoke`](#staged) to `dlg.invoke(...)`. Set `more_messages_to_send` on all but the last segment. |
+| `gsm_map.mo_forward_sm(sc_addr=…, msisdn=…, tpdu=…, imsi=None)` | A staged [`Invoke`](#staged): relay a mobile-originated TPDU on to the service centre. |
 | `gsm_map.send_routing_info_for_sm(msisdn=…, sc_addr=…)` | An **awaitable** resolving to the HLR's routing info (`.imsi`, `.network_node_number`). Needs a running node (a live SCTP transport driven by the siphon binary). |
 | `gsm_map.begin(to=…, ssn=8, ac=…)` | Open an originating [`Dialogue`](#dialogue). `to` is an [`Address`](#address); `ac` is an application context from `gsm_map.AC`. |
 | `gsm_map.AC.short_msg_mt_relay` / `.short_msg_gateway` / `.short_msg_mo_relay` | MAP application-context handles (version 3) for `gsm_map.begin`. |
 
+The `tpdu=` argument of `mt_forward_sm` / `mo_forward_sm` and the address bytes
+are opaque to siphon-sigtran; build them with the `tpdu` crate. See
+[Building an SMSC](cookbook/smsc.md).
+
 ## `gsm_cap` { #gsm-cap }
 
-CAMEL CAP (TS 29.078).
+CAMEL CAP (TS 29.078). Termination decorators, then the gsmSCF invoke builders an
+SCP stages toward the gsmSSF.
 
-| Call | Returns / effect |
+| Decorator | Terminates |
 |---|---|
-| `@gsm_cap.on_initial_dp` | Terminate a CAMEL initialDP. Handler is `def on(dlg, idp)`, `idp` a decoded [`IncomingOp`](#incomingop) (with `.called_party_number`). |
-| `gsm_cap.connect(destination_routing_address=[…])` | A staged [`Invoke`](#staged): reroute the call to a list of called-party-number byte strings. |
+| `@gsm_cap.on_initial_dp` | A CAMEL initialDP. Handler is `def on(dlg, idp)`, `idp` a decoded [`IncomingOp`](#incomingop) (with `.called_party_number`). |
+| `@gsm_cap.on_event_report_bcsm` | An EventReportBCSM the gsmSSF sends when an armed detection point fires. |
+
+| Invoke builder | Stages |
+|---|---|
+| `gsm_cap.connect(destination_routing_address=[…])` | Connect: reroute the call to a list of called-party-number byte strings. |
+| `gsm_cap.release_call(cause=…)` | ReleaseCall: tear the call down with a Q.850 cause. |
+| `gsm_cap.request_report_bcsm_event(events=[(event_type, monitor_mode), …])` | RequestReportBCSMEvent: arm detection points (integers per TS 29.078). |
+| `gsm_cap.apply_charging(charging_characteristics=…, party_to_charge=None)` | ApplyCharging: an online-charging control. |
+
+Stage several in one dialogue (a RequestReportBCSMEvent then a Connect) with
+repeated `dlg.invoke(...)`, then `dlg.end()`. See
+[Building a CAMEL SCP](cookbook/scp.md#beyond-a-fixed-connect).
 
 ## The `Dialogue` handle { #dialogue }
 
@@ -195,6 +237,25 @@ argument (`arg` / `idp`).
     the sibling [`tpdu`](https://crates.io/crates/tpdu) crate, which also ships
     as a Python wheel. See [Building an SMSC](cookbook/smsc.md).
 
+### `PeerTurn` { #peerturn }
+
+On a follow-up leg of a held-open dialogue the termination handler is re-entered
+with a `PeerTurn` in place of the [`IncomingOp`](#incomingop): the decoded view of
+what the peer sent back (its `Continue` or `End`). Tell the two apart with
+`is_peer_turn` (false on the opening `IncomingOp`, true here). See the
+[HLR held-open flow](cookbook/hlr.md#the-held-open-success-flow).
+
+| Field / getter | Meaning |
+|---|---|
+| `is_peer_turn` | Always `True` (the opening `IncomingOp` is `False`). |
+| `is_end` | The peer closed the dialogue with a TCAP `End`. |
+| `is_result` / `is_invoke` / `is_error` | What the first component is. |
+| `operation_code` | The operation code of the first component (a result echoes the one it answers). |
+| `invoke_id` | The invoke id of the first component. |
+| `error_code` | The MAP/CAP error code, if the peer sent a `returnError`. |
+| `result` | The raw BER result parameter of the first `returnResultLast`, if present. |
+| `argument` | The raw BER argument of the first `Invoke` the peer sent, if present. |
+
 ### `MapView` { #mapview }
 
 The read-only decoded view handed to a content / route hook.
@@ -228,7 +289,9 @@ in-process termination seam used for local testing and the
 | `node.open_dialogues()` | Count of currently open TCAP dialogues. |
 | `node.metrics()` | The Prometheus text exposition. |
 | `node.assemble_begin(op, called_gt, called_ssn, calling_gt, arg=None, ac=None)` | Build a genuine inbound `Begin(AARQ, Invoke)` SCCP payload for `op` (a kebab-case operation name). Returns the SCCP bytes. |
+| `node.assemble_continue(dtid, staged, invoke_id=1, otid=None)` | Build an inbound `Continue` for a held-open dialogue keyed to `dtid` (read off the first reply with `decode`), carrying a staged [`Result`](#staged) or [`Invoke`](#staged). |
 | `node.deliver(payload, opc=…, dpc=…)` | Deliver one inbound SCCP payload to the dialogue engine and return the SCCP payloads to send back. |
+| `node.decode(payload)` | Decode an outbound SCCP payload into a read-only `Decoded` view: `.kind`, `.otid` / `.dtid`, `.app_context`, `.invoke` / `.invokes`, `.result`, `.error`. |
 | `node.dispatch_content(name, view)` | Run a registered content hook against a [`MapView`](#mapview) and return its decision. |
 
 ## Hot reload, restated

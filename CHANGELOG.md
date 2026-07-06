@@ -5,6 +5,64 @@ All notable changes are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the policy.
 
+## [0.5.0]
+
+Rounds out the siphon addon so a full HLR, SMSC and CAMEL SCP are genuinely
+scriptable, not just the SMS relay operations. The codec crates already carried
+every argument and result type; this release exposes them through the addon and
+adds the multi-leg bridge a held-open HLR needs.
+
+### Added
+- **MAP result builders** on `gsm_map`, each building and encoding the real MAP
+  result to reply with: `send_routing_info_for_sm_res` (the SRI-SM answer, IMSI +
+  network-node-number), `update_location_res` (HLR number),
+  `send_authentication_info_res` (quintuplet / triplet vectors),
+  `insert_subscriber_data_res`, `cancel_location_res`, `purge_ms_res`,
+  `ready_for_sm_res`.
+- **MAP invoke builders** on `gsm_map`: `insert_subscriber_data` (the HLR's ISD
+  invoke inside a held-open updateLocation) and `mo_forward_sm`, alongside the
+  existing `mt_forward_sm`.
+- **MAP termination decorators** for the operations a HLR / VLR terminates:
+  `on_send_authentication_info`, `on_cancel_location`, `on_purge_ms`,
+  `on_ready_for_sm`, `on_report_sm_delivery_status`, `on_provide_subscriber_info`
+  (the SMS ones already existed).
+- **The held-open multi-leg bridge**: on a follow-up leg the termination handler
+  is re-entered with a decoded `PeerTurn` in place of the opening `IncomingOp`,
+  exposing the peer's operation code and its decoded result / invoke / error
+  (`is_result`, `operation_code`, `result`, ...). One handler drives both legs,
+  branching on `is_peer_turn`, so a script can observe the insertSubscriberData
+  `returnResultLast` and then send the updateLocation result and close.
+- **CAMEL (`gsm_cap`)**: `release_call`, `request_report_bcsm_event` and
+  `apply_charging` invoke builders and an `on_event_report_bcsm` decorator, enough
+  to script initialDP to (RequestReportBCSMEvent +) connect / releaseCall to End.
+- **Node loopback seam**: `node.assemble_continue(dtid, staged, ...)` builds a peer
+  follow-up leg from a staged result / invoke, and `node.decode(payload)` decodes
+  an outbound SCCP payload into a read-only view (`kind`, `otid` / `dtid`,
+  `app_context`, `invoke` / `invokes`, `result`, `error`), so the held-open flow is
+  drivable in-process.
+- **`examples/smsc.py`** now uses the published `tpdu` API for the SMS content: on
+  MO it parses the RP-DATA / SMS-SUBMIT (`parse_rp_data`, `parse_sms_submit`,
+  `destination_from_tpdu`); on MT it builds each SMS-DELIVER (`pack_gsm7`,
+  `SmsDeliver`, a concatenation `UserDataHeader`) wrapped in
+  `RpDataNetworkToMs(...).encode()` as the `tpdu=` bytes. siphon-sigtran keeps the
+  MAP dialogue and moreMessagesToSend; `tpdu` owns the transfer-layer PDU.
+
+### Changed
+- The `gsm_map` / `gsm_cap` cookbook pages and the Script API reference cover the
+  new builders, decorators, the `PeerTurn` view and the `tpdu` split. The HLR
+  recipe is now a full success-path walk-through (updateLocation held open for the
+  insertSubscriberData leg, then the result; sendAuthenticationInfo answered with
+  vectors).
+
+### Tests
+- `tests/dialogue.rs` drives sendAuthenticationInfo (a quintuplet result) and a
+  fuller SCP (RequestReportBCSMEvent + Connect, and releaseCall) through the
+  engine, asserting the emitted TCAP decodes to the right operations and echoes the
+  transaction id. `tests/python.rs` drives the full held-open HLR (updateLocation,
+  an insertSubscriberData leg emitting a real result observed via the `PeerTurn`,
+  then the updateLocation result) and the fuller SCP through the real engine over
+  the addon.
+
 ## [0.4.0]
 
 Phase 4: the siphon addon face. siphon-sigtran becomes a scriptable siphon node,

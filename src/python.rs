@@ -40,14 +40,17 @@ use pyo3::types::{PyBytes, PyModule, PyModuleMethods};
 
 use rasn::types::{OctetString, Oid};
 use sccp::{GlobalTitle, SccpAddress, SccpMessage, SubsystemNumber, UnitData};
-use tcap::dialogue::DialoguePortion;
-use tcap::{Begin, Component, Invoke, OperationCode, TcapMessage};
+use tcap::dialogue::{DialoguePdu, DialoguePortion};
+use tcap::{
+    Begin, Component, Continue as TcapContinue, ErrorCode, Invoke, OperationCode, ReturnResult,
+    ReturnResultValue, TcapMessage,
+};
 
 use crate::config::{Config, ContentRule, GttRule, DEFAULT_TENANT};
 use crate::content::{ContentEngine, MapView as CoreMapView, Operation};
 use crate::dialogue::{
-    Dialogue as CoreDialogue, DialogueEngine, IncomingOp as CoreIncomingOp, PeerTurn,
-    TerminationHandler,
+    Dialogue as CoreDialogue, DialogueEngine, IncomingOp as CoreIncomingOp, PeerComponent,
+    PeerTurn, TerminationHandler,
 };
 use crate::mtp3::route::Destination;
 use crate::routing::Router;
@@ -64,6 +67,31 @@ create_exception!(
 fn err(msg: impl std::fmt::Display) -> PyErr {
     SigtranError::new_err(msg.to_string())
 }
+
+/// Encode a MAP result struct to BER and stage it as a `ReturnResultLast` for
+/// `dlg.reply(...)`, carrying the operation code.
+fn staged_map_res<T: rasn::Encode>(op: i64, res: &T) -> PyResult<StagedResult> {
+    let param = rasn::ber::encode(res).map_err(err)?;
+    Ok(StagedResult {
+        op,
+        param: Some(param),
+    })
+}
+
+/// Encode a MAP argument struct to BER and stage it as an `Invoke` for
+/// `dlg.invoke(...)`, carrying the operation code.
+fn staged_map_invoke<T: rasn::Encode>(op: i64, arg: &T) -> PyResult<StagedInvoke> {
+    let bytes = rasn::ber::encode(arg).map_err(err)?;
+    Ok(StagedInvoke {
+        op,
+        arg: Some(bytes),
+    })
+}
+
+/// A UMTS/EPS authentication quintuplet as `(rand, xres, ck, ik, autn)` bytes.
+type Quintuplet = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+/// A GSM authentication triplet as `(rand, sres, kc)` bytes.
+type Triplet = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 // ── Node state ───────────────────────────────────────────────────────────────
 
@@ -420,10 +448,175 @@ impl PyIncomingOp {
             .map(|n| PyBytes::new(py, n.as_ref()))
     }
 
+    /// Always false: an opening-leg view. A held-open handler that is re-entered
+    /// on a follow-up leg receives a [`PeerTurn`](PyPeerTurn) instead, whose
+    /// `is_peer_turn` is true, so one handler can tell the two legs apart.
+    #[getter]
+    fn is_peer_turn(&self) -> bool {
+        false
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "IncomingOp(operation_code={}, invoke_id={}, calling_gt={:?}, called_gt={:?})",
             self.operation_code, self.invoke_id, self.calling_gt, self.called_gt
+        )
+    }
+}
+
+// ── The decoded peer turn handed to a follow-up-leg handler ──────────────────
+
+/// One decoded component of a peer's follow-up turn.
+#[derive(Clone)]
+struct PeerComp {
+    kind: &'static str,
+    operation_code: Option<i64>,
+    invoke_id: i64,
+    parameter: Option<Vec<u8>>,
+    error_code: Option<i64>,
+}
+
+/// The decoded peer view a termination handler receives on a follow-up leg of a
+/// held-open dialogue (the peer's `Continue` or `End`). It carries the peer's
+/// operation code and the decoded result / invoke / error, so a script can, for
+/// example, observe an insertSubscriberData `returnResultLast` and then finish
+/// the updateLocation with its own result. The opening leg gets an
+/// [`IncomingOp`](PyIncomingOp) instead; branch on `is_peer_turn`.
+#[pyclass(name = "PeerTurn", module = "siphon", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyPeerTurn {
+    is_end: bool,
+    comps: Vec<PeerComp>,
+}
+
+impl PyPeerTurn {
+    fn from_peer(peer: &PeerTurn) -> Self {
+        let comps = peer
+            .components
+            .iter()
+            .map(|c| match c {
+                PeerComponent::Invoke {
+                    invoke_id,
+                    operation_code,
+                    argument,
+                } => PeerComp {
+                    kind: "invoke",
+                    operation_code: Some(*operation_code),
+                    invoke_id: *invoke_id,
+                    parameter: argument.clone(),
+                    error_code: None,
+                },
+                PeerComponent::Result {
+                    invoke_id,
+                    operation_code,
+                    parameter,
+                } => PeerComp {
+                    kind: "result",
+                    operation_code: *operation_code,
+                    invoke_id: *invoke_id,
+                    parameter: parameter.clone(),
+                    error_code: None,
+                },
+                PeerComponent::Error {
+                    invoke_id,
+                    error_code,
+                } => PeerComp {
+                    kind: "error",
+                    operation_code: None,
+                    invoke_id: *invoke_id,
+                    parameter: None,
+                    error_code: Some(*error_code),
+                },
+            })
+            .collect();
+        PyPeerTurn {
+            is_end: peer.is_end,
+            comps,
+        }
+    }
+
+    fn first(&self) -> Option<&PeerComp> {
+        self.comps.first()
+    }
+
+    fn first_of(&self, kind: &str) -> Option<&PeerComp> {
+        self.comps.iter().find(|c| c.kind == kind)
+    }
+}
+
+#[pymethods]
+impl PyPeerTurn {
+    /// Always true: distinguishes a follow-up-leg view from the opening
+    /// [`IncomingOp`](PyIncomingOp) a handler gets on the first leg.
+    #[getter]
+    fn is_peer_turn(&self) -> bool {
+        true
+    }
+
+    /// Whether this turn arrived in a TCAP `End` (the peer closed the dialogue).
+    #[getter]
+    fn is_end(&self) -> bool {
+        self.is_end
+    }
+
+    /// The operation code of the first component: a `returnResultLast` echoes the
+    /// operation it answers, an `Invoke` carries its own. `None` if absent.
+    #[getter]
+    fn operation_code(&self) -> Option<i64> {
+        self.first().and_then(|c| c.operation_code)
+    }
+
+    /// The invoke id of the first component, if any.
+    #[getter]
+    fn invoke_id(&self) -> Option<i64> {
+        self.first().map(|c| c.invoke_id)
+    }
+
+    /// Whether the peer answered one of our invokes with a `returnResultLast`.
+    #[getter]
+    fn is_result(&self) -> bool {
+        self.first_of("result").is_some()
+    }
+
+    /// Whether the peer sent us an `Invoke` inside the open dialogue.
+    #[getter]
+    fn is_invoke(&self) -> bool {
+        self.first_of("invoke").is_some()
+    }
+
+    /// Whether the peer rejected one of our invokes with a `returnError`.
+    #[getter]
+    fn is_error(&self) -> bool {
+        self.first_of("error").is_some()
+    }
+
+    /// The MAP/CAP error code, if the peer sent a `returnError`.
+    #[getter]
+    fn error_code(&self) -> Option<i64> {
+        self.first_of("error").and_then(|c| c.error_code)
+    }
+
+    /// The raw BER result parameter of the first `returnResultLast`, if present.
+    #[getter]
+    fn result<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.first_of("result")
+            .and_then(|c| c.parameter.as_ref())
+            .map(|p| PyBytes::new(py, p))
+    }
+
+    /// The raw BER argument of the first `Invoke` the peer sent, if present.
+    #[getter]
+    fn argument<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.first_of("invoke")
+            .and_then(|c| c.parameter.as_ref())
+            .map(|p| PyBytes::new(py, p))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PeerTurn(is_end={}, components={})",
+            self.is_end,
+            self.comps.len()
         )
     }
 }
@@ -647,8 +840,17 @@ struct PyHandler {
     func: Py<PyAny>,
 }
 
+/// Which leg of the dialogue is re-entering the handler, and the decoded view to
+/// hand it: the opening operation (`Begin`), nothing (an originating `on_start`),
+/// or the peer's follow-up turn (`Continue` / `End`).
+enum Leg<'a> {
+    Begin(&'a CoreIncomingOp),
+    Start,
+    Continue(&'a PeerTurn),
+}
+
 impl PyHandler {
-    fn run(&self, dlg: &mut CoreDialogue, op: Option<&CoreIncomingOp>) {
+    fn run(&self, dlg: &mut CoreDialogue, leg: Leg<'_>) {
         Python::attach(|py| {
             let pydlg = match Bound::new(
                 py,
@@ -661,8 +863,8 @@ impl PyHandler {
                 }
             };
 
-            let call = match op {
-                Some(o) => {
+            let call = match leg {
+                Leg::Begin(o) => {
                     let arg = PyIncomingOp {
                         operation_code: o.operation_code,
                         invoke_id: o.invoke_id,
@@ -678,7 +880,14 @@ impl PyHandler {
                         }
                     }
                 }
-                None => self.func.bind(py).call1((&pydlg,)),
+                Leg::Continue(peer) => match Bound::new(py, PyPeerTurn::from_peer(peer)) {
+                    Ok(t) => self.func.bind(py).call1((&pydlg, &t)),
+                    Err(e) => {
+                        eprintln!("siphon-sigtran: building PeerTurn failed: {e}");
+                        return;
+                    }
+                },
+                Leg::Start => self.func.bind(py).call1((&pydlg,)),
             };
 
             match call {
@@ -700,15 +909,15 @@ impl PyHandler {
 
 impl TerminationHandler for PyHandler {
     fn on_begin(&self, dialogue: &mut CoreDialogue, op: &CoreIncomingOp) {
-        self.run(dialogue, Some(op));
+        self.run(dialogue, Leg::Begin(op));
     }
 
     fn on_start(&self, dialogue: &mut CoreDialogue) {
-        self.run(dialogue, None);
+        self.run(dialogue, Leg::Start);
     }
 
-    fn on_continue(&self, dialogue: &mut CoreDialogue, _peer: &PeerTurn) {
-        self.run(dialogue, None);
+    fn on_continue(&self, dialogue: &mut CoreDialogue, peer: &PeerTurn) {
+        self.run(dialogue, Leg::Continue(peer));
     }
 }
 
@@ -1079,6 +1288,46 @@ impl GsmMap {
         func
     }
 
+    /// Terminate sendAuthenticationInfo (`@gsm_map.on_send_authentication_info`).
+    fn on_send_authentication_info(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, gsm_map::op_codes::SEND_AUTHENTICATION_INFO, &func);
+        func
+    }
+
+    /// Terminate cancelLocation (`@gsm_map.on_cancel_location`).
+    fn on_cancel_location(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, gsm_map::op_codes::CANCEL_LOCATION, &func);
+        func
+    }
+
+    /// Terminate purgeMS (`@gsm_map.on_purge_ms`).
+    fn on_purge_ms(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, gsm_map::op_codes::PURGE_MS, &func);
+        func
+    }
+
+    /// Terminate readyForSM (`@gsm_map.on_ready_for_sm`).
+    fn on_ready_for_sm(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, gsm_map::op_codes::READY_FOR_SM, &func);
+        func
+    }
+
+    /// Terminate reportSM-DeliveryStatus (`@gsm_map.on_report_sm_delivery_status`).
+    fn on_report_sm_delivery_status(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, gsm_map::op_codes::REPORT_SM_DELIVERY_STATUS, &func);
+        func
+    }
+
+    /// Terminate provideSubscriberInfo (`@gsm_map.on_provide_subscriber_info`).
+    fn on_provide_subscriber_info(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(
+            py,
+            gsm_map::operations::subscriber_info::op_codes::PROVIDE_SUBSCRIBER_INFO,
+            &func,
+        );
+        func
+    }
+
     /// Build a MO-ForwardSM result to reply with (`dlg.reply(...)`).
     fn mo_forward_sm_res(&self) -> StagedResult {
         StagedResult {
@@ -1093,6 +1342,164 @@ impl GsmMap {
             op: Operation::MtForwardSm.op_code(),
             param: None,
         }
+    }
+
+    /// Build a SendRoutingInfoForSM (SRI-SM) result, the HLR's answer to an
+    /// SMS-GMSC: the recipient's `imsi` and the serving `network_node_number`
+    /// (the MSC/SGSN to deliver to). `lmsi` is the optional VLR-assigned local id.
+    #[pyo3(signature = (*, imsi, network_node_number, lmsi=None))]
+    fn send_routing_info_for_sm_res(
+        &self,
+        imsi: Vec<u8>,
+        network_node_number: Vec<u8>,
+        lmsi: Option<Vec<u8>>,
+    ) -> PyResult<StagedResult> {
+        use gsm_map::operations::sri_sm::RoutingInfoForSmRes;
+        use gsm_map::types::LocationInfoWithLmsi;
+        let res = RoutingInfoForSmRes {
+            imsi: imsi.into(),
+            location_info_with_lmsi: LocationInfoWithLmsi {
+                network_node_number: network_node_number.into(),
+                lmsi: lmsi.map(Into::into),
+                gprs_node_indicator: None,
+                additional_number: None,
+            },
+        };
+        staged_map_res(gsm_map::op_codes::SEND_ROUTING_INFO_FOR_SM, &res)
+    }
+
+    /// Build an updateLocation result carrying the `hlr_number`: the successful
+    /// close of a location update, sent once the VLR has taken the subscriber data.
+    #[pyo3(signature = (*, hlr_number))]
+    fn update_location_res(&self, hlr_number: Vec<u8>) -> PyResult<StagedResult> {
+        use gsm_map::operations::location::UpdateLocationRes;
+        let res = UpdateLocationRes {
+            hlr_number: hlr_number.into(),
+        };
+        staged_map_res(gsm_map::op_codes::UPDATE_LOCATION, &res)
+    }
+
+    /// Build a sendAuthenticationInfo result carrying authentication vectors.
+    /// Pass `quintuplets` (UMTS/EPS AKA, each `(rand, xres, ck, ik, autn)`) or
+    /// `triplets` (GSM, each `(rand, sres, kc)`); omit both for an empty set.
+    #[pyo3(signature = (*, quintuplets=None, triplets=None))]
+    fn send_authentication_info_res(
+        &self,
+        quintuplets: Option<Vec<Quintuplet>>,
+        triplets: Option<Vec<Triplet>>,
+    ) -> PyResult<StagedResult> {
+        use gsm_map::operations::auth::{
+            AuthenticationQuintuplet, AuthenticationSetList, AuthenticationTriplet,
+            SendAuthenticationInfoRes,
+        };
+        let set = match (quintuplets, triplets) {
+            (Some(q), _) => Some(AuthenticationSetList::QuintupletList(
+                q.into_iter()
+                    .map(|(rand, xres, ck, ik, autn)| AuthenticationQuintuplet {
+                        rand: rand.into(),
+                        xres: xres.into(),
+                        ck: ck.into(),
+                        ik: ik.into(),
+                        autn: autn.into(),
+                    })
+                    .collect(),
+            )),
+            (None, Some(t)) => Some(AuthenticationSetList::TripletList(
+                t.into_iter()
+                    .map(|(rand, sres, kc)| AuthenticationTriplet {
+                        rand: rand.into(),
+                        sres: sres.into(),
+                        kc: kc.into(),
+                    })
+                    .collect(),
+            )),
+            (None, None) => None,
+        };
+        let res = SendAuthenticationInfoRes {
+            authentication_set_list: set,
+        };
+        staged_map_res(gsm_map::op_codes::SEND_AUTHENTICATION_INFO, &res)
+    }
+
+    /// Build an insertSubscriberData result: the VLR accepting the pushed data.
+    fn insert_subscriber_data_res(&self) -> PyResult<StagedResult> {
+        use gsm_map::operations::subscriber_data::{op_codes, InsertSubscriberDataRes};
+        let res = InsertSubscriberDataRes {
+            teleservice_list: None,
+            bearer_service_list: None,
+            odb_general_data: None,
+        };
+        staged_map_res(op_codes::INSERT_SUBSCRIBER_DATA, &res)
+    }
+
+    /// Build a cancelLocation result: the VLR confirming it dropped the record.
+    fn cancel_location_res(&self) -> PyResult<StagedResult> {
+        use gsm_map::operations::location::CancelLocationRes;
+        staged_map_res(gsm_map::op_codes::CANCEL_LOCATION, &CancelLocationRes {})
+    }
+
+    /// Build a purgeMS result. `freeze_tmsi` / `freeze_p_tmsi` ask the VLR/SGSN
+    /// to hold the (P-)TMSI back from reuse for a while.
+    #[pyo3(signature = (*, freeze_tmsi=false, freeze_p_tmsi=false))]
+    fn purge_ms_res(&self, freeze_tmsi: bool, freeze_p_tmsi: bool) -> PyResult<StagedResult> {
+        use gsm_map::operations::location::PurgeMsRes;
+        let res = PurgeMsRes {
+            freeze_tmsi: freeze_tmsi.then_some(()),
+            freeze_p_tmsi: freeze_p_tmsi.then_some(()),
+        };
+        staged_map_res(gsm_map::op_codes::PURGE_MS, &res)
+    }
+
+    /// Build a readyForSM result: the HLR acknowledging the alert.
+    fn ready_for_sm_res(&self) -> PyResult<StagedResult> {
+        use gsm_map::operations::ready_for_sm::ReadyForSmRes;
+        staged_map_res(gsm_map::op_codes::READY_FOR_SM, &ReadyForSmRes {})
+    }
+
+    /// Stage an insertSubscriberData invoke: the HLR pushes subscriber data to
+    /// the VLR inside a held-open updateLocation. `imsi` / `msisdn` are the TBCD
+    /// address bytes.
+    #[pyo3(signature = (*, imsi=None, msisdn=None))]
+    fn insert_subscriber_data(
+        &self,
+        imsi: Option<Vec<u8>>,
+        msisdn: Option<Vec<u8>>,
+    ) -> PyResult<StagedInvoke> {
+        use gsm_map::operations::subscriber_data::{op_codes, InsertSubscriberDataArg};
+        let arg = InsertSubscriberDataArg {
+            imsi: imsi.map(Into::into),
+            msisdn: msisdn.map(Into::into),
+            category: None,
+            subscriber_status: None,
+            bearer_service_list: None,
+            teleservice_list: None,
+            odb_data: None,
+            roaming_restricted_in_sgsn_due_to_unsupported_feature: None,
+            network_access_mode: None,
+        };
+        staged_map_invoke(op_codes::INSERT_SUBSCRIBER_DATA, &arg)
+    }
+
+    /// Stage an MO-ForwardSM invoke: relay a mobile-originated `tpdu` from
+    /// `msisdn` to the service centre `sc_addr` (an IWMSC handing MO SMS on to
+    /// the SMSC). `imsi` is the optional originating IMSI.
+    #[pyo3(signature = (*, sc_addr, msisdn, tpdu, imsi=None))]
+    fn mo_forward_sm(
+        &self,
+        sc_addr: Vec<u8>,
+        msisdn: Vec<u8>,
+        tpdu: Vec<u8>,
+        imsi: Option<Vec<u8>>,
+    ) -> PyResult<StagedInvoke> {
+        use gsm_map::operations::mo_forward_sm::MoForwardSmArg;
+        use gsm_map::{SmRpDa, SmRpOa};
+        let arg = MoForwardSmArg {
+            sm_rp_da: SmRpDa::ServiceCentreAddressDa(sc_addr.into()),
+            sm_rp_oa: SmRpOa::MsIsdn(msisdn.into()),
+            sm_rp_ui: tpdu.into(),
+            imsi: imsi.map(Into::into),
+        };
+        staged_map_invoke(gsm_map::op_codes::MO_FORWARD_SM, &arg)
     }
 
     /// Stage an MT-ForwardSM invoke: deliver `tpdu` to `imsi` from `sc_addr`,
@@ -1221,6 +1628,14 @@ impl GsmCap {
         func
     }
 
+    /// Terminate a CAMEL EventReportBCSM (`@gsm_cap.on_event_report_bcsm`): the
+    /// gsmSSF reporting an armed detection point back to the SCP inside an open
+    /// dialogue.
+    fn on_event_report_bcsm(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, gsm_cap::op_codes::EVENT_REPORT_BCSM, &func);
+        func
+    }
+
     /// Stage a CAP Connect invoke: reroute the call to
     /// `destination_routing_address` (a list of called-party-number byte strings).
     #[pyo3(signature = (*, destination_routing_address))]
@@ -1243,9 +1658,103 @@ impl GsmCap {
         })
     }
 
+    /// Stage a CAP ReleaseCall invoke: tear the call down with a Q.850 `cause`.
+    #[pyo3(signature = (*, cause))]
+    fn release_call(&self, cause: Vec<u8>) -> PyResult<StagedInvoke> {
+        use gsm_cap::operations::ReleaseCallArg;
+        let arg = ReleaseCallArg {
+            cause: cause.into(),
+        };
+        let bytes = gsm_cap::encode(&arg).map_err(err)?;
+        Ok(StagedInvoke {
+            op: gsm_cap::op_codes::RELEASE_CALL,
+            arg: Some(bytes),
+        })
+    }
+
+    /// Stage a CAP RequestReportBCSMEvent invoke: arm the gsmSSF to report the
+    /// given BCSM detection points. `events` is a list of
+    /// `(event_type_bcsm, monitor_mode)` integer pairs (TS 29.078), e.g.
+    /// `(7, 0)` = oAnswer interrupted, `(9, 1)` = oDisconnect notifyAndContinue.
+    #[pyo3(signature = (events))]
+    fn request_report_bcsm_event(&self, events: Vec<(i64, i64)>) -> PyResult<StagedInvoke> {
+        use gsm_cap::operations::RequestReportBcsmEventArg;
+        use gsm_cap::types::BcsmEvent;
+        let bcsm_events = events
+            .into_iter()
+            .map(|(et, mm)| {
+                Ok(BcsmEvent {
+                    event_type_bcsm: event_type_bcsm(et)?,
+                    monitor_mode: monitor_mode(mm)?,
+                    leg_id: None,
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let arg = RequestReportBcsmEventArg { bcsm_events };
+        let bytes = gsm_cap::encode(&arg).map_err(err)?;
+        Ok(StagedInvoke {
+            op: gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+            arg: Some(bytes),
+        })
+    }
+
+    /// Stage a CAP ApplyCharging invoke: hand the gsmSSF the encoded charging
+    /// characteristics (an online-charging control, e.g. a call-duration limit).
+    /// `party_to_charge` names the leg to meter.
+    #[pyo3(signature = (*, charging_characteristics, party_to_charge=None))]
+    fn apply_charging(
+        &self,
+        charging_characteristics: Vec<u8>,
+        party_to_charge: Option<Vec<u8>>,
+    ) -> PyResult<StagedInvoke> {
+        use gsm_cap::operations::ApplyChargingArg;
+        let arg = ApplyChargingArg {
+            ach_billing_charging_characteristics: charging_characteristics.into(),
+            party_to_charge: party_to_charge.map(Into::into),
+        };
+        let bytes = gsm_cap::encode(&arg).map_err(err)?;
+        Ok(StagedInvoke {
+            op: gsm_cap::op_codes::APPLY_CHARGING,
+            arg: Some(bytes),
+        })
+    }
+
     fn __repr__(&self) -> String {
         "gsm_cap".to_string()
     }
+}
+
+/// Map a TS 29.078 EventTypeBCSM integer to the codec enum.
+fn event_type_bcsm(v: i64) -> PyResult<gsm_cap::types::EventTypeBcsm> {
+    use gsm_cap::types::EventTypeBcsm as E;
+    Ok(match v {
+        2 => E::CollectedInfo,
+        3 => E::AnalysedInformation,
+        4 => E::RouteSelectFailure,
+        5 => E::OCalledPartyBusy,
+        6 => E::ONoAnswer,
+        7 => E::OAnswer,
+        9 => E::ODisconnect,
+        10 => E::OAbandon,
+        12 => E::TermAttemptAuthorized,
+        13 => E::TBusy,
+        14 => E::TNoAnswer,
+        15 => E::TAnswer,
+        17 => E::TDisconnect,
+        18 => E::TAbandon,
+        _ => return Err(err(format!("unknown EventTypeBCSM {v}"))),
+    })
+}
+
+/// Map a TS 29.078 MonitorMode integer to the codec enum.
+fn monitor_mode(v: i64) -> PyResult<gsm_cap::types::MonitorMode> {
+    use gsm_cap::types::MonitorMode as M;
+    Ok(match v {
+        0 => M::Interrupted,
+        1 => M::NotifyAndContinue,
+        2 => M::Transparent,
+        _ => return Err(err(format!("unknown MonitorMode {v}"))),
+    })
 }
 
 /// Register a Python termination handler for `op` on every owned subsystem (so
@@ -1265,6 +1774,184 @@ fn register_termination(py: Python<'_>, op: i64, func: &Py<PyAny>) {
             func: func.clone_ref(py),
         });
         engine.register(ssn, op, handler);
+    }
+}
+
+// ── A decoded outbound message (loopback / test seam) ────────────────────────
+
+/// A read-only decode of an outbound TCAP message, produced by
+/// [`Node::decode`](Node) for loopback / tests.
+#[pyclass(name = "Decoded", module = "siphon", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyDecoded {
+    /// `begin` / `continue` / `end` / `abort` / `unidirectional`.
+    #[pyo3(get)]
+    kind: String,
+    otid: Vec<u8>,
+    dtid: Vec<u8>,
+    /// The AARQ or AARE application-context OID arcs, if the message carried one.
+    #[pyo3(get)]
+    app_context: Option<Vec<u32>>,
+    invokes: Vec<(i64, Option<Vec<u8>>)>,
+    result: Option<(i64, Option<Vec<u8>>)>,
+    error: Option<(i64, i64)>,
+}
+
+/// The parts of a decoded TCAP message [`PyDecoded::from_tcap`] pulls out: the
+/// kind, the transaction ids, and borrows of the dialogue portion + components.
+type MsgParts<'a> = (
+    &'static str,
+    Vec<u8>,
+    Vec<u8>,
+    Option<&'a DialoguePortion>,
+    Option<&'a Vec<Component>>,
+);
+
+/// Pull the first local `returnResult` out as `(op, parameter)`.
+fn first_local_result(rr: &ReturnResult) -> Option<(i64, Option<Vec<u8>>)> {
+    let v = rr.result.as_ref()?;
+    match v.operation_code {
+        OperationCode::Local(op) => Some((op, v.parameter.as_ref().map(|p| p.as_bytes().to_vec()))),
+        OperationCode::Global(_) => None,
+    }
+}
+
+impl PyDecoded {
+    fn from_tcap(msg: &TcapMessage) -> Self {
+        let (kind, otid, dtid, dp, comps): MsgParts<'_> = match msg {
+            TcapMessage::Begin(b) => (
+                "begin",
+                b.otid.to_vec(),
+                Vec::new(),
+                b.dialogue_portion.as_ref(),
+                b.components.as_ref(),
+            ),
+            TcapMessage::Continue(c) => (
+                "continue",
+                c.otid.to_vec(),
+                c.dtid.to_vec(),
+                c.dialogue_portion.as_ref(),
+                c.components.as_ref(),
+            ),
+            TcapMessage::End(e) => (
+                "end",
+                Vec::new(),
+                e.dtid.to_vec(),
+                e.dialogue_portion.as_ref(),
+                e.components.as_ref(),
+            ),
+            TcapMessage::Abort(a) => ("abort", Vec::new(), a.dtid.to_vec(), None, None),
+            TcapMessage::Unidirectional(_) => {
+                ("unidirectional", Vec::new(), Vec::new(), None, None)
+            }
+        };
+
+        let app_context = dp
+            .and_then(DialoguePortion::dialogue_pdu)
+            .and_then(|pdu| match pdu {
+                DialoguePdu::Aarq {
+                    application_context_name,
+                    ..
+                }
+                | DialoguePdu::Aare {
+                    application_context_name,
+                    ..
+                } => Some(application_context_name.as_ref().to_vec()),
+                _ => None,
+            });
+
+        let mut invokes = Vec::new();
+        let mut result = None;
+        let mut error = None;
+        if let Some(cs) = comps {
+            for c in cs {
+                match c {
+                    Component::Invoke(inv) => {
+                        if let OperationCode::Local(op) = inv.operation_code {
+                            invokes
+                                .push((op, inv.parameter.as_ref().map(|p| p.as_bytes().to_vec())));
+                        }
+                    }
+                    Component::ReturnResultLast(rr) | Component::ReturnResultNotLast(rr) => {
+                        if result.is_none() {
+                            result = first_local_result(rr);
+                        }
+                    }
+                    Component::ReturnError(re) => {
+                        if let ErrorCode::Local(code) = re.error_code {
+                            error.get_or_insert((re.invoke_id, code));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        PyDecoded {
+            kind: kind.to_string(),
+            otid,
+            dtid,
+            app_context,
+            invokes,
+            result,
+            error,
+        }
+    }
+}
+
+#[pymethods]
+impl PyDecoded {
+    /// The originating transaction id (bytes).
+    #[getter]
+    fn otid<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.otid)
+    }
+
+    /// The destination transaction id (bytes).
+    #[getter]
+    fn dtid<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.dtid)
+    }
+
+    /// The first `Invoke` as `(operation_code, argument_bytes_or_None)`, if any.
+    #[getter]
+    fn invoke<'py>(&self, py: Python<'py>) -> Option<(i64, Option<Bound<'py, PyBytes>>)> {
+        self.invokes
+            .first()
+            .map(|(op, p)| (*op, p.as_ref().map(|b| PyBytes::new(py, b))))
+    }
+
+    /// Every `Invoke` the message carried, as `(operation_code, argument)` pairs
+    /// (a message can stage several, e.g. a RequestReportBCSMEvent then a Connect).
+    #[getter]
+    fn invokes<'py>(&self, py: Python<'py>) -> Vec<(i64, Option<Bound<'py, PyBytes>>)> {
+        self.invokes
+            .iter()
+            .map(|(op, p)| (*op, p.as_ref().map(|b| PyBytes::new(py, b))))
+            .collect()
+    }
+
+    /// The first `ReturnResultLast` as `(operation_code, parameter_bytes_or_None)`.
+    #[getter]
+    fn result<'py>(&self, py: Python<'py>) -> Option<(i64, Option<Bound<'py, PyBytes>>)> {
+        self.result
+            .as_ref()
+            .map(|(op, p)| (*op, p.as_ref().map(|b| PyBytes::new(py, b))))
+    }
+
+    /// The first `ReturnError` as `(invoke_id, error_code)`, if any.
+    #[getter]
+    fn error(&self) -> Option<(i64, i64)> {
+        self.error
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Decoded(kind={}, otid={}, dtid={})",
+            self.kind,
+            hex(&self.otid),
+            hex(&self.dtid)
+        )
     }
 }
 
@@ -1361,6 +2048,75 @@ impl Node {
         Ok(PyBytes::new(py, &sccp))
     }
 
+    /// Assemble an inbound TCAP `Continue` SCCP payload for loopback / tests: a
+    /// follow-up leg from the peer on an open dialogue, addressed to `dtid` (the
+    /// OTID the engine allocated, read off the first reply with `decode`). Pass a
+    /// staged component the same builders produce: a [`Result`](StagedResult) (a
+    /// peer `returnResultLast`, e.g. `gsm_map.insert_subscriber_data_res()`) or an
+    /// [`Invoke`](StagedInvoke). `invoke_id` keys the component; `otid` sets the
+    /// peer's own transaction id. Returns the SCCP payload bytes.
+    #[pyo3(signature = (*, dtid, staged, invoke_id=1, otid=None))]
+    fn assemble_continue<'py>(
+        &self,
+        py: Python<'py>,
+        dtid: Vec<u8>,
+        staged: &Bound<'_, PyAny>,
+        invoke_id: i64,
+        otid: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let component = if let Ok(res) = staged.cast::<StagedResult>() {
+            let res = res.borrow();
+            Component::ReturnResultLast(ReturnResult {
+                invoke_id,
+                result: Some(ReturnResultValue {
+                    operation_code: OperationCode::Local(res.op),
+                    parameter: res.param.clone().map(rasn::types::Any::new),
+                }),
+            })
+        } else if let Ok(inv) = staged.cast::<StagedInvoke>() {
+            let inv = inv.borrow();
+            Component::Invoke(Invoke {
+                invoke_id,
+                linked_id: None,
+                operation_code: OperationCode::Local(inv.op),
+                parameter: inv.arg.clone().map(rasn::types::Any::new),
+            })
+        } else {
+            return Err(err(
+                "assemble_continue: `staged` must be a Result or an Invoke",
+            ));
+        };
+
+        let cont = TcapMessage::Continue(TcapContinue {
+            otid: otid.unwrap_or_else(|| vec![0x22, 0x22, 0x22, 0x22]).into(),
+            dtid: dtid.into(),
+            dialogue_portion: None,
+            components: Some(vec![component]),
+        });
+        let tcap_bytes = tcap::encode(&cont).map_err(err)?;
+
+        // The engine keys a follow-up leg on its DTID, so the exact SCCP
+        // addressing only needs to be a valid UDT toward a subsystem we own.
+        let called = gt_address("15550100", Some(6));
+        let calling = gt_address("15550170", Some(6));
+        let udt = UnitData::new(called, calling, tcap_bytes);
+        let sccp = SccpMessage::Udt(udt).encode().map_err(err)?;
+        Ok(PyBytes::new(py, &sccp))
+    }
+
+    /// Decode one outbound SCCP payload (a UDT carrying TCAP) into a read-only
+    /// [`Decoded`](PyDecoded) view for loopback / tests: the message kind, the
+    /// transaction ids, the AARQ/AARE application context, and the first invoke /
+    /// result / error it carries.
+    fn decode(&self, payload: Vec<u8>) -> PyResult<PyDecoded> {
+        let udt = match SccpMessage::decode(&payload).map_err(err)? {
+            SccpMessage::Udt(u) => u,
+            _ => return Err(err("payload is not an SCCP UDT")),
+        };
+        let msg = tcap::decode(&udt.data).map_err(err)?;
+        Ok(PyDecoded::from_tcap(&msg))
+    }
+
     /// Run a registered content hook against a decoded view and return its
     /// decision (drives the `async def` hook to completion). Raises if no hook of
     /// that name is registered.
@@ -1439,6 +2195,8 @@ fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Decision>()?;
     m.add_class::<PyMapView>()?;
     m.add_class::<PyIncomingOp>()?;
+    m.add_class::<PyPeerTurn>()?;
+    m.add_class::<PyDecoded>()?;
     m.add_class::<PyDialogue>()?;
     m.add_class::<Address>()?;
     m.add_class::<MapAcHandle>()?;

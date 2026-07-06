@@ -70,17 +70,40 @@ sccp:
 ## Beyond a fixed Connect
 
 The Connect target is just bytes you decide, so the SCP is as smart as your
-`reroute`:
+`reroute`: dip a portability database and cache the answer, or pick a destination
+from a time-of-day plan or a subscriber profile.
 
-- **Number portability**: dip a live database, then cache the answer so repeat
-  calls to the same number decide without the dip.
-- **Time-of-day / per-subscriber plans**: choose the destination from a
-  schedule or a subscriber profile.
-- **Release instead of connect**: for a barred call, answer with a release
-  rather than a Connect (a different CAP component in the same dialogue).
+A real SCP also does more than connect. Stage several CAP invokes in the one
+dialogue, then flush them together:
 
-For a routing-heavy node that mixes call control with transit SS7, pair this
-with the [STP recipe](stp.md); to terminate SMS instead, see
+```python
+@gsm_cap.on_initial_dp
+async def on_idp(dlg, idp):
+    if barred(idp.calling_party_number):
+        dlg.invoke(gsm_cap.release_call(cause=b"\x90\x95"))   # Q.850 call rejected
+        dlg.end()
+        return
+    # Arm the answer / disconnect detection points, meter the call, then connect.
+    dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 0), (9, 1)]))
+    dlg.invoke(gsm_cap.apply_charging(charging_characteristics=budget(idp)))
+    dlg.invoke(gsm_cap.connect(destination_routing_address=[reroute(idp.called_party_number)]))
+    dlg.end()
+```
+
+- **`gsm_cap.release_call(cause=…)`** answers a barred call with a release instead
+  of a Connect.
+- **`gsm_cap.request_report_bcsm_event(events=[…])`** arms detection points; each is
+  an `(event_type_bcsm, monitor_mode)` integer pair (TS 29.078), e.g. `(7, 0)` =
+  oAnswer interrupted, `(9, 1)` = oDisconnect notifyAndContinue.
+- **`gsm_cap.apply_charging(charging_characteristics=…)`** hands the gsmSSF an
+  online-charging control (a call-duration limit, say).
+
+When you arm detection points, the gsmSSF reports them back with EventReportBCSM
+in the same dialogue. Terminate those with `@gsm_cap.on_event_report_bcsm` and
+drive the next leg (extend the timer, play an announcement, release).
+
+For a routing-heavy node that mixes call control with transit SS7, pair this with
+the [STP recipe](stp.md); to terminate SMS instead, see
 [Building an SMSC](smsc.md).
 
 ## Next

@@ -130,14 +130,100 @@ assert replied["op"] == 46          # MO-ForwardSM operation code
 assert len(frames) == 1             # a single closing End
 assert node.open_dialogues() == 0   # the End closed it
 
-# ── The CAP namespace stages a Connect and registers an initialDP handler ─────
+# ── Full HLR: updateLocation held open for an insertSubscriberData leg ─────────
+# The engine terminates updateLocation; the HLR pushes subscriber data to the
+# VLR (a Continue that holds the dialogue open), then closes with the
+# updateLocation result once the VLR acks the ISD. One Python handler drives both
+# legs, branching on `event.is_peer_turn`.
+HLR_GT = b"\x91\x15\x55\x01\x90"
+UL_IMSI = b"\x00\x11\x10\x00\x00\x00\x00\x14"
+UL_MSISDN = b"\x91\x15\x55\x01\x70"
+
+@gsm_map.on_update_location
+async def on_ul(dlg, event):
+    if event.is_peer_turn:
+        # The VLR acked the insertSubscriberData; finish with the UL result.
+        if event.is_result:
+            assert event.operation_code == 7      # the ISD op the result answers
+            dlg.reply(gsm_map.update_location_res(hlr_number=HLR_GT))
+            dlg.end()
+        return
+    # Opening leg (event is the updateLocation IncomingOp): push subscriber data.
+    assert event.is_peer_turn is False
+    dlg.invoke(gsm_map.insert_subscriber_data(imsi=UL_IMSI, msisdn=UL_MSISDN))
+    dlg.send()
+
+ul_begin = node.assemble_begin(
+    op="update-location", called_gt="15550100", called_ssn=6, calling_gt="15550180",
+)
+leg1 = node.deliver(ul_begin, opc=2000, dpc=1000)
+assert len(leg1) == 1
+d1 = node.decode(leg1[0])
+assert d1.kind == "continue"           # the ISD leg held the dialogue open
+isd_op, _isd_arg = d1.invoke
+assert isd_op == 7                      # insertSubscriberData
+assert node.open_dialogues() == 1
+our_tid = d1.otid
+
+# The VLR acks the ISD; the HLR must close with the updateLocation result.
+ack = node.assemble_continue(dtid=our_tid, staged=gsm_map.insert_subscriber_data_res())
+leg2 = node.deliver(ack, opc=2000, dpc=1000)
+assert len(leg2) == 1
+d2 = node.decode(leg2[0])
+assert d2.kind == "end"                 # the UL result closes in an End
+assert d2.dtid == b"\x11\x22\x33\x44"   # echoes the VLR's original OTID (assemble_begin's)
+ul_op, ul_param = d2.result
+assert ul_op == 2                       # updateLocation
+assert ul_param                         # carries the HLR number
+assert node.open_dialogues() == 0       # dialogue closed on the result
+
+# ── sendAuthenticationInfo answered with a quintuplet vector, single shot ─────
+@gsm_map.on_send_authentication_info
+async def on_sai(dlg, arg):
+    dlg.reply(gsm_map.send_authentication_info_res(
+        quintuplets=[(b"\x00" * 16, b"\x11" * 8, b"\x22" * 16, b"\x33" * 16, b"\x44" * 16)]
+    ))
+    dlg.end()
+
+sai_begin = node.assemble_begin(
+    op="send-auth-info", called_gt="15550100", called_ssn=6, calling_gt="15550180",
+)
+sai_out = node.deliver(sai_begin, opc=2000, dpc=1000)
+assert len(sai_out) == 1
+ds = node.decode(sai_out[0])
+assert ds.kind == "end"
+sai_op, sai_param = ds.result
+assert sai_op == 56                     # sendAuthenticationInfo
+assert sai_param                        # the auth vectors
+assert node.open_dialogues() == 0
+
+# ── A fuller CAMEL SCP: initialDP answered with RequestReportBCSMEvent + Connect
 @gsm_cap.on_initial_dp
 async def on_idp(dlg, idp):
+    # Arm the answer / disconnect detection points, then connect the call onward.
+    dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 0), (9, 1)]))
     dlg.invoke(gsm_cap.connect(destination_routing_address=[b"\x00\x11\x22"]))
     dlg.end()
 
-staged = gsm_cap.connect(destination_routing_address=[b"\x00\x11\x22"])
-assert staged is not None
+# An SCP that also receives EventReportBCSM registers a handler for it.
+@gsm_cap.on_event_report_bcsm
+async def on_erb(dlg, arg):
+    dlg.end()
+
+assert on_erb is not None
+assert gsm_cap.release_call(cause=b"\x90\x03") is not None
+assert gsm_cap.apply_charging(charging_characteristics=b"\x01\x02\x03") is not None
+
+idp_begin = node.assemble_begin(
+    op="initial-dp", called_gt="15550100", called_ssn=6, calling_gt="15550170",
+)
+idp_out = node.deliver(idp_begin, opc=2000, dpc=1000)
+assert len(idp_out) == 1
+di = node.decode(idp_out[0])
+assert di.kind == "end"                 # both invokes ride the closing End
+idp_ops = [op for (op, _) in di.invokes]
+assert 23 in idp_ops and 20 in idp_ops  # RequestReportBCSMEvent + Connect
+assert node.open_dialogues() == 0
 
 # ── The originating helper returns an awaitable bridged onto tokio ────────────
 # Awaiting it needs a live SCTP transport (a running node); without one it

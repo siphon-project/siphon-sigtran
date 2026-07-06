@@ -93,14 +93,76 @@ terminated dialogue must always be answered.
 
 ## The held-open success flow
 
-A full HLR answers a successful updateLocation with an **insertSubscriberData**
-leg held open toward the VLR, then the updateLocation result once the VLR acks
-the ISD. That is the engine's held-open, multi-leg
-[termination shape](../routing.md#termination): a `Begin` answered with a
-`Continue` that keeps the dialogue open, the peer's follow-up re-entering the
-handler to finish with an `End`. The dialogue engine drives that shape (it is
-exercised end to end in the crate's dialogue tests); it is the same
-stage-then-flush model the [SMSC recipe](smsc.md) uses for multi-segment MT.
+A full updateLocation does not just accept. The HLR pushes the subscriber's
+profile to the VLR with an **insertSubscriberData** leg held open, then sends the
+updateLocation result once the VLR acks it. That is the engine's held-open,
+multi-leg [termination shape](../routing.md#termination): a `Begin` answered with
+a `Continue` that keeps the dialogue open, the VLR's follow-up re-entering the
+handler to finish with an `End`.
+
+One handler drives both legs. On the opening leg it gets the decoded
+[`IncomingOp`](../script-api.md#incomingop); on the follow-up leg it gets a
+[`PeerTurn`](../script-api.md#peerturn), the decoded view of what the VLR sent
+back. Branch on `is_peer_turn`.
+
+```python
+from siphon import gsm_map
+
+HLR_NUMBER = b"\x91\x15\x55\x01\x90"          # our E.164 address, TBCD
+
+@gsm_map.on_update_location
+async def on_update_location(dlg, event):
+    if event.is_peer_turn:
+        # Follow-up leg: the VLR answered our insertSubscriberData.
+        if event.is_result:
+            dlg.reply(gsm_map.update_location_res(hlr_number=HLR_NUMBER))
+            dlg.end()                            # close with the updateLocation result
+        elif event.is_error:
+            dlg.abort()                          # the VLR refused the data
+        return
+    # Opening leg: push the subscriber profile, hold the dialogue open.
+    imsi, msisdn = await load_profile(event.argument)
+    dlg.invoke(gsm_map.insert_subscriber_data(imsi=imsi, msisdn=msisdn))
+    dlg.send()                                   # Continue: ISD invoke, dialogue stays open
+```
+
+Three moving parts, all on real API:
+
+- **`gsm_map.insert_subscriber_data(imsi=…, msisdn=…)`** stages the ISD invoke the
+  HLR sends inside the open dialogue. `dlg.send()` flushes it as a `Continue` that
+  carries the AARE and keeps the transaction open.
+- **The [`PeerTurn`](../script-api.md#peerturn)** the follow-up leg receives says
+  what the VLR sent: `is_result` / `is_invoke` / `is_error`, the `operation_code`
+  it answers, and the raw `result` bytes. The handler waits for the ISD
+  `returnResultLast` before it closes.
+- **`gsm_map.update_location_res(hlr_number=…)`** builds the updateLocation result;
+  `dlg.reply(...)` then `dlg.end()` sends it in the closing `End`, which echoes the
+  VLR's original transaction id.
+
+The engine drives that shape end to end (it is exercised in the crate's dialogue
+tests and the addon test). It is the same stage-then-flush model the
+[SMSC recipe](smsc.md) uses for multi-segment MT.
+
+## Answer sendAuthenticationInfo
+
+An authentication query is single-shot: the VLR asks for vectors, the HLR answers
+with them in a closing `End`. Build the vectors with
+`gsm_map.send_authentication_info_res`, quintuplets for UMTS/EPS AKA (each
+`(rand, xres, ck, ik, autn)`) or triplets for GSM (each `(rand, sres, kc)`).
+
+```python
+@gsm_map.on_send_authentication_info
+async def on_send_auth_info(dlg, arg):
+    vectors = await mint_quintuplets(arg.argument, n=5)   # your Milenage / TUAK
+    dlg.reply(gsm_map.send_authentication_info_res(quintuplets=vectors))
+    dlg.end()
+```
+
+`mint_quintuplets` runs your Milenage or TUAK against the subscriber's K / OP; the
+MAP side is one `reply` then `end`. cancelLocation, purgeMS, readyForSM and
+reportSM-DeliveryStatus terminate the same single-shot way, each with its own
+`@gsm_map.on_*` decorator (see the [Script API](../script-api.md#gsm-map)) and its
+own `*_res` builder.
 
 ## Next
 

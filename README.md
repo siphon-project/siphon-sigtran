@@ -173,6 +173,14 @@ async def on_mo(dlg, arg):
     dlg.end()
 ```
 
+The termination decorators, result builders and invoke builders cover a full HLR
+(updateLocation held open for an insertSubscriberData leg, then the result;
+sendAuthenticationInfo), SMSC (MO / MT ForwardSM, SRI-SM) and CAMEL SCP (initialDP
+to connect or releaseCall, with RequestReportBCSMEvent and applyCharging). On a
+held-open dialogue's follow-up leg the handler is re-entered with a decoded
+`PeerTurn`, so it can observe the peer's reply (the insertSubscriberData
+`returnResultLast`, say) before it closes.
+
 Routing decisions (`ss7.route` / `ss7.drop` / `ss7.route_default` / `ss7.allow`)
 and the general override `@ss7.on_route(when=...)` round out the three override
 styles. The runnable tutorial lives under [`examples/`](examples): `stp.py`
@@ -194,7 +202,7 @@ composing siphon binary.
 | Transport (M3UA/M2PA/SCTP) | real kernel SCTP; M3UA ASPSM/ASPTM handshake + traffic modes, M2PA link alignment, SSNM to route state, load-share + failover, SI-agnostic transfer, own-opc + route-reflect loop guards |
 | Dialogue termination | TCAP transaction engine: Begin/Continue/End + AARQ/AARE, per-(SSN, operation) handlers, single response, held-open multi-leg, originating dialogues, invoke / dialogue timers + ceiling, aborts |
 | Metrics | full Prometheus family set (association / ASP / linkset state, route availability, MSU rate, GTT + content + MTP3-management counters, active dialogues, dialogue / invoke timeouts, aborts, loop guards) with a text renderer |
-| siphon addon | `register(py, parent)` seam (built + tested against siphon-sip, no wheel/PyPI); live table programming (`ss7.routes` / `ss7.gtt` / `ss7.content`), deferred + general routing hooks, MAP/CAP termination decorators driving a `Dialogue` handle |
+| siphon addon | `register(py, parent)` seam (built + tested against siphon-sip, no wheel/PyPI); live table programming (`ss7.routes` / `ss7.gtt` / `ss7.content`), deferred + general routing hooks; MAP/CAP termination decorators for the full HLR / SMSC / SCP set, MAP result + invoke builders (`update_location_res`, `send_authentication_info_res`, `insert_subscriber_data`, ...) and CAP `connect` / `release_call` / `request_report_bcsm_event` / `apply_charging`, driving a `Dialogue` handle with a decoded `PeerTurn` on held-open follow-up legs |
 
 The transport is proven end-to-end in `tests/wire.rs`: genuinely-assembled SS7
 MSUs (SRI-SM, updateLocation, MO/MT-ForwardSM, initialDP) driven over real SCTP

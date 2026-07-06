@@ -13,7 +13,12 @@ use std::time::{Duration, Instant};
 
 use rasn::types::{Any, Oid};
 
-use gsm_cap::operations::ConnectArg;
+use gsm_cap::operations::{ConnectArg, ReleaseCallArg, RequestReportBcsmEventArg};
+use gsm_cap::types::{BcsmEvent, EventTypeBcsm, MonitorMode};
+use gsm_map::operations::auth::{
+    AuthenticationQuintuplet, AuthenticationSetList, SendAuthenticationInfoArg,
+    SendAuthenticationInfoRes,
+};
 use gsm_map::operations::location::UpdateLocationRes;
 use gsm_map::operations::mo_forward_sm::MoForwardSmRes;
 use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
@@ -51,6 +56,7 @@ const PEER_TID: [u8; 4] = [0x22, 0x22, 0x22, 0x22];
 // MAP/CAP application contexts.
 const AC_SRI_SM: [u32; 8] = [0, 4, 0, 0, 1, 0, 20, 3]; // shortMsgGateway v3
 const AC_NET_LOC_UP: [u32; 8] = [0, 4, 0, 0, 1, 0, 1, 3]; // networkLocUp v3
+const AC_INFO_RETRIEVAL: [u32; 8] = [0, 4, 0, 0, 1, 0, 5, 3]; // infoRetrieval v3
 const AC_MO_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 21, 3]; // shortMsgMO-Relay v3
 const AC_MT_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 25, 3]; // shortMsgMT-Relay v3
 const AC_CAP: [u32; 8] = [0, 4, 0, 0, 1, 21, 3, 4]; // gsmSSF-scfGeneric v3
@@ -215,6 +221,37 @@ fn result_of(msg: &TcapMessage) -> (i64, Vec<u8>) {
     }
 }
 
+/// Every `Invoke` component the message carries as `(op, argument)`, in order.
+fn invoke_all(msg: &TcapMessage) -> Vec<(i64, Vec<u8>)> {
+    let comps = match msg {
+        TcapMessage::End(e) => e.components.clone(),
+        TcapMessage::Continue(c) => c.components.clone(),
+        TcapMessage::Begin(b) => b.components.clone(),
+        _ => None,
+    };
+    comps
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|c| match c {
+            Component::Invoke(inv) => match inv.operation_code {
+                OperationCode::Local(v) => Some((
+                    v,
+                    inv.parameter
+                        .map(|p| p.as_bytes().to_vec())
+                        .unwrap_or_default(),
+                )),
+                OperationCode::Global(_) => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The operation codes of every `Invoke` component the message carries, in order.
+fn invoke_ops(msg: &TcapMessage) -> Vec<i64> {
+    invoke_all(msg).into_iter().map(|(op, _)| op).collect()
+}
+
 /// The AARE application-context arcs the reply carries (asserting an AARE is
 /// present), or `None`.
 fn aare_ac(msg: &TcapMessage) -> Option<Vec<u32>> {
@@ -327,6 +364,46 @@ fn connect_arg() -> Vec<u8> {
     gsm_cap::encode(&arg).expect("encode connect")
 }
 
+fn send_auth_info_res() -> Vec<u8> {
+    let res = SendAuthenticationInfoRes {
+        authentication_set_list: Some(AuthenticationSetList::QuintupletList(vec![
+            AuthenticationQuintuplet {
+                rand: vec![0x11; 16].into(),
+                xres: vec![0x22; 8].into(),
+                ck: vec![0x33; 16].into(),
+                ik: vec![0x44; 16].into(),
+                autn: vec![0x55; 16].into(),
+            },
+        ])),
+    };
+    rasn::ber::encode(&res).expect("encode sai res")
+}
+
+fn rrbe_arg() -> Vec<u8> {
+    let arg = RequestReportBcsmEventArg {
+        bcsm_events: vec![
+            BcsmEvent {
+                event_type_bcsm: EventTypeBcsm::OAnswer,
+                monitor_mode: MonitorMode::Interrupted,
+                leg_id: None,
+            },
+            BcsmEvent {
+                event_type_bcsm: EventTypeBcsm::ODisconnect,
+                monitor_mode: MonitorMode::NotifyAndContinue,
+                leg_id: None,
+            },
+        ],
+    };
+    gsm_cap::encode(&arg).expect("encode rrbe")
+}
+
+fn release_call_arg() -> Vec<u8> {
+    let arg = ReleaseCallArg {
+        cause: vec![0x90, 0x03].into(), // Q.850 normal, unspecified
+    };
+    gsm_cap::encode(&arg).expect("encode release")
+}
+
 // ── Test handlers (the phase-4 Python handlers, done in Rust here) ───────────
 
 /// A fake HLR answering SRI-SM with an imsi + serving-MSC number, single shot.
@@ -376,6 +453,39 @@ impl TerminationHandler for FakeScp {
     fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
         dlg.invoke(gsm_cap::op_codes::CONNECT, Some(connect_arg()));
         dlg.end(); // connect Invoke in the closing dialogue
+    }
+}
+
+/// A fake HLR answering sendAuthenticationInfo with a quintuplet vector, single
+/// shot (the vectors ride the closing End).
+struct FakeHlrSendAuthInfo;
+impl TerminationHandler for FakeHlrSendAuthInfo {
+    fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
+        dlg.reply(op.operation_code, Some(send_auth_info_res()));
+        dlg.end();
+    }
+}
+
+/// A fuller SCP: arm two BCSM detection points (RequestReportBCSMEvent) and then
+/// connect, both in the closing End.
+struct FakeScpFull;
+impl TerminationHandler for FakeScpFull {
+    fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
+        dlg.invoke(
+            gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+            Some(rrbe_arg()),
+        );
+        dlg.invoke(gsm_cap::op_codes::CONNECT, Some(connect_arg()));
+        dlg.end();
+    }
+}
+
+/// An SCP that releases the call instead of connecting (a barred number).
+struct FakeScpRelease;
+impl TerminationHandler for FakeScpRelease {
+    fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
+        dlg.invoke(gsm_cap::op_codes::RELEASE_CALL, Some(release_call_arg()));
+        dlg.end();
     }
 }
 
@@ -696,6 +806,154 @@ fn initial_dp_gets_connect_in_the_closing_end() {
         "the End carries a connect invoke"
     );
     let _: ConnectArg = gsm_cap::decode(&param).expect("connect decodes");
+}
+
+#[test]
+fn send_auth_info_gets_auth_vectors_in_an_end() {
+    let engine = engine_with(
+        6,
+        gsm_map::op_codes::SEND_AUTHENTICATION_INFO,
+        Arc::new(FakeHlrSendAuthInfo),
+    );
+    let otid = [0x51, 0x52, 0x53, 0x54];
+    let arg = rasn::ber::encode(&SendAuthenticationInfoArg {
+        imsi: tbcd(IMSI).into(),
+        number_of_requested_vectors: 5.into(),
+        re_synchronisation_info: None,
+        requesting_node_type: None,
+    })
+    .unwrap();
+
+    let out = engine.deliver(
+        &begin_msu(
+            gsm_map::op_codes::SEND_AUTHENTICATION_INFO,
+            arg,
+            &AC_INFO_RETRIEVAL,
+            SubsystemNumber::Hlr,
+            &otid,
+        ),
+        "ingress",
+    );
+    assert_eq!(out.len(), 1);
+    let reply = decode_reply(&out[0]);
+    assert!(
+        matches!(reply, TcapMessage::End(_)),
+        "sendAuthenticationInfo answered in a TCAP End"
+    );
+    assert_eq!(dtid_of(&reply), otid, "the End echoes the request OTID");
+    assert_eq!(aare_ac(&reply).as_deref(), Some(&AC_INFO_RETRIEVAL[..]));
+
+    let (op, param) = result_of(&reply);
+    assert_eq!(op, gsm_map::op_codes::SEND_AUTHENTICATION_INFO);
+    let res: SendAuthenticationInfoRes = rasn::ber::decode(&param).expect("decode sai res");
+    match res.authentication_set_list {
+        Some(AuthenticationSetList::QuintupletList(q)) => {
+            assert_eq!(q.len(), 1, "one quintuplet returned");
+            assert_eq!(q[0].rand.len(), 16);
+            assert_eq!(q[0].autn.len(), 16);
+        }
+        other => panic!("expected a quintuplet list, got {other:?}"),
+    }
+    assert_eq!(engine.open_dialogues(), 0, "single-shot dialogue closed");
+}
+
+#[test]
+fn initial_dp_gets_rrbe_and_connect_in_the_closing_end() {
+    let engine = engine_with(146, gsm_cap::op_codes::INITIAL_DP, Arc::new(FakeScpFull));
+    let otid = [0xC0, 0xFF, 0xEE, 0x01];
+    let arg = gsm_cap::encode(&gsm_cap::operations::InitialDpArg {
+        service_key: 100.into(),
+        called_party_number: Some(isdn("15550123").into()),
+        calling_party_number: Some(isdn(PEER_GT).into()),
+        calling_partys_category: None,
+        original_called_party_id: None,
+        event_type_bcsm: None,
+        redirecting_party_id: None,
+        imsi: Some(tbcd(IMSI).into()),
+        location_information: None,
+        call_reference_number: None,
+        msc_address: None,
+        called_party_bcd_number: None,
+        time_and_timezone: None,
+    })
+    .unwrap();
+
+    let out = engine.deliver(
+        &begin_msu(
+            gsm_cap::op_codes::INITIAL_DP,
+            arg,
+            &AC_CAP,
+            SubsystemNumber::Cap,
+            &otid,
+        ),
+        "ingress",
+    );
+    let reply = decode_reply(&out[0]);
+    assert!(matches!(reply, TcapMessage::End(_)));
+    assert_eq!(dtid_of(&reply), otid, "the End echoes the request OTID");
+
+    let ops = invoke_ops(&reply);
+    assert_eq!(
+        ops,
+        vec![
+            gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+            gsm_cap::op_codes::CONNECT
+        ],
+        "the End carries RequestReportBCSMEvent then Connect"
+    );
+    // Both components decode as their CAP operations.
+    let rrbe = invoke_all(&reply)
+        .into_iter()
+        .find(|(op, _)| *op == gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT)
+        .expect("rrbe present")
+        .1;
+    let arg: RequestReportBcsmEventArg = gsm_cap::decode(&rrbe).expect("rrbe decodes");
+    assert_eq!(arg.bcsm_events.len(), 2);
+    assert_eq!(engine.open_dialogues(), 0);
+}
+
+#[test]
+fn initial_dp_gets_release_call_for_a_barred_number() {
+    let engine = engine_with(146, gsm_cap::op_codes::INITIAL_DP, Arc::new(FakeScpRelease));
+    let otid = [0xBA, 0x88, 0xED, 0x00];
+    let arg = gsm_cap::encode(&gsm_cap::operations::InitialDpArg {
+        service_key: 7.into(),
+        called_party_number: Some(isdn("15550666").into()),
+        calling_party_number: Some(isdn(PEER_GT).into()),
+        calling_partys_category: None,
+        original_called_party_id: None,
+        event_type_bcsm: None,
+        redirecting_party_id: None,
+        imsi: Some(tbcd(IMSI).into()),
+        location_information: None,
+        call_reference_number: None,
+        msc_address: None,
+        called_party_bcd_number: None,
+        time_and_timezone: None,
+    })
+    .unwrap();
+
+    let out = engine.deliver(
+        &begin_msu(
+            gsm_cap::op_codes::INITIAL_DP,
+            arg,
+            &AC_CAP,
+            SubsystemNumber::Cap,
+            &otid,
+        ),
+        "ingress",
+    );
+    let reply = decode_reply(&out[0]);
+    assert!(matches!(reply, TcapMessage::End(_)));
+    assert_eq!(dtid_of(&reply), otid);
+    let (op, param) = invoke_of(&reply);
+    assert_eq!(
+        op,
+        gsm_cap::op_codes::RELEASE_CALL,
+        "a barred call is released, not connected"
+    );
+    let _: ReleaseCallArg = gsm_cap::decode(&param).expect("releaseCall decodes");
+    assert_eq!(engine.open_dialogues(), 0);
 }
 
 #[test]
