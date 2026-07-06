@@ -85,7 +85,7 @@ sccp:
   local_ssns: [6, 8]          # inbound for these terminates locally
   gtt_groups:
     - { name: ag-hlr,    mode: cost,  members: [{dpc: 2000, ssn: 6, cost: 1}, {dpc: 2001, ssn: 6, cost: 2}] }
-    - { name: ag-router, mode: share, members: [{dpc: 2003, ssn: 8, weight: 1}, {dpc: 2004, ssn: 8, weight: 1}] }
+    - { name: ag-home-router, mode: share, members: [{dpc: 2003, ssn: 8, weight: 1}, {dpc: 2004, ssn: 8, weight: 1}] }
   gtt:
     - { match: {gt_prefix: "155501", gti: 4, tt: 0, np: 1, nai: 4}, to: {group: ag-hlr} }
     - { match: {gt_prefix: "1555"},                                 to: {dpc: 2000, ssn: 6} }
@@ -101,10 +101,10 @@ content_routing:
   address_tables:
     - { name: home-subs, addrs: ["15550142", "15550143"] }
   imsi_tables:
-    - { name: buyer-a, prefixes: ["001010", "001011"] }
+    - { name: customer-a, prefixes: ["001010", "001011"] }
   rules:
-    - name: buyer-a-home
-      match:  { operation: [update-location, send-auth-info, cancel-location], imsi_in: buyer-a }
+    - name: customer-a-home
+      match:  { operation: [update-location, send-auth-info, cancel-location], imsi_in: customer-a }
       action: { route: {dpc: 2005, ssn: 6} }
     - name: sri-sm-np
       match:  { operation: sri-sm }
