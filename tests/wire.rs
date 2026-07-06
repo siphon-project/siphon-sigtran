@@ -13,7 +13,8 @@
 //! * load-share spread across an AS's two ASPs (SLS-keyed),
 //! * failover to an M2PA linkset when the primary AS's ASP drops,
 //! * SI-agnostic transfer (an ISUP `SI=5` MSU transits by DPC, undecoded),
-//! * the two transfer-path loop guards (own-OPC, route-reflection),
+//! * the transfer-path loop guards (own-OPC, route-reflection) and the SCCP
+//!   hop-counter guard on a GTT translation (decrement, then drop + XUDTS return),
 //! * the `sua` adaptation reserved-but-refused,
 //! * a tshark dissection gate over the forwarded frames.
 //!
@@ -44,7 +45,9 @@ use gsm_map::types::{LocationInfoWithLmsi, SmRpDa, SmRpOa};
 use m2pa::{LinkState, LinkStatusMessage, M2paMessage, M2paStateMachine};
 use m3ua::{M3uaMessage, MessageType, ProtocolData};
 use mtp3::NetworkIndicator;
-use sccp::{GlobalTitle, SccpAddress, SccpMessage, SubsystemNumber, UnitData};
+use sccp::{
+    ExtendedUnitData, GlobalTitle, ReturnCause, SccpAddress, SccpMessage, SubsystemNumber, UnitData,
+};
 use tcap::dialogue::{DialoguePdu, DialoguePortion};
 use tcap::{Begin, Component, Invoke, OperationCode, ReturnResult, ReturnResultValue, TcapMessage};
 
@@ -208,6 +211,61 @@ fn sccp_udt(called_ssn: SubsystemNumber, tcap_bytes: &[u8]) -> Vec<u8> {
 /// Build the SCCP bytes for a named MAP operation.
 fn map_sccp(op: i64, arg: Vec<u8>, ac: &[u32]) -> Vec<u8> {
     sccp_udt(SubsystemNumber::Hlr, &tcap_begin(op, arg, ac))
+}
+
+/// Wrap TCAP bytes in an SCCP **XUDT** carrying a hop counter, with a called-party
+/// GT that a GTT rule will translate. `return_on_error` sets the message-handling
+/// that asks for an XUDTS back when the message cannot be delivered.
+fn sccp_xudt(tcap_bytes: &[u8], hop: u8, return_on_error: bool) -> Vec<u8> {
+    let gt = |digits: &str| GlobalTitle::Gt0100 {
+        translation_type: 0,
+        numbering_plan: 1,
+        encoding_scheme: 1,
+        nature_of_address: 4,
+        digits: digits.to_string(),
+    };
+    let called = SccpAddress::with_gt(gt("15550142"), Some(SubsystemNumber::Hlr));
+    let calling = SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Msc));
+    let mut xudt = ExtendedUnitData::new(called, calling, tcap_bytes.to_vec());
+    xudt.hop_counter = hop;
+    if return_on_error {
+        xudt.message_handling = 0x8; // return message on error
+    }
+    xudt.encode().expect("encode xudt")
+}
+
+/// An SRI-SM XUDT (hop counter set) addressed by GT to the translating node.
+fn map_xudt(hop: u8, return_on_error: bool) -> Vec<u8> {
+    sccp_xudt(
+        &tcap_begin(
+            gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+            sri_sm_arg("15559999"),
+            &AC_SRI_SM,
+        ),
+        hop,
+        return_on_error,
+    )
+}
+
+/// The (dpc, hop_counter) recovered from a forwarded M3UA DATA frame carrying an
+/// SCCP XUDT.
+fn xudt_of_m3ua(payload: &[u8]) -> Option<(u32, u8)> {
+    let msg = M3uaMessage::decode(payload).ok()?;
+    let pd = msg.protocol_data().ok()?;
+    match SccpMessage::decode(&pd.user_data).ok()? {
+        SccpMessage::Xudt(x) => Some((pd.dpc, x.hop_counter)),
+        _ => None,
+    }
+}
+
+/// The return cause of an XUDTS carried in a forwarded M3UA DATA frame.
+fn xudts_cause_of_m3ua(payload: &[u8]) -> Option<u8> {
+    let msg = M3uaMessage::decode(payload).ok()?;
+    let pd = msg.protocol_data().ok()?;
+    match SccpMessage::decode(&pd.user_data).ok()? {
+        SccpMessage::Xudts(x) => Some(x.return_cause.value()),
+        _ => None,
+    }
 }
 
 /// Build the SCCP bytes for the CAMEL initialDP operation.
@@ -912,6 +970,100 @@ async fn wire_loop_guard_drops_route_reflection() {
         "route-reflect loop counter did not increment"
     );
 
+    peer_a.close();
+    handle.shutdown();
+}
+
+// ── Scenario 6b: SCCP hop-counter loop guard (GTT translation) ───────────────
+
+/// A GTT-translating node. `ingress` is an ASP of AS `caller` (so a violation
+/// return has a path back to the originator); `hlr-a` is an ASP of AS `hlr`. A
+/// called-party GT prefixed `1555` translates to DPC 2000 → AS hlr, which is the
+/// `RouteTo` path the SCCP hop counter guards. We own SSN 8 only, so an SRI-SM to
+/// SSN 6 does not terminate locally.
+const GTT_NODE: &str = r#"
+node: { point_code: 1000, variant: ITU, network_indicator: international }
+associations:
+  - { id: ingress, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+  - { id: hlr-a,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+application_servers:
+  - { name: caller, traffic_mode: override, routing_context: 0,   asps: [ingress] }
+  - { name: hlr,    traffic_mode: override, routing_context: 100, asps: [hlr-a] }
+mtp3_routes:
+  - { dpc: 2000, as: hlr, priority: 1 }
+sccp:
+  local_ssns: [8]
+  gtt:
+    - { match: {gt_prefix: "1555"}, to: {dpc: 2000, ssn: 6} }
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_hop_counter_guards_the_gtt_loop() {
+    let before = metrics::loops_detected(LoopKind::HopCounter);
+
+    let Some(handle) = start_node(GTT_NODE, "wire_hop_counter").await else {
+        return;
+    };
+    let ingress = handle.bound_addr("ingress").expect("ingress");
+    let hlr_a = handle.bound_addr("hlr-a").expect("hlr-a");
+
+    let (src, peer_a) = match (
+        AspPeer::connect(ingress, 0).await,
+        AspPeer::connect(hlr_a, 100).await,
+    ) {
+        (Some(s), Some(a)) => (s, a),
+        _ => {
+            eprintln!("SKIP wire_hop_counter: a peer connect failed");
+            return;
+        }
+    };
+    let mut src = src;
+    let mut peer_a = peer_a;
+    assert!(
+        wait_route(
+            handle.router(),
+            DPC_HLR,
+            &Destination::ApplicationServer("hlr".into())
+        )
+        .await,
+        "AS hlr never came up"
+    );
+
+    // 1. An XUDT with room to spare (hop 3) is translated by GTT and relayed to
+    //    the AS with the hop counter decremented by one (3 → 2).
+    src.send_in(&m3ua_sccp(&map_xudt(3, false), OPC_UPSTREAM, NODE_PC, 0))
+        .await;
+    let fwd = peer_a.recv_out().await.expect("XUDT translated to hlr-a");
+    let (dpc, hop) = xudt_of_m3ua(&fwd).expect("forwarded frame is an XUDT");
+    assert_eq!(dpc, DPC_HLR, "translated to the GTT result DPC");
+    assert_eq!(hop, 2, "hop counter decremented by one at the translation");
+
+    // 2. An XUDT that would exhaust its hop counter at this translation (hop 1 →
+    //    0) is a loop: it is dropped (never forwarded to the AS), counted, and,
+    //    because it asked to be returned on error, an XUDTS "hop counter
+    //    violation" comes back to the originator.
+    src.send_in(&m3ua_sccp(&map_xudt(1, true), OPC_UPSTREAM, NODE_PC, 0))
+        .await;
+
+    let ret = src
+        .recv_out()
+        .await
+        .expect("XUDTS violation returned to caller");
+    assert_eq!(
+        xudts_cause_of_m3ua(&ret),
+        Some(ReturnCause::HopCounterViolation.value()),
+        "return is an XUDTS with cause hop counter violation (0x0C)"
+    );
+    assert!(
+        peer_a.drain(Duration::from_millis(400)).await.is_empty(),
+        "the exhausted XUDT leaked to the AS instead of being dropped"
+    );
+    assert!(
+        metrics::loops_detected(LoopKind::HopCounter) > before,
+        "hop-counter loop counter did not increment"
+    );
+
+    src.close();
     peer_a.close();
     handle.shutdown();
 }
