@@ -1,9 +1,9 @@
 # siphon-sigtran
 
-[![crates.io](https://img.shields.io/crates/v/siphon-sigtran.svg)](https://crates.io/crates/siphon-sigtran)
-[![docs.rs](https://docs.rs/siphon-sigtran/badge.svg)](https://docs.rs/siphon-sigtran)
 [![CI](https://github.com/siphon-project/siphon-sigtran/actions/workflows/ci.yml/badge.svg)](https://github.com/siphon-project/siphon-sigtran/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.80%2B-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![SIGTRAN](https://img.shields.io/badge/SIGTRAN-M3UA%20%7C%20M2PA-blue)](https://www.rfc-editor.org/rfc/rfc4666)
 
 A **SIGTRAN/SS7 runtime**. It turns a declarative `sigtran.yaml` into a running
 signalling node: SCTP transport (M3UA / M2PA), MTP3 routing, SCCP Global Title
