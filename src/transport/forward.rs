@@ -6,7 +6,7 @@
 use async_sctp::SctpAssociation;
 use m3ua::{M3uaMessage, MessageType};
 use mtp3::{Mtp3Event, PointCode};
-use sccp::{GlobalTitle, SccpMessage};
+use sccp::{ExtendedUnitDataService, GlobalTitle, LongUnitDataService, ReturnCause, SccpMessage};
 
 use super::framing::{self, Msu};
 use super::{LocalDelivery, TaskCtx};
@@ -32,10 +32,13 @@ pub fn inbound_from_msu(msu: &Msu) -> Inbound {
         ..Default::default()
     };
     if msu.si == framing::SI_SCCP {
-        if let Ok(SccpMessage::Udt(udt)) = SccpMessage::decode(&msu.payload) {
-            inbound.called_ssn = udt.called_party.ssn.as_ref().map(|s| s.value());
-            if udt.called_party.global_title.digits().is_some() {
-                inbound.cdpa = Some(selector_from_gt(&udt.called_party.global_title));
+        // Any connectionless type (UDT/UDTS/XUDT/XUDTS/LUDT/LUDTS) exposes the
+        // called party the same way, so GTT sees the extended/long messages too.
+        if let Ok(sccp) = SccpMessage::decode(&msu.payload) {
+            let called = sccp.called_party();
+            inbound.called_ssn = called.ssn.as_ref().map(|s| s.value());
+            if called.global_title.digits().is_some() {
+                inbound.cdpa = Some(selector_from_gt(&called.global_title));
             }
         }
     }
@@ -131,12 +134,19 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
                 loop_reflect(&via, &msu, inbound_assoc);
                 return;
             }
-            // A GTT / content result to a concrete DPC. Relay to the resolved
-            // egress with the new DPC. (SCCP CdPA GT / SSN rewrite from a content
-            // rule is not applied on the wire yet, that rides the dialogue-SAP
-            // work; the DPC-level relay is honoured here.)
+            // A GTT / content result to a concrete DPC is an SCCP relay point, so
+            // apply the SCCP hop counter (the standard GTT loop breaker) before
+            // relaying. It decrements XUDT/LUDT and drops + returns a violation at
+            // zero. (SCCP CdPA GT / SSN rewrite from a content rule is not applied
+            // on the wire yet, that rides the dialogue-SAP work; the DPC-level
+            // relay is honoured here.)
+            let payload = match hop_counter_guard(&msu, ctx, inbound_src.as_ref()).await {
+                HopGuard::Forward(payload) => payload,
+                HopGuard::Exhausted => return,
+            };
             let mut out = msu.clone();
             out.dpc = dpc;
+            out.payload = payload;
             send_via(&via, &out, ctx).await;
         }
         RouteDecision::RouteTo { dpc, via: None, .. } => {
@@ -182,6 +192,136 @@ fn loop_reflect(via: &Destination, msu: &Msu, inbound_assoc: &str) {
          OPC {} DPC {} SI {}",
         msu.opc, msu.dpc, msu.si
     );
+}
+
+/// SCCP "return message on error" message-handling value (Q.713): the originator
+/// asks for a UDTS/XUDTS back when the message cannot be delivered.
+const SCCP_RETURN_ON_ERROR: u8 = 0x8;
+
+/// Outcome of the SCCP hop-counter guard on the GTT / content-translation relay.
+enum HopGuard {
+    /// Forward the message with this SCCP payload (hop counter decremented, or
+    /// unchanged for a message that carries no hop counter).
+    Forward(Vec<u8>),
+    /// The hop counter was exhausted: the message was dropped and counted, and a
+    /// violation return was sent if it asked to be returned on error.
+    Exhausted,
+}
+
+/// Apply the SCCP hop counter at a global-title translation (Q.713 §4 / Q.714).
+///
+/// XUDT/LUDT carry a hop counter that a translating node decrements; when it
+/// reaches zero the message is a routing loop and is discarded (and returned as
+/// XUDTS/LUDTS "hop counter violation" when the return option is set). This is
+/// the standard GTT loop breaker two nodes ping-ponging a global title would
+/// otherwise never escape. UDT/UDTS carry no hop counter, and other Service
+/// Indicators are not SCCP at all, so those loops are caught by the MTP3 own-OPC
+/// and route-reflect guards instead; both forward unchanged here.
+async fn hop_counter_guard(
+    msu: &Msu,
+    ctx: &TaskCtx,
+    inbound_src: Option<&Destination>,
+) -> HopGuard {
+    if msu.si != framing::SI_SCCP {
+        return HopGuard::Forward(msu.payload.clone());
+    }
+    let mut sccp = match SccpMessage::decode(&msu.payload) {
+        Ok(m) => m,
+        Err(_) => return HopGuard::Forward(msu.payload.clone()),
+    };
+    let Some(hop) = sccp.hop_counter() else {
+        return HopGuard::Forward(msu.payload.clone());
+    };
+
+    let remaining = hop.saturating_sub(1);
+    if remaining != 0 {
+        set_hop_counter(&mut sccp, remaining);
+        return match sccp.encode() {
+            Ok(bytes) => HopGuard::Forward(bytes),
+            // Re-encoding a message we just decoded should not fail; if it
+            // somehow does, forward the original rather than drop a good message.
+            Err(e) => {
+                eprintln!("siphon-sigtran: hop-counter re-encode failed ({e}), forwarding as-is");
+                HopGuard::Forward(msu.payload.clone())
+            }
+        };
+    }
+
+    // Exhausted → routing loop. Drop, count, and return a violation if asked.
+    metrics::record_loop(LoopKind::HopCounter);
+    eprintln!(
+        "siphon-sigtran: loop dropped (hop-counter): OPC {} DPC {} exhausted at GTT",
+        msu.opc, msu.dpc
+    );
+    if let Some(src) = inbound_src {
+        if let Some(ret) = hop_violation_return(msu, &sccp, ctx) {
+            send_via(src, &ret, ctx).await;
+        }
+    }
+    HopGuard::Exhausted
+}
+
+/// Set the hop counter on the SCCP types that carry one; a no-op for UDT/UDTS.
+fn set_hop_counter(msg: &mut SccpMessage, hop: u8) {
+    match msg {
+        SccpMessage::Xudt(m) => m.hop_counter = hop,
+        SccpMessage::Xudts(m) => m.hop_counter = hop,
+        SccpMessage::Ludt(m) => m.hop_counter = hop,
+        SccpMessage::Ludts(m) => m.hop_counter = hop,
+        SccpMessage::Udt(_) | SccpMessage::Udts(_) => {}
+    }
+}
+
+/// Build the XUDTS / LUDTS "hop counter violation" return for an exhausted
+/// message, addressed back to the originator (called / calling swapped). Returns
+/// `None` when the message did not ask to be returned on error, or is itself a
+/// service message (a return is never returned).
+fn hop_violation_return(inbound: &Msu, sccp: &SccpMessage, ctx: &TaskCtx) -> Option<Msu> {
+    let return_on_error = match sccp {
+        SccpMessage::Xudt(m) => m.message_handling == SCCP_RETURN_ON_ERROR,
+        SccpMessage::Ludt(m) => m.message_handling == SCCP_RETURN_ON_ERROR,
+        _ => false,
+    };
+    if !return_on_error {
+        return None;
+    }
+
+    // The return goes back to the original calling party, from the called party.
+    let to = sccp.calling_party().clone();
+    let from = sccp.called_party().clone();
+    let data = sccp.data().to_vec();
+    let payload = match sccp {
+        SccpMessage::Ludt(_) => SccpMessage::Ludts(LongUnitDataService::new(
+            ReturnCause::HopCounterViolation,
+            to,
+            from,
+            data,
+        )),
+        _ => SccpMessage::Xudts(ExtendedUnitDataService::new(
+            ReturnCause::HopCounterViolation,
+            to,
+            from,
+            data,
+        )),
+    }
+    .encode()
+    .ok()?;
+
+    // We originate the return: OPC is our own point code, DPC is whoever sent it
+    // to us; SLS / NI / MP mirror the inbound so it follows the same path back.
+    let opc = ctx
+        .router
+        .node_point_code(&ctx.tenant)
+        .unwrap_or(inbound.dpc);
+    Some(Msu {
+        opc,
+        dpc: inbound.opc,
+        si: inbound.si,
+        ni: inbound.ni,
+        mp: inbound.mp,
+        sls: inbound.sls,
+        payload,
+    })
 }
 
 /// Forward an MSU on a resolved [`Destination`]'s egress association(s).

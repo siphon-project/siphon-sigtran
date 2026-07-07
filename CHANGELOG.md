@@ -5,6 +5,25 @@ All notable changes are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the policy.
 
+## [0.6.0]
+
+### Added
+- **SCCP hop-counter loop guard.** On a global-title translation (the `RouteTo`
+  path), an XUDT/LUDT has its hop counter decremented; when it reaches zero the
+  message is a routing loop and is dropped, counted under
+  `sigtran_loops_detected_total{kind="hop-counter"}`, and (when the message set
+  the return-on-error option) an XUDTS/LUDTS with cause "hop counter violation"
+  is sent back to the originator. This is the standard GTT loop breaker, on top
+  of the existing MTP3 own-OPC and route-reflect guards. Backed by `sccp` 1.1.0.
+- The `hop-counter` value on the `LoopKind` metric label.
+
+### Changed
+- `inbound_from_msu` now reads the called party from any connectionless SCCP type
+  (UDT/UDTS/XUDT/XUDTS/LUDT/LUDTS) via `SccpMessage::called_party`, so the extended
+  and long messages are GTT-routable (previously only plain UDT was decoded for
+  routing).
+- Depends on `sccp` 1.1.0 (the extended/long messages with a hop counter).
+
 ## [0.5.1]
 
 Internal refactor, no wire change. The M2PA framing path now encodes and decodes

@@ -30,6 +30,11 @@ pub enum LoopKind {
     /// The resolved egress is the very AS / linkset the MSU arrived on: sending
     /// it there would reflect it straight back.
     RouteReflect,
+    /// The SCCP hop counter reached zero at a global-title translation: the
+    /// standard GTT loop breaker (Q.713). The message is discarded and, when it
+    /// asked to be returned on error, an XUDTS/LUDTS with cause "hop counter
+    /// violation" is sent back to the originator.
+    HopCounter,
 }
 
 impl LoopKind {
@@ -38,17 +43,20 @@ impl LoopKind {
         match self {
             LoopKind::OwnOpc => "own-opc",
             LoopKind::RouteReflect => "route-reflect",
+            LoopKind::HopCounter => "hop-counter",
         }
     }
 }
 
 static LOOPS_OWN_OPC: AtomicU64 = AtomicU64::new(0);
 static LOOPS_ROUTE_REFLECT: AtomicU64 = AtomicU64::new(0);
+static LOOPS_HOP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn loop_cell(kind: LoopKind) -> &'static AtomicU64 {
     match kind {
         LoopKind::OwnOpc => &LOOPS_OWN_OPC,
         LoopKind::RouteReflect => &LOOPS_ROUTE_REFLECT,
+        LoopKind::HopCounter => &LOOPS_HOP_COUNTER,
     }
 }
 
@@ -446,7 +454,11 @@ pub fn render() -> String {
         "MSUs dropped by the MTP3 transfer-path loop guards.",
         "counter",
     );
-    for kind in [LoopKind::OwnOpc, LoopKind::RouteReflect] {
+    for kind in [
+        LoopKind::OwnOpc,
+        LoopKind::RouteReflect,
+        LoopKind::HopCounter,
+    ] {
         line(
             &mut out,
             "sigtran_loops_detected_total",
@@ -736,6 +748,7 @@ mod tests {
     fn loop_labels_are_stable() {
         assert_eq!(LoopKind::OwnOpc.label(), "own-opc");
         assert_eq!(LoopKind::RouteReflect.label(), "route-reflect");
+        assert_eq!(LoopKind::HopCounter.label(), "hop-counter");
     }
 
     #[test]

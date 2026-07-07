@@ -1,6 +1,6 @@
 [package]
 name = "siphon-sigtran"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 description = "SIGTRAN/SS7 runtime: M3UA/M2PA transport, MTP3 routing, SCCP GTT, content routing, MAP/CAP termination on the published SS7 codec crates"
