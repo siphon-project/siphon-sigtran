@@ -210,6 +210,15 @@ impl Router {
         self.tenancy.get(tenant).map(|rt| rt.point_code)
     }
 
+    /// A tenant's compiled ISUP screening engine, or `None` when the tenant has
+    /// no `isup_screening` block. The transit path consults this only for an
+    /// SI=5 MSU, so a tenant without screening (or any non-ISUP MSU) pays nothing.
+    pub fn isup_screen(&self, tenant: &str) -> Option<&crate::isup::IsupScreen> {
+        self.tenancy
+            .get(tenant)
+            .and_then(|rt| rt.isup_screen.as_ref())
+    }
+
     /// Whether a DPC currently resolves to any available egress (used by the
     /// transport to answer an M3UA DAUD audit).
     pub fn is_reachable(&self, tenant: &str, dpc_value: u32) -> bool {

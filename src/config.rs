@@ -515,6 +515,64 @@ pub struct ContentRouting {
     pub rules: Vec<ContentRule>,
 }
 
+// ── ISUP screening ──────────────────────────────────────────────────────────
+
+/// What a screening rule (or the default) does to a matched ISUP message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenAction {
+    /// Drop the message (screen it off the transit path).
+    Block,
+    /// Explicitly let the message transit.
+    Allow,
+}
+
+fn default_screen_action() -> ScreenAction {
+    ScreenAction::Allow
+}
+
+/// The `match:` clause of an ISUP screening rule. All present fields must hold
+/// (AND); absent fields are wildcards.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ScreenMatch {
+    /// Match the ISUP message type by its lower-case Q.763 acronym (`iam`, `rel`,
+    /// `acm`, …). See [`crate::isup::message_type_from_name`].
+    #[serde(default)]
+    pub message_type: Option<String>,
+    /// Match a leading prefix of the called-party-number digits.
+    #[serde(default)]
+    pub called_prefix: Option<String>,
+    /// Match a leading prefix of the calling-party-number digits.
+    #[serde(default)]
+    pub calling_prefix: Option<String>,
+}
+
+/// One `isup_screening.rules:` entry: match an ISUP message, take an action.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScreenRule {
+    /// Rule name (metrics/log clarity + first-match ordering).
+    pub name: String,
+    /// The match criteria.
+    #[serde(rename = "match")]
+    pub match_: ScreenMatch,
+    /// The action to take on the first matching rule.
+    pub action: ScreenAction,
+}
+
+/// The `isup_screening:` block: optional ISUP-aware screening on the SI=5 transit
+/// path. When absent the transit path is byte-for-byte unchanged; when present,
+/// each transiting ISUP message is decoded and evaluated against the ordered
+/// rules (first match wins), and a `block` result drops it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IsupScreening {
+    /// The action for a message that no rule matches (default: `allow`).
+    #[serde(default = "default_screen_action")]
+    pub default: ScreenAction,
+    /// The ordered screening rules (first match wins).
+    #[serde(default)]
+    pub rules: Vec<ScreenRule>,
+}
+
 // ── The per-tenant body + the whole file ────────────────────────────────────
 
 /// The per-tenant routing tables: the shape that repeats under each
@@ -543,6 +601,10 @@ pub struct Tenant {
     /// The tenant's content-routing rules.
     #[serde(default)]
     pub content_routing: Option<ContentRouting>,
+    /// The tenant's ISUP screening rules (SI=5 transit path). Absent = no
+    /// screening (transit unchanged).
+    #[serde(default)]
+    pub isup_screening: Option<IsupScreening>,
 }
 
 impl Tenant {
@@ -570,6 +632,8 @@ struct RawFile {
     sccp: Option<Sccp>,
     #[serde(default)]
     content_routing: Option<ContentRouting>,
+    #[serde(default)]
+    isup_screening: Option<IsupScreening>,
     #[serde(default)]
     tcap: Option<Tcap>,
     #[serde(default)]
@@ -629,10 +693,12 @@ impl Config {
                     || !raw.mtp3_routes.is_empty()
                     || raw.sccp.is_some()
                     || raw.content_routing.is_some()
+                    || raw.isup_screening.is_some()
                 {
                     return Err(Error::validation(
                         "top-level routing fields (application_servers/linksets/mtp3_routes/\
-                         sccp/content_routing) cannot be mixed with an explicit `tenants:` block",
+                         sccp/content_routing/isup_screening) cannot be mixed with an explicit \
+                         `tenants:` block",
                     ));
                 }
                 map
@@ -654,6 +720,7 @@ impl Config {
                         mtp3_routes: raw.mtp3_routes,
                         sccp: raw.sccp.unwrap_or_default(),
                         content_routing: raw.content_routing,
+                        isup_screening: raw.isup_screening,
                     },
                 );
                 map
@@ -916,6 +983,27 @@ impl Config {
                 if let Some(t) = &rule.action.route {
                     self.validate_target(t, tenant, &group_names)
                         .map_err(|e| where_(format!("content rule `{}`: {e}", rule.name)))?;
+                }
+            }
+        }
+
+        // ISUP screening: rule names unique; any named message-type is known.
+        if let Some(scr) = &tenant.isup_screening {
+            let mut rule_names = BTreeSet::new();
+            for rule in &scr.rules {
+                if !rule_names.insert(rule.name.as_str()) {
+                    return Err(where_(format!(
+                        "duplicate isup_screening rule `{}`",
+                        rule.name
+                    )));
+                }
+                if let Some(mt) = &rule.match_.message_type {
+                    if crate::isup::message_type_from_name(mt).is_none() {
+                        return Err(where_(format!(
+                            "isup_screening rule `{}` names unknown message_type `{}`",
+                            rule.name, mt
+                        )));
+                    }
                 }
             }
         }
@@ -1274,6 +1362,90 @@ content_routing:
 "#;
         let err = Config::parse(yaml).unwrap_err();
         assert!(err.to_string().contains("unknown operation"));
+    }
+
+    #[test]
+    fn isup_screening_parses_into_default_tenant() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations: []
+isup_screening:
+  default: allow
+  rules:
+    - name: block-premium
+      match: { message_type: iam, called_prefix: "1900" }
+      action: block
+    - name: allow-national
+      match: { calling_prefix: "1555" }
+      action: allow
+"#;
+        let cfg = Config::parse(yaml).unwrap();
+        let scr = cfg
+            .default_tenant()
+            .unwrap()
+            .isup_screening
+            .as_ref()
+            .expect("screening present");
+        assert_eq!(scr.default, ScreenAction::Allow);
+        assert_eq!(scr.rules.len(), 2);
+        assert_eq!(scr.rules[0].name, "block-premium");
+        assert_eq!(scr.rules[0].action, ScreenAction::Block);
+        assert_eq!(scr.rules[0].match_.message_type.as_deref(), Some("iam"));
+        assert_eq!(scr.rules[0].match_.called_prefix.as_deref(), Some("1900"));
+    }
+
+    #[test]
+    fn isup_screening_default_is_allow_when_absent() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations: []
+isup_screening:
+  rules:
+    - name: r1
+      match: { message_type: rel }
+      action: block
+"#;
+        let cfg = Config::parse(yaml).unwrap();
+        let scr = cfg
+            .default_tenant()
+            .unwrap()
+            .isup_screening
+            .as_ref()
+            .unwrap();
+        assert_eq!(scr.default, ScreenAction::Allow);
+    }
+
+    #[test]
+    fn rejects_unknown_isup_message_type() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations: []
+isup_screening:
+  rules:
+    - name: bad
+      match: { message_type: not-a-type }
+      action: block
+"#;
+        let err = Config::parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("unknown message_type"));
+    }
+
+    #[test]
+    fn rejects_duplicate_isup_screening_rule() {
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations: []
+isup_screening:
+  rules:
+    - name: dup
+      match: { message_type: iam }
+      action: block
+    - name: dup
+      match: { message_type: rel }
+      action: block
+"#;
+        let err = Config::parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("duplicate isup_screening rule"));
     }
 
     #[test]

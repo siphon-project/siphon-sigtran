@@ -16,6 +16,7 @@ use mtp3::Variant;
 
 use crate::config::{Config, TenantId};
 use crate::content::ContentEngine;
+use crate::isup::IsupScreen;
 use crate::mtp3::route::{RouteResolver, RouteState};
 use crate::sccp::gtt::{GtConverter, GttResolver};
 
@@ -40,6 +41,9 @@ pub struct TenantRuntime {
     pub converter: GtConverter,
     /// Content-routing engine (absent if the tenant has no `content_routing`).
     pub content: Option<ContentEngine>,
+    /// ISUP screening engine for the SI=5 transit path (absent if the tenant has
+    /// no `isup_screening`, in which case the transit path is unchanged).
+    pub isup_screen: Option<IsupScreen>,
 }
 
 impl TenantRuntime {
@@ -98,6 +102,7 @@ impl Tenancy {
             let gtt = GttResolver::compile(&tenant.sccp);
             let converter = GtConverter::from(&tenant.sccp.gt_conversion);
             let content = tenant.content_routing.as_ref().map(ContentEngine::compile);
+            let isup_screen = tenant.isup_screening.as_ref().map(IsupScreen::compile);
             let point_code = tenant
                 .resolved_point_code()
                 .map(|pc| pc.value())
@@ -113,6 +118,7 @@ impl Tenancy {
                     gtt,
                     converter,
                     content,
+                    isup_screen,
                 },
             );
         }

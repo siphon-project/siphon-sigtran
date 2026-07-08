@@ -24,6 +24,10 @@ use super::TransportError;
 /// SCCP Service Indicator (ITU-T Q.704 Table 1): `SI = 3`.
 pub const SI_SCCP: u8 = 3;
 
+/// ISUP Service Indicator (ITU-T Q.704 Table 1): `SI = 5`. The transit path
+/// decodes this only when a tenant has ISUP screening configured.
+pub const SI_ISUP: u8 = 5;
+
 /// A decoded MSU at the MTP3-user boundary: the routing label plus the payload.
 ///
 /// This is what a relay reads to route by DPC and what it re-wraps for the
