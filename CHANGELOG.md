@@ -5,6 +5,26 @@ All notable changes are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the policy.
 
+## [Unreleased]
+
+### Added
+- **Optional ISUP-aware screening on the SI=5 transit path.** A tenant can add an
+  `isup_screening:` block (a `default` action plus ordered `block` / `allow` rules
+  matching on the ISUP `message_type` and/or a called- / calling-party-number
+  prefix). When configured, each transiting ISUP MSU is decoded with the
+  `itu-isup` codec (Q.763) and evaluated first-match-wins: a `block` result drops
+  the message, counts it under `sigtran_isup_screened_total{reason}`
+  (`rule` / `default` / `decode-error`), and logs one line, while everything else
+  transits exactly as before. A message that will not decode as ISUP takes the
+  configured default action, never a silent mis-route. With no `isup_screening:`
+  block the transit path is byte-for-byte unchanged and pays only a
+  Service-Indicator compare on the hot path.
+- The `sigtran_isup_screened_total{reason}` metric family.
+
+### Changed
+- Depends on `itu-isup` 1.0.0 (the Q.763 ISUP message + parameter codec), decoded
+  on the transit path only when a tenant configures screening.
+
 ## [0.6.0]
 
 ### Added

@@ -31,6 +31,9 @@ m3ua = "1"
 m2pa = "1"
 # SCCP (Q.71x): global titles, addresses, UDT. Drives the GTT resolver.
 sccp = "1"
+# ISUP (Q.763): circuit-switched call control, a direct MTP3-user (SI=5). Decoded
+# on the transit path for the optional ISUP-aware screening layer.
+itu-isup = "1"
 # TCAP (Q.773): transactions + components. Decoded for content routing.
 tcap = "1"
 # GSM MAP (TS 29.002): operation codes + argument types (content routing view).

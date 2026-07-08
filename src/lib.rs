@@ -109,6 +109,7 @@ pub mod config;
 pub mod content;
 pub mod dialogue;
 pub mod error;
+pub mod isup;
 pub mod metrics;
 pub mod mtp3;
 pub mod point_code;

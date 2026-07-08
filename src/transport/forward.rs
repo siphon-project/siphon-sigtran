@@ -10,6 +10,7 @@ use sccp::{ExtendedUnitDataService, GlobalTitle, LongUnitDataService, ReturnCaus
 
 use super::framing::{self, Msu};
 use super::{LocalDelivery, TaskCtx};
+use crate::isup::{IsupScreen, Screened};
 use crate::metrics::{self, LoopKind};
 use crate::mtp3::route::Destination;
 use crate::routing::{Inbound, RouteDecision};
@@ -119,6 +120,17 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
     let inbound = inbound_from_msu(&msu);
     match ctx.router.route_in(&ctx.tenant, &inbound) {
         RouteDecision::Route { via } => {
+            // ISUP screening on the SI=5 transit path (opt-in per tenant). Only an
+            // SI=5 MSU consults `isup_screen`; every other Service Indicator (the
+            // SCCP hot path included) pays just this compare, and a tenant with no
+            // screening block returns `None` here, so transit stays unchanged.
+            if msu.si == framing::SI_ISUP {
+                if let Some(screen) = ctx.router.isup_screen(&ctx.tenant) {
+                    if apply_isup_screen(screen, &msu, inbound_assoc) {
+                        return;
+                    }
+                }
+            }
             if is_reflection(inbound_src.as_ref(), &via) {
                 loop_reflect(&via, &msu, inbound_assoc);
                 return;
@@ -192,6 +204,52 @@ fn loop_reflect(via: &Destination, msu: &Msu, inbound_assoc: &str) {
          OPC {} DPC {} SI {}",
         msu.opc, msu.dpc, msu.si
     );
+}
+
+/// Screen a transiting ISUP MSU (SI=5) against the tenant's rules. Returns `true`
+/// if the message was screened (dropped, counted under
+/// `sigtran_isup_screened_total`, and logged), `false` if it should transit. A
+/// decode failure never crashes the path: it takes the tenant's configured
+/// default action, and either outcome is logged (a malformed ISUP frame is never
+/// passed or dropped silently).
+fn apply_isup_screen(screen: &IsupScreen, msu: &Msu, inbound_assoc: &str) -> bool {
+    let verdict = screen.screen(&msu.payload);
+    if let Some(reason) = verdict.reason() {
+        metrics::record_isup_screened(reason);
+    }
+    match verdict {
+        Screened::Pass => false,
+        Screened::PassUndecoded { error } => {
+            eprintln!(
+                "siphon-sigtran: isup screen could not decode SI=5 MSU \
+                 (OPC {} DPC {} in on {inbound_assoc}): {error}; passing per default allow",
+                msu.opc, msu.dpc
+            );
+            false
+        }
+        Screened::BlockRule { rule } => {
+            eprintln!(
+                "siphon-sigtran: isup screened (drop): rule `{rule}`, OPC {} DPC {} SI {} in on {inbound_assoc}",
+                msu.opc, msu.dpc, msu.si
+            );
+            true
+        }
+        Screened::BlockDefault => {
+            eprintln!(
+                "siphon-sigtran: isup screened (drop): default action, OPC {} DPC {} SI {} in on {inbound_assoc}",
+                msu.opc, msu.dpc, msu.si
+            );
+            true
+        }
+        Screened::BlockUndecoded { error } => {
+            eprintln!(
+                "siphon-sigtran: isup screened (drop): undecodable SI=5 MSU per default block \
+                 (OPC {} DPC {} in on {inbound_assoc}): {error}",
+                msu.opc, msu.dpc
+            );
+            true
+        }
+    }
 }
 
 /// SCCP "return message on error" message-handling value (Q.713): the originator

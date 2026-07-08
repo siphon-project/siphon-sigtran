@@ -70,6 +70,54 @@ pub fn loops_detected(kind: LoopKind) -> u64 {
     loop_cell(kind).load(Ordering::Relaxed)
 }
 
+// ── ISUP screening (SI=5 transit path) ───────────────────────────────────────
+
+/// Why an ISUP MSU was screened (dropped) on the SI=5 transit path. A peer of
+/// the [`LoopKind`] loop guards: same fixed-array atomic shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenReason {
+    /// The message matched an explicit `block` screening rule.
+    Rule,
+    /// No rule matched and the screening default action is `block`.
+    Default,
+    /// The message would not decode as ISUP and the screening default action is
+    /// `block` (a malformed frame is never silently mis-routed).
+    DecodeError,
+}
+
+impl ScreenReason {
+    /// The `reason` label value used in the exposed metric.
+    pub fn label(self) -> &'static str {
+        match self {
+            ScreenReason::Rule => "rule",
+            ScreenReason::Default => "default",
+            ScreenReason::DecodeError => "decode-error",
+        }
+    }
+}
+
+static ISUP_SCREENED_RULE: AtomicU64 = AtomicU64::new(0);
+static ISUP_SCREENED_DEFAULT: AtomicU64 = AtomicU64::new(0);
+static ISUP_SCREENED_DECODE: AtomicU64 = AtomicU64::new(0);
+
+fn screen_cell(reason: ScreenReason) -> &'static AtomicU64 {
+    match reason {
+        ScreenReason::Rule => &ISUP_SCREENED_RULE,
+        ScreenReason::Default => &ISUP_SCREENED_DEFAULT,
+        ScreenReason::DecodeError => &ISUP_SCREENED_DECODE,
+    }
+}
+
+/// Count one ISUP MSU screened (dropped) for the given reason.
+pub fn record_isup_screened(reason: ScreenReason) {
+    screen_cell(reason).fetch_add(1, Ordering::Relaxed);
+}
+
+/// The current count of ISUP MSUs screened for the given reason.
+pub fn isup_screened(reason: ScreenReason) -> u64 {
+    screen_cell(reason).load(Ordering::Relaxed)
+}
+
 // ── MSU traffic counters (hot path, fixed arrays, zero allocation) ───────────
 
 /// The direction an MSU crossed the node, for [`msu`].
@@ -467,6 +515,26 @@ pub fn render() -> String {
         );
     }
 
+    // ISUP screening.
+    help(
+        &mut out,
+        "sigtran_isup_screened_total",
+        "ISUP MSUs dropped by the SI=5 transit-path screening rules, by reason.",
+        "counter",
+    );
+    for reason in [
+        ScreenReason::Rule,
+        ScreenReason::Default,
+        ScreenReason::DecodeError,
+    ] {
+        line(
+            &mut out,
+            "sigtran_isup_screened_total",
+            &[("reason", reason.label())],
+            isup_screened(reason),
+        );
+    }
+
     // MSU traffic.
     help(
         &mut out,
@@ -752,12 +820,27 @@ mod tests {
     }
 
     #[test]
+    fn screen_reason_labels_and_counter() {
+        assert_eq!(ScreenReason::Rule.label(), "rule");
+        assert_eq!(ScreenReason::Default.label(), "default");
+        assert_eq!(ScreenReason::DecodeError.label(), "decode-error");
+        let before = isup_screened(ScreenReason::Rule);
+        record_isup_screened(ScreenReason::Rule);
+        assert_eq!(isup_screened(ScreenReason::Rule), before + 1);
+        // A different reason cell is untouched.
+        let dflt = isup_screened(ScreenReason::Default);
+        record_isup_screened(ScreenReason::DecodeError);
+        assert_eq!(isup_screened(ScreenReason::Default), dflt);
+    }
+
+    #[test]
     fn render_carries_every_family_header() {
         // The families share process-wide state with the other tests, so assert
         // on the shape (every HELP/TYPE header present), not exact counts.
         let text = render();
         for family in [
             "sigtran_loops_detected_total",
+            "sigtran_isup_screened_total",
             "sigtran_msu_total",
             "sigtran_gtt_translations_total",
             "sigtran_gtt_errors_total",

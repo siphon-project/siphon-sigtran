@@ -13,6 +13,8 @@
 //! * load-share spread across an AS's two ASPs (SLS-keyed),
 //! * failover to an M2PA linkset when the primary AS's ASP drops,
 //! * SI-agnostic transfer (an ISUP `SI=5` MSU transits by DPC, undecoded),
+//! * ISUP screening on the SI=5 transit path (a blocked IAM dropped + counted,
+//!   an allowed IAM transited to the egress AS unchanged),
 //! * the transfer-path loop guards (own-OPC, route-reflection) and the SCCP
 //!   hop-counter guard on a GTT translation (decrement, then drop + XUDTS return),
 //! * the `sua` adaptation reserved-but-refused,
@@ -53,7 +55,7 @@ use tcap::{Begin, Component, Invoke, OperationCode, ReturnResult, ReturnResultVa
 
 use siphon_sigtran::config::{Config, Tcap};
 use siphon_sigtran::dialogue::{Dialogue, DialogueEngine, IncomingOp, TerminationHandler};
-use siphon_sigtran::metrics::{self, LoopKind};
+use siphon_sigtran::metrics::{self, LoopKind, ScreenReason};
 use siphon_sigtran::mtp3::route::Destination;
 use siphon_sigtran::routing::{Inbound, RouteDecision, Router};
 use siphon_sigtran::transport::next_status;
@@ -850,6 +852,114 @@ async fn wire_transfers_non_sccp_by_dpc() {
         "Service Indicator preserved (not decapsulated)"
     );
     assert_eq!(pd.user_data, isup, "ISUP payload passed through untouched");
+
+    src.close();
+    peer_a.close();
+    handle.shutdown();
+}
+
+// ── Scenario 4b: ISUP screening on the SI=5 transit path ─────────────────────
+
+/// Ingress SG + AS `hlr`, with ISUP screening: block an IAM whose called-party
+/// number begins `1900`, allow everything else. Route 2000 → hlr.
+const SCREEN_NODE: &str = r#"
+node: { point_code: 1000, variant: ITU, network_indicator: international }
+associations:
+  - { id: ingress, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+  - { id: hlr-a,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+application_servers:
+  - { name: hlr, traffic_mode: override, routing_context: 100, asps: [hlr-a] }
+mtp3_routes:
+  - { dpc: 2000, as: hlr, priority: 1 }
+sccp:
+  local_ssns: [8]
+isup_screening:
+  default: allow
+  rules:
+    - name: block-premium
+      match: { message_type: iam, called_prefix: "1900" }
+      action: block
+"#;
+
+/// A genuine ISUP Initial Address Message to `called` (national number), encoded
+/// as the MTP3-user payload an M3UA DATA carries for `SI=5`. Synthetic +1-555/1900
+/// digits.
+fn isup_iam(called: &str) -> Vec<u8> {
+    itu_isup::Message::iam(
+        1,    // CIC
+        0x00, // nature of connection indicators
+        0x2000,
+        itu_isup::calling_party_category::ORDINARY,
+        0x00, // transmission medium requirement (speech)
+        &itu_isup::Number::called(3, 1, false, called),
+    )
+    .expect("build isup iam")
+    .encode()
+    .expect("encode isup iam")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_isup_screening_drops_blocked_passes_allowed() {
+    let before = metrics::isup_screened(ScreenReason::Rule);
+
+    let Some(handle) = start_node(SCREEN_NODE, "wire_isup_screen").await else {
+        return;
+    };
+    let ingress = handle.bound_addr("ingress").expect("ingress");
+    let hlr_a = handle.bound_addr("hlr-a").expect("hlr-a");
+
+    let (src, peer_a) = match (
+        AspPeer::connect(ingress, 0).await,
+        AspPeer::connect(hlr_a, 100).await,
+    ) {
+        (Some(s), Some(a)) => (s, a),
+        _ => {
+            eprintln!("SKIP wire_isup_screen: a peer connect failed");
+            return;
+        }
+    };
+    let mut peer_a = peer_a;
+    assert!(
+        wait_route(
+            handle.router(),
+            DPC_HLR,
+            &Destination::ApplicationServer("hlr".into())
+        )
+        .await,
+        "AS hlr never came up"
+    );
+
+    // 1. An ISUP IAM to a called number the block rule matches (prefix 1900) is
+    //    screened: dropped before the transit, never forwarded, and counted.
+    let blocked = isup_iam("1900123");
+    src.send_in(&m3ua_data_si(&blocked, SI_ISUP, OPC_UPSTREAM, DPC_HLR, 0))
+        .await;
+    assert!(
+        peer_a.drain(Duration::from_millis(500)).await.is_empty(),
+        "screened ISUP IAM was forwarded instead of dropped"
+    );
+    assert!(
+        metrics::isup_screened(ScreenReason::Rule) > before,
+        "isup screening rule counter did not increment"
+    );
+
+    // 2. An ISUP IAM to a called number no rule matches transits by DPC to the
+    //    egress AS under the default `allow`, SI=5 intact, payload untouched.
+    let allowed = isup_iam("1555123");
+    src.send_in(&m3ua_data_si(&allowed, SI_ISUP, OPC_UPSTREAM, DPC_HLR, 0))
+        .await;
+    let fwd = peer_a
+        .recv_out()
+        .await
+        .expect("allowed ISUP IAM transited to hlr-a");
+    let msg = M3uaMessage::decode(&fwd).expect("decode m3ua");
+    let pd = msg.protocol_data().expect("protocol data");
+    assert_eq!(pd.dpc, DPC_HLR, "transited by DPC");
+    assert_eq!(pd.si, SI_ISUP, "Service Indicator preserved");
+    assert_eq!(
+        pd.user_data, allowed,
+        "allowed ISUP payload passed through untouched"
+    );
 
     src.close();
     peer_a.close();
