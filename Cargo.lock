@@ -1388,6 +1388,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "inap"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4972df8ea3964ab2b5f274b47487984a04deb3eab92e4e768dbe3dd76b5f61d1"
+dependencies = [
+ "rasn",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2982,6 +2992,7 @@ dependencies = [
  "criterion",
  "gsm_cap",
  "gsm_map",
+ "inap",
  "itu-isup",
  "m2pa",
  "m3ua",

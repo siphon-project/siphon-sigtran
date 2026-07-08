@@ -7,9 +7,9 @@
 //! Compiled only with `--features python`; the default crate build pulls neither
 //! pyo3 nor siphon, so consumers of the pure-Rust routing brain stay lean. The
 //! single seam is [`register`]: a composing siphon binary calls it at startup to
-//! mount the `ss7` / `gsm_map` / `gsm_cap` namespaces (plus `configure` /
+//! mount the `ss7` / `gsm_map` / `gsm_cap` / `inap` namespaces (plus `configure` /
 //! `metrics` and the shared types) onto the `siphon` package module, so scripts
-//! import them with `from siphon import ss7, gsm_map, gsm_cap`.
+//! import them with `from siphon import ss7, gsm_map, gsm_cap, inap`.
 //!
 //! # The model
 //!
@@ -24,8 +24,9 @@
 //!   (`@ss7.on_route(when=...)`). The decision constructors (`ss7.route`,
 //!   `ss7.drop`, `ss7.route_default`, `ss7.allow`) build a [`Decision`] the
 //!   async override layer resolves.
-//! * **Termination** registers a Python handler per MAP/CAP operation
-//!   (`@gsm_map.on_mo_forward_sm`, `@gsm_cap.on_initial_dp`, …). When a dialogue
+//! * **Termination** registers a Python handler per MAP/CAP/INAP operation
+//!   (`@gsm_map.on_mo_forward_sm`, `@gsm_cap.on_initial_dp`,
+//!   `@inap.on_initial_dp`, …). When a dialogue
 //!   terminates, the handler drives a [`PyDialogue`] handle (`invoke` / `reply` /
 //!   `send` / `end`). An `async def` handler runs to completion on an asyncio
 //!   loop, mirroring how a handler runs on siphon's runtime.
@@ -445,6 +446,36 @@ impl PyIncomingOp {
         let bytes = self.argument.as_ref()?;
         let idp: gsm_cap::operations::InitialDpArg = gsm_cap::decode(bytes).ok()?;
         idp.called_party_number
+            .map(|n| PyBytes::new(py, n.as_ref()))
+    }
+
+    /// The `serviceKey` of an INAP CS-1 initialDP, if decoded: the IN service
+    /// logic the SSF triggered on (an `@inap.on_initial_dp` handler keys its
+    /// service selection on it).
+    #[getter]
+    fn inap_service_key(&self) -> Option<i64> {
+        let bytes = self.argument.as_ref()?;
+        let idp: inap::operations::InitialDpArg = inap::decode(bytes).ok()?;
+        i64::try_from(&idp.service_key).ok()
+    }
+
+    /// The `calledPartyNumber` of an INAP CS-1 initialDP, if decoded (the
+    /// fixed-network dialled digits, distinct from the CAMEL initialDP the
+    /// [`called_party_number`](Self::called_party_number) getter decodes).
+    #[getter]
+    fn inap_called_party_number<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        let bytes = self.argument.as_ref()?;
+        let idp: inap::operations::InitialDpArg = inap::decode(bytes).ok()?;
+        idp.called_party_number
+            .map(|n| PyBytes::new(py, n.as_ref()))
+    }
+
+    /// The `callingPartyNumber` of an INAP CS-1 initialDP, if decoded.
+    #[getter]
+    fn inap_calling_party_number<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        let bytes = self.argument.as_ref()?;
+        let idp: inap::operations::InitialDpArg = inap::decode(bytes).ok()?;
+        idp.calling_party_number
             .map(|n| PyBytes::new(py, n.as_ref()))
     }
 
@@ -1757,6 +1788,281 @@ fn monitor_mode(v: i64) -> PyResult<gsm_cap::types::MonitorMode> {
     })
 }
 
+// ── The `inap` namespace ─────────────────────────────────────────────────────
+
+/// The `inap` (INAP CS-1, ITU-T Q.1218 / ETSI EN 300 374-1) namespace singleton.
+///
+/// INAP is a TCAP-user peer to CAMEL CAP: an IN SCP terminates the SSF-SCF
+/// dialogue the same way `gsm_cap` terminates a CAMEL one, but with the
+/// fixed-network INAP operation set and the IN application contexts. The
+/// termination decorators register a handler per (owned SSN, INAP opcode); the
+/// originating builders stage the SCF-to-SSF invokes an SCP sends. Both feed the
+/// same [`PyDialogue`] / [`DialogueEngine`] path the CAMEL surface uses.
+#[pyclass(name = "Inap", module = "siphon")]
+pub struct Inap;
+
+#[pymethods]
+impl Inap {
+    /// The INAP application-context helpers (`inap.AC.ssp_to_scp`).
+    #[getter]
+    #[allow(non_snake_case)]
+    fn AC(&self) -> InapAc {
+        InapAc
+    }
+
+    // ── Termination decorators (SSF -> SCF, the SCP terminates) ──
+
+    /// Terminate an INAP initialDP (`@inap.on_initial_dp`): the SSF reports a
+    /// triggered call to the SCP. The handler reads the decoded argument off the
+    /// [`IncomingOp`](PyIncomingOp) `inap_*` getters
+    /// (`inap_service_key` / `inap_called_party_number` / …).
+    fn on_initial_dp(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, inap::op_codes::INITIAL_DP, &func);
+        func
+    }
+
+    /// Terminate an INAP eventReportBCSM (`@inap.on_event_report_bcsm`): the SSF
+    /// reports an armed detection point back to the SCP inside an open dialogue.
+    fn on_event_report_bcsm(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, inap::op_codes::EVENT_REPORT_BCSM, &func);
+        func
+    }
+
+    /// Terminate an INAP applyChargingReport (`@inap.on_apply_charging_report`):
+    /// the SSF returns the metered call result to the SCP.
+    fn on_apply_charging_report(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, inap::op_codes::APPLY_CHARGING_REPORT, &func);
+        func
+    }
+
+    /// Terminate an INAP assistRequestInstructions
+    /// (`@inap.on_assist_request_instructions`): an assisting SSF asks the SCP
+    /// for instructions, keyed by the correlationID.
+    fn on_assist_request_instructions(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, inap::op_codes::ASSIST_REQUEST_INSTRUCTIONS, &func);
+        func
+    }
+
+    /// Terminate an INAP callInformationReport
+    /// (`@inap.on_call_information_report`): the SSF returns the previously
+    /// requested call-information (metering) items.
+    fn on_call_information_report(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, inap::op_codes::CALL_INFORMATION_REPORT, &func);
+        func
+    }
+
+    /// Terminate an INAP specializedResourceReport
+    /// (`@inap.on_specialized_resource_report`): the SRF signals that a played
+    /// announcement completed.
+    fn on_specialized_resource_report(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
+        register_termination(py, inap::op_codes::SPECIALIZED_RESOURCE_REPORT, &func);
+        func
+    }
+
+    // ── Originating builders (SCF -> SSF, the SCP instructs) ──
+
+    /// Stage an INAP RequestReportBCSMEvent invoke: arm the SSF to report the
+    /// given BCSM detection points. `events` is a list of
+    /// `(event_type_bcsm, monitor_mode)` integer pairs (ITU-T Q.1218), e.g.
+    /// `(7, 0)` = oAnswer interrupted, `(9, 1)` = oDisconnect notifyAndContinue.
+    #[pyo3(signature = (events))]
+    fn request_report_bcsm_event(&self, events: Vec<(i64, i64)>) -> PyResult<StagedInvoke> {
+        use inap::operations::RequestReportBcsmEventArg;
+        use inap::types::BcsmEvent;
+        let bcsm_events = events
+            .into_iter()
+            .map(|(et, mm)| {
+                Ok(BcsmEvent {
+                    event_type_bcsm: inap_event_type_bcsm(et)?,
+                    monitor_mode: inap_monitor_mode(mm)?,
+                    leg_id: None,
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let arg = RequestReportBcsmEventArg { bcsm_events };
+        staged_inap_invoke(inap::op_codes::REQUEST_REPORT_BCSM_EVENT, &arg)
+    }
+
+    /// Stage an INAP Connect invoke: instruct the SSF to route the call to
+    /// `destination_routing_address` (a list of called-party-number byte strings).
+    /// `original_called_party_id`, when given, preserves the originally dialled
+    /// number across the reroute.
+    #[pyo3(signature = (*, destination_routing_address, original_called_party_id=None))]
+    fn connect(
+        &self,
+        destination_routing_address: Vec<Vec<u8>>,
+        original_called_party_id: Option<Vec<u8>>,
+    ) -> PyResult<StagedInvoke> {
+        use inap::operations::ConnectArg;
+        let arg = ConnectArg {
+            destination_routing_address: destination_routing_address
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            correlation_id: None,
+            original_called_party_id: original_called_party_id.map(Into::into),
+            scf_id: None,
+        };
+        staged_inap_invoke(inap::op_codes::CONNECT, &arg)
+    }
+
+    /// Stage an INAP Continue invoke: let the SSF resume normal call processing
+    /// at the detection point. It carries no argument.
+    fn continue_(&self) -> StagedInvoke {
+        StagedInvoke {
+            op: inap::op_codes::CONTINUE,
+            arg: None,
+        }
+    }
+
+    /// Stage an INAP ReleaseCall invoke: tear the call down with a Q.850 `cause`.
+    #[pyo3(signature = (*, cause))]
+    fn release_call(&self, cause: Vec<u8>) -> PyResult<StagedInvoke> {
+        use inap::operations::ReleaseCallArg;
+        let arg = ReleaseCallArg(cause.into());
+        staged_inap_invoke(inap::op_codes::RELEASE_CALL, &arg)
+    }
+
+    /// Stage an INAP ApplyCharging invoke: install the encoded charging
+    /// characteristics at the SSF (an online-charging control, e.g. a
+    /// call-duration limit). `party_to_charge`, when given, names the leg to
+    /// meter as its sending-side identity.
+    #[pyo3(signature = (*, charging_characteristics, party_to_charge=None))]
+    fn apply_charging(
+        &self,
+        charging_characteristics: Vec<u8>,
+        party_to_charge: Option<Vec<u8>>,
+    ) -> PyResult<StagedInvoke> {
+        use inap::operations::ApplyChargingArg;
+        use inap::types::LegId;
+        let arg = ApplyChargingArg {
+            ach_billing_charging_characteristics: charging_characteristics.into(),
+            party_to_charge: party_to_charge.map(|l| LegId::SendingSideId(l.into())),
+        };
+        staged_inap_invoke(inap::op_codes::APPLY_CHARGING, &arg)
+    }
+
+    /// Stage an INAP PlayAnnouncement invoke: instruct the SRF to play an
+    /// announcement or tone. `information_to_send` is the opaque announcement
+    /// descriptor. `disconnect_from_ip_forbidden` keeps the SRF connection up
+    /// afterwards; `request_announcement_complete` asks for a
+    /// specializedResourceReport once it finishes.
+    #[pyo3(signature = (*, information_to_send, disconnect_from_ip_forbidden=None, request_announcement_complete=None))]
+    fn play_announcement(
+        &self,
+        information_to_send: Vec<u8>,
+        disconnect_from_ip_forbidden: Option<bool>,
+        request_announcement_complete: Option<bool>,
+    ) -> PyResult<StagedInvoke> {
+        use inap::operations::PlayAnnouncementArg;
+        let arg = PlayAnnouncementArg {
+            information_to_send: information_to_send.into(),
+            disconnect_from_ip_forbidden,
+            request_announcement_complete,
+        };
+        staged_inap_invoke(inap::op_codes::PLAY_ANNOUNCEMENT, &arg)
+    }
+
+    /// Stage an INAP PromptAndCollectUserInformation invoke: instruct the SRF to
+    /// collect digits from the user, optionally after playing a prompt.
+    /// `collected_info` is the opaque collection descriptor; `information_to_send`
+    /// is the optional prompt to play first.
+    #[pyo3(signature = (*, collected_info, disconnect_from_ip_forbidden=None, information_to_send=None))]
+    fn prompt_and_collect_user_information(
+        &self,
+        collected_info: Vec<u8>,
+        disconnect_from_ip_forbidden: Option<bool>,
+        information_to_send: Option<Vec<u8>>,
+    ) -> PyResult<StagedInvoke> {
+        use inap::operations::PromptAndCollectUserInformationArg;
+        let arg = PromptAndCollectUserInformationArg {
+            collected_info: collected_info.into(),
+            disconnect_from_ip_forbidden,
+            information_to_send: information_to_send.map(Into::into),
+        };
+        staged_inap_invoke(inap::op_codes::PROMPT_AND_COLLECT_USER_INFORMATION, &arg)
+    }
+
+    /// Stage an INAP ConnectToResource invoke: connect the call to a specialised
+    /// resource at `ip_routing_address` (a called-party-number byte string), or,
+    /// with none given, to the SRF colocated with the SSF.
+    #[pyo3(signature = (*, ip_routing_address=None))]
+    fn connect_to_resource(&self, ip_routing_address: Option<Vec<u8>>) -> PyResult<StagedInvoke> {
+        use inap::operations::ConnectToResourceArg;
+        let none = ip_routing_address.is_none();
+        let arg = ConnectToResourceArg {
+            resource_address_ipv4: ip_routing_address.map(Into::into),
+            resource_address_none: none.then_some(()),
+        };
+        staged_inap_invoke(inap::op_codes::CONNECT_TO_RESOURCE, &arg)
+    }
+
+    fn __repr__(&self) -> String {
+        "inap".to_string()
+    }
+}
+
+/// `inap.AC`, INAP CS-1 application-context helpers.
+#[pyclass(name = "InapAc", module = "siphon")]
+pub struct InapAc;
+
+#[pymethods]
+impl InapAc {
+    /// cs1-ssp-to-scp, the Core INAP CS-1 SSP-to-SCP application context
+    /// (`0.4.0.1.1.0.3.0`). Carried in the AARQ/AARE of an INAP SSF-SCF dialogue,
+    /// so the response the engine builds for an INAP termination echoes the IN
+    /// application context, not a CAMEL one.
+    #[getter]
+    fn ssp_to_scp(&self) -> MapAcHandle {
+        MapAcHandle {
+            arcs: oid_arcs(inap::application_context::cs1_ssp_to_scp()),
+        }
+    }
+}
+
+/// Encode an INAP operation argument to BER and stage it as an `Invoke` for
+/// `dlg.invoke(...)`, carrying the operation code.
+fn staged_inap_invoke<T: rasn::Encode>(op: i64, arg: &T) -> PyResult<StagedInvoke> {
+    let bytes = inap::encode(arg).map_err(err)?;
+    Ok(StagedInvoke {
+        op,
+        arg: Some(bytes),
+    })
+}
+
+/// Map an ITU-T Q.1218 EventTypeBCSM integer to the INAP codec enum.
+fn inap_event_type_bcsm(v: i64) -> PyResult<inap::types::EventTypeBcsm> {
+    use inap::types::EventTypeBcsm as E;
+    Ok(match v {
+        2 => E::CollectedInfo,
+        3 => E::AnalysedInformation,
+        4 => E::RouteSelectFailure,
+        5 => E::OCalledPartyBusy,
+        6 => E::ONoAnswer,
+        7 => E::OAnswer,
+        9 => E::ODisconnect,
+        10 => E::OAbandon,
+        12 => E::TermAttemptAuthorized,
+        13 => E::TBusy,
+        14 => E::TNoAnswer,
+        15 => E::TAnswer,
+        17 => E::TDisconnect,
+        18 => E::TAbandon,
+        _ => return Err(err(format!("unknown EventTypeBCSM {v}"))),
+    })
+}
+
+/// Map an ITU-T Q.1218 MonitorMode integer to the INAP codec enum.
+fn inap_monitor_mode(v: i64) -> PyResult<inap::types::MonitorMode> {
+    use inap::types::MonitorMode as M;
+    Ok(match v {
+        0 => M::Interrupted,
+        1 => M::NotifyAndContinue,
+        2 => M::Transparent,
+        _ => return Err(err(format!("unknown MonitorMode {v}"))),
+    })
+}
+
 /// Register a Python termination handler for `op` on every owned subsystem (so
 /// the handler fires whichever local SSN the message was addressed to).
 fn register_termination(py: Python<'_>, op: i64, func: &Py<PyAny>) {
@@ -2189,6 +2495,7 @@ fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ss7", Bound::new(py, Ss7)?)?;
     m.add("gsm_map", Bound::new(py, GsmMap)?)?;
     m.add("gsm_cap", Bound::new(py, GsmCap)?)?;
+    m.add("inap", Bound::new(py, Inap)?)?;
 
     // Types a script imports for typing / construction.
     m.add_class::<Node>()?;
@@ -2211,16 +2518,16 @@ fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 /// The siphon integration seam. A composing siphon binary calls this once at
 /// startup with the `siphon` package module as `parent`; it mounts the `ss7` /
-/// `gsm_map` / `gsm_cap` namespace singletons, the `configure` / `metrics`
-/// functions, the `SigtranError` exception, and the shared types onto it. A
-/// hot-reloaded script then reaches them with
-/// `from siphon import ss7, gsm_map, gsm_cap`, programs the Rust routing tables
-/// live, and registers MAP/CAP termination handlers.
+/// `gsm_map` / `gsm_cap` / `inap` namespace singletons, the `configure` /
+/// `metrics` functions, the `SigtranError` exception, and the shared types onto
+/// it. A hot-reloaded script then reaches them with
+/// `from siphon import ss7, gsm_map, gsm_cap, inap`, programs the Rust routing
+/// tables live, and registers MAP/CAP/INAP termination handlers.
 ///
 /// The namespace singletons drive one process-wide [`node`]. A composing binary
 /// that prefers per-namespace mounting can instead register [`Ss7`] / [`GsmMap`]
-/// / [`GsmCap`] individually (they are `#[pyclass]` values), but `register` is
-/// the one-call form and the surface the tests drive.
+/// / [`GsmCap`] / [`Inap`] individually (they are `#[pyclass]` values), but
+/// `register` is the one-call form and the surface the tests drive.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     add_contents(py, parent)
 }

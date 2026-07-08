@@ -60,6 +60,11 @@ const AC_INFO_RETRIEVAL: [u32; 8] = [0, 4, 0, 0, 1, 0, 5, 3]; // infoRetrieval v
 const AC_MO_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 21, 3]; // shortMsgMO-Relay v3
 const AC_MT_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 25, 3]; // shortMsgMT-Relay v3
 const AC_CAP: [u32; 8] = [0, 4, 0, 0, 1, 21, 3, 4]; // gsmSSF-scfGeneric v3
+const AC_INAP: [u32; 8] = [0, 4, 0, 1, 1, 0, 3, 0]; // cs1-ssp-to-scp (Core INAP CS-1)
+
+// The IN SCP subsystem (route-on-SSN, dispatched to the INAP dissector in
+// Wireshark by default).
+const SCP_SSN: u8 = 106;
 
 // ── TBCD helpers (same shape as ss7-stack) ───────────────────────────────────
 
@@ -404,6 +409,71 @@ fn release_call_arg() -> Vec<u8> {
     gsm_cap::encode(&arg).expect("encode release")
 }
 
+// ── INAP CS-1 argument bytes (fixed-network IN, distinct from the CAMEL set) ──
+
+fn inap_initial_dp_arg() -> Vec<u8> {
+    let arg = inap::operations::InitialDpArg {
+        service_key: 100.into(),
+        called_party_number: Some(isdn("15550142").into()),
+        calling_party_number: Some(isdn(PEER_GT).into()),
+        calling_partys_category: None,
+        ip_ssp_capabilities: None,
+        ip_available: None,
+        location_number: None,
+        original_called_party_id: None,
+        high_layer_compatibility: None,
+        service_interaction_indicators: None,
+        additional_calling_party_number: None,
+        forward_call_indicators: None,
+        event_type_bcsm: None,
+        redirecting_party_id: None,
+    };
+    inap::encode(&arg).expect("encode inap idp")
+}
+
+fn inap_rrbe_arg() -> Vec<u8> {
+    let arg = inap::operations::RequestReportBcsmEventArg {
+        bcsm_events: vec![
+            inap::types::BcsmEvent {
+                event_type_bcsm: inap::types::EventTypeBcsm::OAnswer,
+                monitor_mode: inap::types::MonitorMode::Interrupted,
+                leg_id: None,
+            },
+            inap::types::BcsmEvent {
+                event_type_bcsm: inap::types::EventTypeBcsm::ODisconnect,
+                monitor_mode: inap::types::MonitorMode::NotifyAndContinue,
+                leg_id: None,
+            },
+        ],
+    };
+    inap::encode(&arg).expect("encode inap rrbe")
+}
+
+fn inap_connect_arg() -> Vec<u8> {
+    let arg = inap::operations::ConnectArg {
+        destination_routing_address: vec![isdn("15550123").into()],
+        correlation_id: None,
+        original_called_party_id: None,
+        scf_id: None,
+    };
+    inap::encode(&arg).expect("encode inap connect")
+}
+
+fn inap_release_call_arg() -> Vec<u8> {
+    // INAP CS-1 releaseCall is a bare Q.850 Cause (not a SEQUENCE).
+    let arg = inap::operations::ReleaseCallArg(vec![0x90, 0x03].into());
+    inap::encode(&arg).expect("encode inap release")
+}
+
+fn inap_event_report_bcsm_arg() -> Vec<u8> {
+    let arg = inap::operations::EventReportBcsmArg {
+        event_type_bcsm: inap::types::EventTypeBcsm::OAnswer,
+        leg_id: None,
+        misc_call_info: None,
+    };
+    inap::encode(&arg).expect("encode inap erb")
+}
+
 // ── Test handlers (the phase-4 Python handlers, done in Rust here) ───────────
 
 /// A fake HLR answering SRI-SM with an imsi + serving-MSC number, single shot.
@@ -486,6 +556,45 @@ impl TerminationHandler for FakeScpRelease {
     fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
         dlg.invoke(gsm_cap::op_codes::RELEASE_CALL, Some(release_call_arg()));
         dlg.end();
+    }
+}
+
+/// A fake IN SCP terminating an INAP CS-1 initialDP: arm two BCSM detection
+/// points (RequestReportBCSMEvent) and connect the call, both in the closing End.
+struct FakeInapScp;
+impl TerminationHandler for FakeInapScp {
+    fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
+        dlg.invoke(
+            inap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+            Some(inap_rrbe_arg()),
+        );
+        dlg.invoke(inap::op_codes::CONNECT, Some(inap_connect_arg()));
+        dlg.end();
+    }
+}
+
+/// A fake IN SCP that arms detection points and holds the dialogue open (RRBE in
+/// a Continue), then releases the call when the SSF reports the armed event
+/// (eventReportBCSM).
+struct FakeInapScpHeldOpen;
+impl TerminationHandler for FakeInapScpHeldOpen {
+    fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
+        dlg.invoke(
+            inap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+            Some(inap_rrbe_arg()),
+        );
+        dlg.send(); // Continue: AARE + RRBE, dialogue held open
+    }
+    fn on_continue(&self, dlg: &mut Dialogue, peer: &PeerTurn) {
+        // The SSF reported an armed detection point; release the call and close.
+        if peer
+            .components
+            .iter()
+            .any(|c| matches!(c, PeerComponent::Invoke { .. }))
+        {
+            dlg.invoke(inap::op_codes::RELEASE_CALL, Some(inap_release_call_arg()));
+            dlg.end();
+        }
     }
 }
 
@@ -953,6 +1062,117 @@ fn initial_dp_gets_release_call_for_a_barred_number() {
         "a barred call is released, not connected"
     );
     let _: ReleaseCallArg = gsm_cap::decode(&param).expect("releaseCall decodes");
+    assert_eq!(engine.open_dialogues(), 0);
+}
+
+#[test]
+fn inap_initial_dp_gets_rrbe_and_connect_at_the_scp() {
+    // An IN SCP owns SSN 106; the SSF triggers an INAP CS-1 initialDP under the
+    // cs1-ssp-to-scp application context. The SCP arms two BCSM detection points
+    // and connects the call, both in the closing End; the AARE echoes the IN
+    // application context (not a CAMEL one).
+    let engine = engine_with(SCP_SSN, inap::op_codes::INITIAL_DP, Arc::new(FakeInapScp));
+    let otid = [0x1A, 0x2B, 0x3C, 0x4D];
+
+    let out = engine.deliver(
+        &begin_msu(
+            inap::op_codes::INITIAL_DP,
+            inap_initial_dp_arg(),
+            &AC_INAP,
+            SubsystemNumber::from_u8(SCP_SSN),
+            &otid,
+        ),
+        "ingress",
+    );
+    let reply = decode_reply(&out[0]);
+    assert!(matches!(reply, TcapMessage::End(_)));
+    assert_eq!(dtid_of(&reply), otid, "the End echoes the request OTID");
+    assert_eq!(
+        aare_ac(&reply).as_deref(),
+        Some(&AC_INAP[..]),
+        "the AARE carries the IN application context, not a CAMEL one"
+    );
+
+    let ops = invoke_ops(&reply);
+    assert_eq!(
+        ops,
+        vec![
+            inap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+            inap::op_codes::CONNECT
+        ],
+        "the End carries RequestReportBCSMEvent then Connect"
+    );
+    // Both components decode as their INAP CS-1 operations.
+    let rrbe = invoke_all(&reply)
+        .into_iter()
+        .find(|(op, _)| *op == inap::op_codes::REQUEST_REPORT_BCSM_EVENT)
+        .expect("rrbe present")
+        .1;
+    let arg: inap::operations::RequestReportBcsmEventArg =
+        inap::decode(&rrbe).expect("inap rrbe decodes");
+    assert_eq!(arg.bcsm_events.len(), 2);
+    let connect = invoke_all(&reply)
+        .into_iter()
+        .find(|(op, _)| *op == inap::op_codes::CONNECT)
+        .expect("connect present")
+        .1;
+    let _: inap::operations::ConnectArg = inap::decode(&connect).expect("inap connect decodes");
+    assert_eq!(engine.open_dialogues(), 0);
+}
+
+#[test]
+fn inap_initial_dp_held_open_then_event_report_releases() {
+    // The SCP arms detection points in a Continue (dialogue held open); the SSF
+    // then reports the armed event (eventReportBCSM), and the SCP releases the
+    // call in the closing End. One handler drives both legs.
+    let engine = engine_with(
+        SCP_SSN,
+        inap::op_codes::INITIAL_DP,
+        Arc::new(FakeInapScpHeldOpen),
+    );
+    let otid = [0x5E, 0x6F, 0x70, 0x81];
+
+    // Opening leg: initialDP → RequestReportBCSMEvent in a Continue.
+    let leg1 = engine.deliver(
+        &begin_msu(
+            inap::op_codes::INITIAL_DP,
+            inap_initial_dp_arg(),
+            &AC_INAP,
+            SubsystemNumber::from_u8(SCP_SSN),
+            &otid,
+        ),
+        "ingress",
+    );
+    let r1 = decode_reply(&leg1[0]);
+    assert!(
+        matches!(r1, TcapMessage::Continue(_)),
+        "RRBE holds the dialogue open"
+    );
+    assert_eq!(aare_ac(&r1).as_deref(), Some(&AC_INAP[..]));
+    assert_eq!(invoke_of(&r1).0, inap::op_codes::REQUEST_REPORT_BCSM_EVENT);
+    assert_eq!(engine.open_dialogues(), 1);
+    let our_tid = otid_of(&r1);
+
+    // Follow-up leg: the SSF reports the armed event; the SCP releases + closes.
+    let leg2 = engine.deliver(
+        &continue_msu(
+            &our_tid,
+            vec![invoke(
+                inap::op_codes::EVENT_REPORT_BCSM,
+                inap_event_report_bcsm_arg(),
+                1,
+            )],
+            false,
+            &AC_INAP,
+        ),
+        "ingress",
+    );
+    let r2 = decode_reply(&leg2[0]);
+    assert!(
+        matches!(r2, TcapMessage::End(_)),
+        "the SCP closes with a releaseCall"
+    );
+    assert_eq!(invoke_of(&r2).0, inap::op_codes::RELEASE_CALL);
     assert_eq!(engine.open_dialogues(), 0);
 }
 

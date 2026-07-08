@@ -83,6 +83,10 @@ const AC_NET_LOC_UP: [u32; 8] = [0, 4, 0, 0, 1, 0, 1, 3];
 const AC_MO_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 21, 3];
 /// gsmSSF-scfGenericAC v3 (CAMEL initialDP).
 const AC_CAP: [u32; 8] = [0, 4, 0, 0, 1, 21, 3, 4];
+/// cs1-ssp-to-scp (Core INAP CS-1 initialDP). Binds Wireshark's INAP dissector.
+const AC_INAP: [u32; 8] = [0, 4, 0, 1, 1, 0, 3, 0];
+/// The IN SCP subsystem number (Wireshark dispatches SSN 106 to INAP by default).
+const SCP_SSN: u8 = 106;
 
 // ── Synthetic value helpers (same shape as ss7-stack) ────────────────────────
 
@@ -171,6 +175,27 @@ fn initial_dp_arg(imsi: &str) -> Vec<u8> {
         time_and_timezone: None,
     };
     gsm_cap::encode(&arg).expect("encode idp")
+}
+
+/// An INAP CS-1 initialDP argument (fixed-network IEs, no mobile fields).
+fn inap_initial_dp_arg() -> Vec<u8> {
+    let arg = inap::operations::InitialDpArg {
+        service_key: 100.into(),
+        called_party_number: Some(isdn("15550142").into()),
+        calling_party_number: Some(isdn("15550101").into()),
+        calling_partys_category: None,
+        ip_ssp_capabilities: None,
+        ip_available: None,
+        location_number: None,
+        original_called_party_id: None,
+        high_layer_compatibility: None,
+        service_interaction_indicators: None,
+        additional_calling_party_number: None,
+        forward_call_indicators: None,
+        event_type_bcsm: None,
+        redirecting_party_id: None,
+    };
+    inap::encode(&arg).expect("encode inap idp")
 }
 
 // ── TCAP + SCCP assembly (real dialogue portion for a clean dissection) ───────
@@ -276,6 +301,27 @@ fn cap_sccp(imsi: &str) -> Vec<u8> {
         SubsystemNumber::Cap,
         &tcap_begin(gsm_cap::op_codes::INITIAL_DP, initial_dp_arg(imsi), &AC_CAP),
     )
+}
+
+/// Build the SCCP bytes for the INAP CS-1 initialDP operation, addressed
+/// route-on-SSN to the SCP (SSN 106) under the Core INAP CS-1 application context.
+///
+/// It carries a distinct OTID so a dissector keys it as its own TCAP transaction
+/// (the shared `tcap_begin` OTID would otherwise group every Begin in the capture
+/// into one transaction and dissect them all under the first frame's SSN).
+fn inap_sccp() -> Vec<u8> {
+    let begin = Begin {
+        otid: vec![0x51, 0x52, 0x53, 0x54].into(),
+        dialogue_portion: Some(aarq(&AC_INAP)),
+        components: Some(vec![Component::Invoke(Invoke {
+            invoke_id: 1,
+            linked_id: None,
+            operation_code: OperationCode::Local(inap::op_codes::INITIAL_DP),
+            parameter: Some(Any::new(inap_initial_dp_arg())),
+        })]),
+    };
+    let tcap = tcap::encode(&TcapMessage::Begin(begin)).expect("encode inap tcap");
+    sccp_udt(SubsystemNumber::from_u8(SCP_SSN), &tcap)
 }
 
 // ── Transport framing (explicit OPC/DPC/SLS, any Service Indicator) ──────────
@@ -1496,8 +1542,15 @@ async fn wire_forwarded_frames_dissect_clean_in_tshark() {
     let cap = cap_sccp("001010000000042");
     src.send_in(&m3ua_sccp(&cap, OPC_UPSTREAM, DPC_ADJ, 0))
         .await;
+    // One INAP CS-1 initialDP (SSN 106) routed to the M3UA AS, so it transits
+    // undecoded and forwards over M3UA alongside the MAP frames.
+    let inap = inap_sccp();
+    src.send_in(&m3ua_sccp(&inap, OPC_UPSTREAM, DPC_HLR, 0))
+        .await;
 
-    // Collect the forwarded frames: three M3UA (PPID 3), one M2PA (PPID 5).
+    // Collect the forwarded frames: three MAP + one INAP over M3UA (PPID 3), one
+    // CAMEL over M2PA (PPID 5). The M2PA frame is pulled between the MAP and INAP
+    // M3UA frames so the reverse-path indices below stay stable.
     let mut frames: Vec<(Vec<u8>, u32, u16)> = Vec::new();
     for _ in 0..map_msus.len() {
         let f = peer_a.recv_out().await.expect("m3ua forward");
@@ -1505,6 +1558,8 @@ async fn wire_forwarded_frames_dissect_clean_in_tshark() {
     }
     let mf = m2pa.recv_out().await.expect("m2pa forward");
     frames.push((mf, PPID_M2PA, 1));
+    let inf = peer_a.recv_out().await.expect("m3ua inap forward");
+    frames.push((inf, PPID_M3UA, 1));
 
     src.close();
     peer_a.close();
@@ -1518,6 +1573,10 @@ async fn wire_forwarded_frames_dissect_clean_in_tshark() {
     assert_eq!(
         decode_m2pa(&frames[3].0).2,
         Some(gsm_cap::op_codes::INITIAL_DP)
+    );
+    assert_eq!(
+        decode_m3ua(&frames[4].0).2,
+        Some(inap::op_codes::INITIAL_DP)
     );
 
     if !tshark_available() {
@@ -1574,6 +1633,7 @@ async fn wire_forwarded_frames_dissect_clean_in_tshark() {
     let proto_text = String::from_utf8_lossy(&proto.stdout);
     let tcap_frames = proto_text.lines().filter(|l| l.contains("tcap")).count();
     let map_frames = proto_text.lines().filter(|l| l.contains("gsm_map")).count();
+    let inap_frames = proto_text.lines().filter(|l| l.contains("inap")).count();
 
     let _ = std::fs::remove_file(&path);
 
@@ -1582,15 +1642,20 @@ async fn wire_forwarded_frames_dissect_clean_in_tshark() {
         "tshark flagged the forwarded frames:\n{}",
         bad.join("\n")
     );
-    // All four frames (3 over M3UA, 1 over M2PA) must dissect down to TCAP, and
-    // the three MAP operations down to gsm_map. This proves the framing on both
-    // egress transports is genuinely valid, not merely non-erroring at SCTP.
+    // All five frames (4 over M3UA, 1 over M2PA) must dissect down to TCAP, the
+    // three MAP operations down to gsm_map, and the INAP initialDP down to the
+    // INAP dissector. This proves the framing on both egress transports is
+    // genuinely valid, not merely non-erroring at SCTP.
     assert!(
-        tcap_frames >= 4,
+        tcap_frames >= 5,
         "tshark did not dissect every forwarded frame through TCAP (got {tcap_frames})"
     );
     assert!(
         map_frames >= 3,
         "tshark did not dissect the M3UA-forwarded MAP frames through gsm_map (got {map_frames})"
+    );
+    assert!(
+        inap_frames >= 1,
+        "tshark did not dissect the INAP initialDP through the INAP dissector (got {inap_frames})"
     );
 }
