@@ -25,6 +25,18 @@
 //! Routing Key Management (dynamic REG/DEREG), the ERR round-trip, or multiple
 //! ASPs multiplexed on one SCTP association, those are out of scope this phase.
 //!
+//! ## What the SUA subset does
+//!
+//! SUA (RFC 3868) is M3UA's sibling: the same ASPSM/ASPTM handshake brings an
+//! Application Server up, but it carries the **SCCP user** (TCAP) addressed by
+//! GT/SSN/PC in a **CLDT** (connectionless data transfer), not the MTP3 user on a
+//! routing label. An inbound CLDT is bridged one-for-one to an SCCP UDT and
+//! routed through the *same* GTT / content / local-termination engine as
+//! SCCP-over-M3UA; an egress to a `sua` AS re-wraps the routed SCCP-user in a
+//! CLDT (SCTP PPID 4). Only the **connectionless** set (CLDT/CLDR) is carried;
+//! the connection-oriented set (CORE/COAK/CODT/CODA/…) is out of scope this
+//! phase. See [`sua`](self) and [`framing`].
+//!
 //! ## What the M2PA subset does
 //!
 //! It aligns a link to in-service (Alignment → Proving → Ready) with the
@@ -46,11 +58,6 @@
 //! MSU's OPC is our own point code, so we originated it and it came back) and
 //! **route-reflect** (the resolved egress is the very AS / linkset the MSU
 //! arrived on). Both warn-log the OPC/DPC and the inbound association.
-//!
-//! ## Reserved
-//!
-//! `sua` associations parse but are **not implemented**: [`TransportHandle::start`]
-//! returns [`TransportError::Unsupported`] listing them.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -71,6 +78,7 @@ pub mod framing;
 mod m2pa;
 mod m3ua;
 pub mod registry;
+mod sua;
 
 pub use framing::Msu;
 pub use m2pa::next_status;
@@ -104,15 +112,18 @@ pub enum TransportError {
     /// An M2PA encode/decode failed.
     #[error("m2pa: {0}")]
     M2pa(#[from] ::m2pa::M2paError),
+    /// A SUA decode/encode failed.
+    #[error("sua: {0}")]
+    Sua(#[from] ::sua::SuaError),
+    /// An SCCP encode/decode failed (in the SUA CLDT ⇄ SCCP-user bridge).
+    #[error("sccp: {0}")]
+    Sccp(#[from] ::sccp::SccpError),
     /// A routing-label framing error.
     #[error("framing: {0}")]
     Framing(String),
     /// A config problem surfaced at transport start (bad address, unknown tenant).
     #[error("config: {0}")]
     Config(String),
-    /// A configured adaptation is reserved but not implemented (SUA).
-    #[error("unsupported: {0}")]
-    Unsupported(String),
 }
 
 /// Transport result alias.
@@ -163,19 +174,6 @@ impl TransportHandle {
         tenant_id: &str,
         router: Arc<Router>,
     ) -> Result<Self> {
-        // SUA is reserved: refuse to start if any association uses it.
-        let sua: Vec<&str> = config
-            .associations
-            .iter()
-            .filter(|a| a.adaptation == Adaptation::Sua)
-            .map(|a| a.id.as_str())
-            .collect();
-        if !sua.is_empty() {
-            return Err(TransportError::Unsupported(format!(
-                "sua adaptation is reserved and not implemented (associations: {sua:?})"
-            )));
-        }
-
         let registry = Arc::new(
             Registry::build(config, tenant_id)
                 .ok_or_else(|| TransportError::Config(format!("unknown tenant `{tenant_id}`")))?,
@@ -205,7 +203,9 @@ impl TransportHandle {
             };
 
             match (assoc.adaptation, assoc.role) {
-                (Adaptation::M3ua, Role::Server) | (Adaptation::M2pa, Role::Server) => {
+                (Adaptation::M3ua, Role::Server)
+                | (Adaptation::M2pa, Role::Server)
+                | (Adaptation::Sua, Role::Server) => {
                     let listener = bind(&addrs, &sctp_cfg)?;
                     bound.insert(assoc.id.clone(), listener.local_addr()?);
                     tasks.push(tokio::spawn(accept_loop(
@@ -228,6 +228,18 @@ impl TransportHandle {
                         shutdown_rx.clone(),
                     )));
                 }
+                (Adaptation::Sua, Role::Client) => {
+                    let conn = Arc::new(connect(&addrs, &sctp_cfg).await?);
+                    slot.set_sender(conn.clone());
+                    let membership = registry.as_membership(&assoc.id);
+                    tasks.push(tokio::spawn(sua::run_asp(
+                        conn,
+                        slot,
+                        membership,
+                        ctx,
+                        shutdown_rx.clone(),
+                    )));
+                }
                 (Adaptation::M2pa, Role::Client) => {
                     let conn = Arc::new(connect(&addrs, &sctp_cfg).await?);
                     slot.set_sender(conn.clone());
@@ -238,7 +250,6 @@ impl TransportHandle {
                         shutdown_rx.clone(),
                     )));
                 }
-                (Adaptation::Sua, _) => unreachable!("sua rejected above"),
             }
         }
 
@@ -354,7 +365,9 @@ async fn accept_loop(
                     Adaptation::M2pa => {
                         tokio::spawn(m2pa::run_link(assoc, child_slot, child_ctx, child_sd));
                     }
-                    Adaptation::Sua => {}
+                    Adaptation::Sua => {
+                        tokio::spawn(sua::run_sg(assoc, child_slot, child_ctx, child_sd));
+                    }
                 }
             }
         }
@@ -406,7 +419,19 @@ async fn send_reply(registry: &Registry, assoc_id: &str, msu: &Msu) {
                 return;
             }
         },
-        Adaptation::Sua => return,
+        Adaptation::Sua => {
+            let rc = registry
+                .as_membership(assoc_id)
+                .map(|(rc, _)| rc)
+                .unwrap_or(0);
+            match framing::wrap_sua(msu, rc) {
+                Ok(b) => (b, 1u16, 4u32),
+                Err(e) => {
+                    eprintln!("siphon-sigtran: dialogue reply sua framing failed: {e}");
+                    return;
+                }
+            }
+        }
     };
     if let Err(e) = sender.send(&bytes, stream, ppid).await {
         eprintln!("siphon-sigtran: dialogue reply send on `{assoc_id}` failed: {e}");

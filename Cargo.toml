@@ -31,6 +31,11 @@ m3ua = "1"
 m2pa = "1"
 # SCCP (Q.71x): global titles, addresses, UDT. Drives the GTT resolver.
 sccp = "1"
+# SUA (RFC 3868): IP adaptation of the SCCP user (TCAP) with GT/SSN/PC addressing.
+# The connectionless set (CLDT/CLDR) bridges one-for-one to SCCP UDT/UDTS, so a
+# `sua` Application Server routes through the same GTT / content / termination
+# engine as SCCP-over-M3UA. Phase-2 transport. SCTP PPID 4.
+sua = "1"
 # ISUP (Q.763): circuit-switched call control, a direct MTP3-user (SI=5). Decoded
 # on the transit path for the optional ISUP-aware screening layer.
 itu-isup = "1"

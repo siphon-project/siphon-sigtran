@@ -17,8 +17,9 @@
 //!   an allowed IAM transited to the egress AS unchanged),
 //! * the transfer-path loop guards (own-OPC, route-reflection) and the SCCP
 //!   hop-counter guard on a GTT translation (decrement, then drop + XUDTS return),
-//! * the `sua` adaptation reserved-but-refused,
-//! * a tshark dissection gate over the forwarded frames.
+//! * a `sua` association starting, and a SUA CLDT routed via GTT to an egress AS
+//!   (the CLDT ⇄ SCCP-user bridge on both faces),
+//! * a tshark dissection gate over the forwarded frames (M3UA + M2PA, and SUA).
 //!
 //! Real SCTP is required; if a bind/connect fails (module not loaded, no
 //! privilege) the test prints a SKIP and passes. All data is synthetic: test
@@ -50,6 +51,7 @@ use mtp3::NetworkIndicator;
 use sccp::{
     ExtendedUnitData, GlobalTitle, ReturnCause, SccpAddress, SccpMessage, SubsystemNumber, UnitData,
 };
+use sua::{GlobalTitle as SuaGt, MessageType as SuaType, SuaAddress, SuaMessage};
 use tcap::dialogue::{DialoguePdu, DialoguePortion};
 use tcap::{Begin, Component, Invoke, OperationCode, ReturnResult, ReturnResultValue, TcapMessage};
 
@@ -70,6 +72,7 @@ const DPC_ADJ: u32 = 3000; // m2pa adjacent → linkset `transit`
 const OUR_GT: &str = "15550100";
 const PPID_M3UA: u32 = 3;
 const PPID_M2PA: u32 = 5;
+const PPID_SUA: u32 = 4;
 const SI_SCCP: u8 = 3;
 const SI_ISUP: u8 = 5;
 
@@ -566,6 +569,137 @@ async fn send_link_status(assoc: &SctpAssociation, state: LinkState) {
     }
 }
 
+// ── Synthetic SUA ASP peer (connects to the node's SG association) ────────────
+
+/// A SUA ASP peer: it connects to one of the node's `server` SUA associations,
+/// runs the ASPSM/ASPTM handshake to Active on PPID 4, then sends CLDT in and
+/// collects the CLDT/CLDR the node forwards back out to it.
+struct SuaPeer {
+    assoc: Arc<SctpAssociation>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    task: JoinHandle<()>,
+}
+
+impl SuaPeer {
+    /// Connect + handshake. `rc` is the AS routing context to activate.
+    async fn connect(addr: SocketAddr, rc: u32) -> Option<Self> {
+        let cfg = SctpConfig::new().nodelay(true);
+        let assoc = Arc::new(SctpAssociation::connect_with(addr, &cfg).await.ok()?);
+        assoc
+            .send(&SuaMessage::asp_up(Some(1), None).encode(), 0, PPID_SUA)
+            .await
+            .ok()?;
+        wait_sua(&assoc, SuaType::AspUpAck).await?;
+        assoc
+            .send(
+                &SuaMessage::asp_active(Some(1), Some(rc)).encode(),
+                0,
+                PPID_SUA,
+            )
+            .await
+            .ok()?;
+        wait_sua(&assoc, SuaType::AspActiveAck).await?;
+
+        let (tx, rx) = mpsc::channel(64);
+        let a2 = assoc.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((data, info)) = a2.recv().await {
+                if info.ppid != PPID_SUA {
+                    continue;
+                }
+                match SuaMessage::decode(&data) {
+                    Ok(m) if matches!(m.message_type, SuaType::Cldt | SuaType::Cldr) => {
+                        if tx.send(data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(m) if m.message_type == SuaType::Heartbeat => {
+                        let _ = a2
+                            .send(&SuaMessage::heartbeat_ack(None).encode(), 0, PPID_SUA)
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Some(Self { assoc, rx, task })
+    }
+
+    /// Send an already-encoded SUA message in on stream 1.
+    async fn send_in(&self, bytes: &[u8]) {
+        let _ = self.assoc.send(bytes, 1, PPID_SUA).await;
+    }
+
+    /// Await the next forwarded CLDT/CLDR frame (up to 5 s).
+    async fn recv_out(&mut self) -> Option<Vec<u8>> {
+        timeout(Duration::from_secs(5), self.rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn close(self) {
+        self.task.abort();
+    }
+}
+
+/// Receive on an association until a SUA message of the wanted type arrives.
+async fn wait_sua(assoc: &SctpAssociation, want: SuaType) -> Option<()> {
+    loop {
+        let (data, info) = timeout(Duration::from_secs(5), assoc.recv())
+            .await
+            .ok()?
+            .ok()?;
+        if info.ppid != PPID_SUA {
+            continue;
+        }
+        if let Ok(m) = SuaMessage::decode(&data) {
+            if m.message_type == want {
+                return Some(());
+            }
+        }
+    }
+}
+
+/// A SUA CLDT carrying a MAP operation, addressed by GT so a GTT rule translates
+/// it. Calling party is us (MSC, `OUR_GT`); called party carries `called_gt` and
+/// SSN 6 (HLR). `hop` seeds the SS7 hop counter.
+fn sua_cldt_map(op: i64, arg: Vec<u8>, ac: &[u32], called_gt: &str, hop: u8) -> Vec<u8> {
+    let source = SuaAddress::with_gt(SuaGt::e164(OUR_GT), Some(SubsystemNumber::Msc.value()));
+    let dest = SuaAddress::with_gt(SuaGt::e164(called_gt), Some(SubsystemNumber::Hlr.value()));
+    let data = tcap_begin(op, arg, ac);
+    SuaMessage::cldt(0, 0, &source, &dest, 0, Some(hop), data)
+        .expect("build cldt")
+        .encode()
+}
+
+/// (destination GT digits, SS7 hop count, invoke operation code) recovered from a
+/// forwarded SUA CLDT.
+fn decode_cldt(payload: &[u8]) -> (Option<String>, Option<u8>, Option<i64>) {
+    let msg = SuaMessage::decode(payload).expect("decode cldt");
+    let dst = msg
+        .destination_address()
+        .ok()
+        .and_then(|a| a.gt_digits().map(|s| s.to_string()));
+    let hop = msg.ss7_hop_count();
+    let op = msg.data().and_then(op_of_tcap);
+    (dst, hop, op)
+}
+
+/// The first Invoke operation code inside a TCAP Begin, or `None`.
+fn op_of_tcap(tcap_bytes: &[u8]) -> Option<i64> {
+    match tcap::decode(tcap_bytes).ok()? {
+        TcapMessage::Begin(b) => match b.components?.into_iter().next()? {
+            Component::Invoke(inv) => match inv.operation_code {
+                OperationCode::Local(op) => Some(op),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 // ── Route-state polling ──────────────────────────────────────────────────────
 
 /// Poll the node until DPC `dpc` transit-resolves to `want`, up to ~10 s.
@@ -627,6 +761,25 @@ sccp:
 "#
     )
 }
+
+/// A SUA-only node: an ingress SUA SG association `sua-in`, an egress SUA AS
+/// `sccp-as` (one ASP `sua-out`), and a GTT rule translating GT prefix `1555`
+/// to dpc 2000 (which routes to that AS). A CLDT arriving on `sua-in` is bridged
+/// to the SCCP path, translated by GTT, and re-wrapped as a CLDT toward the AS.
+const SUA_NODE: &str = r#"
+node: { point_code: 1000, variant: ITU, network_indicator: international }
+associations:
+  - { id: sua-in,  adaptation: sua, role: server, addrs: [127.0.0.1], port: 0 }
+  - { id: sua-out, adaptation: sua, role: server, addrs: [127.0.0.1], port: 0 }
+application_servers:
+  - { name: sccp-as, traffic_mode: override, routing_context: 200, asps: [sua-out] }
+mtp3_routes:
+  - { dpc: 2000, as: sccp-as, priority: 1 }
+sccp:
+  local_ssns: [8]
+  gtt:
+    - { match: {gt_prefix: "1555"}, to: {dpc: 2000, ssn: 6} }
+"#;
 
 /// Start a node, or print a SKIP and return `None` if SCTP is unavailable.
 async fn start_node(yaml: &str, what: &str) -> Option<TransportHandle> {
@@ -1224,27 +1377,26 @@ async fn wire_hop_counter_guards_the_gtt_loop() {
     handle.shutdown();
 }
 
-// ── Scenario 7: sua reserved but refused ─────────────────────────────────────
+// ── Scenario 7: a sua association starts ──────────────────────────────────────
 
 #[tokio::test]
-async fn wire_sua_adaptation_is_reserved_and_refused() {
-    // Parsing accepts a `sua` association; starting the transport must refuse it
-    // with a clear "not implemented", no SCTP required.
+async fn wire_sua_association_starts() {
+    // A `sua` association is a working transport now: a node with a sua `server`
+    // association binds and comes up (no longer refused at start). Real SCTP is
+    // required; a bind failure prints a SKIP and passes.
     let yaml = r#"
 node: { point_code: 1000, variant: ITU }
 associations:
-  - { id: s1, adaptation: sua, role: client, addrs: [127.0.0.1], port: 14001 }
+  - { id: s1, adaptation: sua, role: server, addrs: [127.0.0.1], port: 0 }
 "#;
-    let cfg = Config::parse(yaml).expect("sua config parses");
-    let router = Arc::new(Router::new(&cfg));
-    let msg = match TransportHandle::start(&cfg, router).await {
-        Ok(_) => panic!("sua must be refused at start, but the transport came up"),
-        Err(e) => e.to_string(),
+    let Some(handle) = start_node(yaml, "wire_sua_starts").await else {
+        return;
     };
     assert!(
-        msg.contains("sua") && msg.contains("not implemented"),
-        "unexpected error for reserved sua: {msg}"
+        handle.bound_addr("s1").is_some(),
+        "sua association did not bind"
     );
+    handle.shutdown();
 }
 
 // ── Scenario 8: MAP/CAP dialogue termination over the wire ───────────────────
@@ -1393,6 +1545,78 @@ async fn wire_terminates_sri_sm_in_the_dialogue_engine() {
     );
 
     peer.close();
+    handle.shutdown();
+}
+
+// ── Scenario 9: SUA CLDT routed via GTT to an egress SUA AS ───────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_sua_cldt_routes_via_gtt_to_egress_as() {
+    let Some(handle) = start_node(SUA_NODE, "wire_sua_cldt").await else {
+        return;
+    };
+    let sua_in = handle.bound_addr("sua-in").expect("sua-in bound");
+    let sua_out = handle.bound_addr("sua-out").expect("sua-out bound");
+
+    let (src, egress) = match (
+        SuaPeer::connect(sua_in, 0).await,
+        SuaPeer::connect(sua_out, 200).await,
+    ) {
+        (Some(s), Some(e)) => (s, e),
+        _ => {
+            eprintln!("SKIP wire_sua_cldt: a peer connect failed");
+            return;
+        }
+    };
+    let mut egress = egress;
+
+    assert!(
+        wait_route(
+            handle.router(),
+            DPC_HLR,
+            &Destination::ApplicationServer("sccp-as".into())
+        )
+        .await,
+        "sua AS sccp-as never came up"
+    );
+
+    // A SUA CLDT carrying a genuine SRI-SM Begin, called-party GT `15559999` that
+    // the GTT rule (`1555` prefix) translates to dpc 2000 → AS sccp-as. The node
+    // bridges CLDT → SCCP (an XUDT, since the CLDT carries an SS7 hop counter),
+    // runs GTT, decrements the hop counter on the relay, and re-wraps the routed
+    // SCCP-user as a CLDT toward the egress AS.
+    let cldt = sua_cldt_map(
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        sri_sm_arg("15559999"),
+        &AC_SRI_SM,
+        "15559999",
+        15,
+    );
+    src.send_in(&cldt).await;
+
+    let fwd = egress
+        .recv_out()
+        .await
+        .expect("forwarded CLDT to egress AS");
+    let (dst_gt, hop, op) = decode_cldt(&fwd);
+    assert_eq!(
+        dst_gt.as_deref(),
+        Some("15559999"),
+        "called-party GT preserved on the forwarded CLDT"
+    );
+    assert_eq!(
+        op,
+        Some(gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM),
+        "SRI-SM operation intact on the forwarded CLDT"
+    );
+    assert_eq!(
+        hop,
+        Some(14),
+        "SS7 hop counter decremented at the GTT relay"
+    );
+
+    src.close();
+    egress.close();
     handle.shutdown();
 }
 
@@ -1657,5 +1881,124 @@ async fn wire_forwarded_frames_dissect_clean_in_tshark() {
     assert!(
         inap_frames >= 1,
         "tshark did not dissect the INAP initialDP through the INAP dissector (got {inap_frames})"
+    );
+}
+
+/// The node-emitted SUA CLDT (PPID 4) dissects clean through Wireshark's SUA
+/// dissector: no Malformed / expert error, and the chain reaches the SUA
+/// adaptation layer with the SCCP-user address parameters read back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_sua_cldt_dissects_clean_in_tshark() {
+    let Some(handle) = start_node(SUA_NODE, "wire_sua_tshark").await else {
+        return;
+    };
+    let sua_in = handle.bound_addr("sua-in").expect("sua-in bound");
+    let sua_out = handle.bound_addr("sua-out").expect("sua-out bound");
+
+    let (src, egress) = match (
+        SuaPeer::connect(sua_in, 0).await,
+        SuaPeer::connect(sua_out, 200).await,
+    ) {
+        (Some(s), Some(e)) => (s, e),
+        _ => {
+            eprintln!("SKIP wire_sua_tshark: a peer connect failed");
+            return;
+        }
+    };
+    let mut egress = egress;
+    assert!(
+        wait_route(
+            handle.router(),
+            DPC_HLR,
+            &Destination::ApplicationServer("sccp-as".into())
+        )
+        .await
+    );
+
+    let cldt = sua_cldt_map(
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        sri_sm_arg("15559999"),
+        &AC_SRI_SM,
+        "15559999",
+        15,
+    );
+    src.send_in(&cldt).await;
+    let fwd = egress.recv_out().await.expect("forwarded CLDT");
+
+    src.close();
+    egress.close();
+    handle.shutdown();
+
+    // Reverse-path sanity first (independent of tshark).
+    let (dst_gt, _hop, op) = decode_cldt(&fwd);
+    assert_eq!(dst_gt.as_deref(), Some("15559999"));
+    assert_eq!(op, Some(gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM));
+
+    if !tshark_available() {
+        eprintln!(
+            "SKIP wire_sua_tshark dissection: tshark not installed (transport path still proven)"
+        );
+        return;
+    }
+
+    // PPID 4 auto-maps to SUA in Wireshark, so no `-d` override is needed.
+    let frame = eth_ipv4_sctp(&sctp_packet(&fwd, PPID_SUA, 1, 1));
+    let path = std::env::temp_dir().join(format!("sigtran_sua_{}.pcap", std::process::id()));
+    write_pcap(&path, &[frame]).expect("write pcap");
+
+    let out = Command::new("tshark")
+        .args(["-r", path.to_str().unwrap(), "-V"])
+        .output()
+        .expect("run tshark -V");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let bad: Vec<String> = text
+        .lines()
+        .filter(|l| {
+            let ll = l.to_ascii_lowercase();
+            ll.contains("malformed")
+                || (ll.contains("[expert info") && (ll.contains("error") || ll.contains("warn")))
+                || ll.contains("beyond the end")
+                || ll.contains("dissector bug")
+        })
+        .map(|l| l.trim().to_string())
+        .collect();
+
+    let proto = Command::new("tshark")
+        .args([
+            "-r",
+            path.to_str().unwrap(),
+            "-T",
+            "fields",
+            "-e",
+            "frame.protocols",
+        ])
+        .output()
+        .expect("run tshark -T fields");
+    let proto_text = String::from_utf8_lossy(&proto.stdout);
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        bad.is_empty(),
+        "tshark flagged the SUA CLDT:\n{}\n--- dissection ---\n{}",
+        bad.join("\n"),
+        text
+    );
+    let low = text.to_ascii_lowercase();
+    // The chain must reach the SUA adaptation layer, with the CLDT type and the
+    // SCCP-user address parameter (the called-party global title) read back, not
+    // merely stop at SCTP.
+    assert!(low.contains("adaptation layer"), "no SUA layer:\n{text}");
+    assert!(
+        low.contains("connectionless data transfer") || low.contains("cldt"),
+        "message type not CLDT:\n{text}"
+    );
+    assert!(
+        text.contains("15559999"),
+        "called-party GT digits absent from the SUA dissection:\n{text}"
+    );
+    assert!(
+        proto_text.lines().any(|l| l.contains("sua")),
+        "frame.protocols never reached sua: {proto_text}"
     );
 }
