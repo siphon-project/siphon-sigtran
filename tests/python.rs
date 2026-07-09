@@ -38,7 +38,7 @@ import asyncio
 import inspect
 
 import siphon
-from siphon import ss7, gsm_map, gsm_cap
+from siphon import ss7, gsm_map, gsm_cap, inap
 
 CONFIG = """
 node: { point_code: 1000, variant: ITU }
@@ -49,13 +49,14 @@ application_servers:
 mtp3_routes:
   - { dpc: 2000, as: hlr, priority: 1 }
 sccp:
-  local_ssns: [6, 8]
+  local_ssns: [6, 8, 106]
 """
 
-# ── Import surface: the three namespaces + the node API + the exception ───────
+# ── Import surface: the four namespaces + the node API + the exception ─────────
 assert hasattr(siphon, "ss7")
 assert hasattr(siphon, "gsm_map")
 assert hasattr(siphon, "gsm_cap")
+assert hasattr(siphon, "inap")
 assert callable(siphon.configure)
 assert callable(siphon.metrics)
 assert issubclass(siphon.SigtranError, Exception)
@@ -223,6 +224,62 @@ di = node.decode(idp_out[0])
 assert di.kind == "end"                 # both invokes ride the closing End
 idp_ops = [op for (op, _) in di.invokes]
 assert 23 in idp_ops and 20 in idp_ops  # RequestReportBCSMEvent + Connect
+assert node.open_dialogues() == 0
+
+# ── An INAP CS-1 SCP: initialDP answered with RequestReportBCSMEvent + Connect ─
+# INAP is a TCAP-user peer to CAMEL; the SCP terminates the SSF-SCF dialogue the
+# same way, under the Core INAP CS-1 application context, on the SCP subsystem
+# (SSN 106). The decoded initialDP exposes the fixed-network INAP fields.
+INAP_IDP = b"\x30\x11\x80\x01\x64\x82\x05\x91\x51\x55\x10\x24\x83\x05\x91\x51\x55\x10\x10"
+INAP_CALLED = b"\x91\x51\x55\x10\x24"
+inap_seen = {}
+
+@inap.on_initial_dp
+async def on_inap_idp(dlg, idp):
+    inap_seen["service_key"] = idp.inap_service_key
+    inap_seen["called"] = idp.inap_called_party_number
+    # Arm the answer / disconnect detection points, then route the call onward.
+    dlg.invoke(inap.request_report_bcsm_event(events=[(7, 0), (9, 1)]))
+    dlg.invoke(inap.connect(destination_routing_address=[b"\x00\x11\x22"]))
+    dlg.end()
+
+# An SCP that also fields the follow-up reports registers those handlers too.
+@inap.on_event_report_bcsm
+async def on_inap_erb(dlg, arg):
+    dlg.end()
+
+@inap.on_apply_charging_report
+async def on_inap_acr(dlg, arg):
+    dlg.end()
+
+# Every originating builder produces a staged invoke dlg.invoke() consumes.
+assert on_inap_erb is not None and on_inap_acr is not None
+assert inap.continue_() is not None
+assert inap.release_call(cause=b"\x90\x03") is not None
+assert inap.apply_charging(charging_characteristics=b"\x01\x02\x03") is not None
+assert inap.apply_charging(charging_characteristics=b"\x01", party_to_charge=b"\x01") is not None
+assert inap.play_announcement(information_to_send=b"\x0a\x0b") is not None
+assert inap.prompt_and_collect_user_information(collected_info=b"\x01\x02") is not None
+assert inap.connect_to_resource() is not None
+assert list(inap.AC.ssp_to_scp.arcs) == [0, 4, 0, 1, 1, 0, 3, 0]
+
+inap_begin = node.assemble_begin(
+    op="initial-dp",
+    called_gt="15550100",
+    called_ssn=106,
+    calling_gt="15550170",
+    arg=INAP_IDP,
+    ac=inap.AC.ssp_to_scp,
+)
+inap_out = node.deliver(inap_begin, opc=2000, dpc=1000)
+assert len(inap_out) == 1
+dinap = node.decode(inap_out[0])
+assert dinap.kind == "end"                            # both invokes ride the closing End
+assert list(dinap.app_context) == [0, 4, 0, 1, 1, 0, 3, 0]  # IN AC echoed in the AARE, not a CAMEL one
+inap_ops = [op for (op, _) in dinap.invokes]
+assert 23 in inap_ops and 20 in inap_ops              # RequestReportBCSMEvent + Connect
+assert inap_seen["service_key"] == 100                # the decoded INAP serviceKey
+assert inap_seen["called"] == INAP_CALLED             # the decoded INAP calledPartyNumber
 assert node.open_dialogues() == 0
 
 # ── The originating helper returns an awaitable bridged onto tokio ────────────
