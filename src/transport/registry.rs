@@ -90,13 +90,16 @@ struct LinksetEntry {
 }
 
 /// A chosen egress: the live association and the routing context to stamp on the
-/// M3UA DATA (present only for an AS; `None` for an M2PA linkset).
+/// M3UA/SUA DATA (present only for an AS; `None` for an M2PA linkset).
 #[derive(Clone)]
 pub struct Selected {
     /// The egress association handle.
     pub assoc: Arc<SctpAssociation>,
-    /// The AS routing context (M3UA), if this egress is an AS.
+    /// The AS routing context (M3UA / SUA), if this egress is an AS.
     pub routing_context: Option<u32>,
+    /// The egress association's adaptation, so the forwarder frames the MSU for
+    /// the right transport (M3UA DATA vs SUA CLDT vs M2PA User Data).
+    pub adaptation: Adaptation,
 }
 
 /// The shared transport registry, compiled from one tenant's config.
@@ -279,6 +282,7 @@ impl Registry {
                         slots[i].sender().map(|assoc| Selected {
                             assoc,
                             routing_context: Some(a.routing_context),
+                            adaptation: slots[i].adaptation,
                         })
                     })
                     .collect()
@@ -301,6 +305,7 @@ impl Registry {
                         slots[i].sender().map(|assoc| Selected {
                             assoc,
                             routing_context: None,
+                            adaptation: slots[i].adaptation,
                         })
                     })
                     .collect()

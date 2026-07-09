@@ -10,6 +10,7 @@ use sccp::{ExtendedUnitDataService, GlobalTitle, LongUnitDataService, ReturnCaus
 
 use super::framing::{self, Msu};
 use super::{LocalDelivery, TaskCtx};
+use crate::config::Adaptation;
 use crate::isup::{IsupScreen, Screened};
 use crate::metrics::{self, LoopKind};
 use crate::mtp3::route::Destination;
@@ -21,8 +22,10 @@ use crate::sccp::gtt::GttSelector;
 const M3UA_DATA_STREAM: u16 = 1;
 const M3UA_CTRL_STREAM: u16 = 0;
 const M2PA_DATA_STREAM: u16 = 1;
+const SUA_DATA_STREAM: u16 = 1;
 const PPID_M3UA: u32 = 3;
 const PPID_M2PA: u32 = 5;
+const PPID_SUA: u32 = 4;
 
 /// Build the router [`Inbound`] from an MSU. The DPC alone routes a transit MSU
 /// of any Service Indicator; only an SCCP MSU (`SI=3`) is decoded further so
@@ -394,11 +397,29 @@ async fn send_via(via: &Destination, msu: &Msu, ctx: &TaskCtx) {
     }
     for sel in selected {
         let (bytes, stream, ppid) = match via {
-            Destination::ApplicationServer(_) => (
-                framing::wrap_m3ua(msu, sel.routing_context),
-                M3UA_DATA_STREAM,
-                PPID_M3UA,
-            ),
+            // An Application Server is served by M3UA or SUA ASPs; the egress
+            // framing follows the selected association's adaptation (M3UA DATA on
+            // a point-code routing label, or a SUA CLDT wrapping the SCCP user).
+            Destination::ApplicationServer(_) => match sel.adaptation {
+                Adaptation::M3ua => (
+                    framing::wrap_m3ua(msu, sel.routing_context),
+                    M3UA_DATA_STREAM,
+                    PPID_M3UA,
+                ),
+                Adaptation::Sua => match framing::wrap_sua(msu, sel.routing_context.unwrap_or(0)) {
+                    Ok(b) => (b, SUA_DATA_STREAM, PPID_SUA),
+                    Err(e) => {
+                        eprintln!("siphon-sigtran: sua framing failed: {e}");
+                        continue;
+                    }
+                },
+                Adaptation::M2pa => {
+                    eprintln!(
+                        "siphon-sigtran: application-server egress selected an m2pa association (invalid config), dropping"
+                    );
+                    continue;
+                }
+            },
             Destination::Linkset(_) => match framing::wrap_m2pa(msu) {
                 Ok(b) => (b, M2PA_DATA_STREAM, PPID_M2PA),
                 Err(e) => {

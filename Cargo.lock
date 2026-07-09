@@ -3004,6 +3004,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "siphon-sip",
+ "sua",
  "tcap",
  "thiserror 2.0.18",
  "tokio",
@@ -3156,6 +3157,15 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "sua"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f614599008a945998096e2ffaa05747ee853d00cf22838c142a9965dac118dc4"
+dependencies = [
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "subtle"

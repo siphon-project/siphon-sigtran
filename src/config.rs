@@ -88,10 +88,11 @@ pub enum Adaptation {
     M3ua,
     /// M2PA (RFC 4165), SCTP PPID 5.
     M2pa,
-    /// SUA (RFC 3868), SCTP PPID 4. **Reserved only** in this release: the
-    /// config accepts it so a plan can name it, but no SUA transport exists yet
-    /// (it needs a SUA codec crate that is not published). Starting a node with
-    /// a `sua` association returns a clear "not implemented" from the transport.
+    /// SUA (RFC 3868), SCTP PPID 4. Carries the SCCP user (TCAP) with GT/SSN/PC
+    /// addressing. A `sua` Application Server is served by SUA ASPs (exactly as an
+    /// M3UA AS is served by M3UA ASPs); its connectionless data (CLDT) bridges
+    /// one-for-one to SCCP UDT and routes through the same GTT / content /
+    /// termination engine. Only the connectionless set is carried.
     Sua,
 }
 
@@ -139,12 +140,14 @@ pub enum TrafficMode {
     Broadcast,
 }
 
-/// One `application_servers:` entry: an M3UA **Application Server** (RFC 4666).
+/// One `application_servers:` entry: a SIGTRAN **Application Server** (RFC 4666
+/// M3UA / RFC 3868 SUA).
 ///
-/// An AS is a logical destination served by one or more **ASPs**. Each ASP is
-/// an M3UA association (referenced by id in [`asps`](ApplicationServer::asps)),
-/// and the per-ASP ASPSM/ASPTM state machine brings it up. The traffic mode is
-/// an AS property, not a per-ASP one.
+/// An AS is a logical destination served by one or more **ASPs**. Each ASP is an
+/// M3UA *or* SUA association (referenced by id in [`asps`](ApplicationServer::asps)),
+/// and the per-ASP ASPSM/ASPTM state machine brings it up. All ASPs of one AS
+/// share a single adaptation (all M3UA, or all SUA). The traffic mode is an AS
+/// property, not a per-ASP one.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApplicationServer {
     /// AS name, referenced by `mtp3_routes` (`as:`).
@@ -800,7 +803,8 @@ impl Config {
         // never resolves two ways.
         let mut dest_names = BTreeSet::new();
 
-        // Application Servers: names unique; each ASP is a known m3ua association.
+        // Application Servers: names unique; each ASP is a known M3UA or SUA
+        // association, and all ASPs of one AS share a single adaptation.
         let mut as_names = BTreeSet::new();
         for a in &tenant.application_servers {
             if !dest_names.insert(a.name.as_str()) {
@@ -813,22 +817,34 @@ impl Config {
                     a.name
                 )));
             }
+            let mut as_adapt: Option<Adaptation> = None;
             for asp in &a.asps {
-                match assoc_adapt.get(asp.as_str()) {
+                let adapt = match assoc_adapt.get(asp.as_str()) {
                     None => {
                         return Err(where_(format!(
                             "application_server `{}` references unknown association `{}`",
                             a.name, asp
                         )))
                     }
-                    Some(Adaptation::M3ua) => {}
+                    Some(a @ (Adaptation::M3ua | Adaptation::Sua)) => *a,
                     Some(other) => {
                         return Err(where_(format!(
                             "application_server `{}` asp `{}` is a {other:?} association, \
-                             an AS is served by m3ua ASPs",
+                             an AS is served by m3ua or sua ASPs",
                             a.name, asp
                         )))
                     }
+                };
+                match as_adapt {
+                    None => as_adapt = Some(adapt),
+                    Some(first) if first != adapt => {
+                        return Err(where_(format!(
+                            "application_server `{}` mixes {first:?} and {adapt:?} ASPs; \
+                             all ASPs of an AS must share one adaptation",
+                            a.name
+                        )))
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -1275,7 +1291,8 @@ mtp3_routes:
     }
 
     #[test]
-    fn rejects_as_asp_that_is_not_m3ua() {
+    fn rejects_as_asp_that_is_m2pa() {
+        // An AS is served by M3UA or SUA ASPs, never an m2pa link.
         let yaml = r#"
 node: { point_code: 1000, variant: ITU }
 associations:
@@ -1284,7 +1301,7 @@ application_servers:
   - { name: as1, traffic_mode: override, routing_context: 1, asps: [x1] }
 "#;
         let err = Config::parse(yaml).unwrap_err();
-        assert!(err.to_string().contains("served by m3ua ASPs"));
+        assert!(err.to_string().contains("served by m3ua or sua ASPs"));
     }
 
     #[test]
@@ -1301,15 +1318,44 @@ linksets:
     }
 
     #[test]
-    fn accepts_reserved_sua_association() {
-        // `sua` is reserved: parse/validate accept it (the transport rejects it
-        // at start). An unreferenced sua association is fine on its own.
+    fn accepts_sua_association() {
+        // A standalone sua association is fine on its own.
         let yaml = r#"
 node: { point_code: 1000, variant: ITU }
 associations:
   - { id: s1, adaptation: sua, role: client, addrs: [10.0.0.1], port: 14001 }
 "#;
         assert!(Config::parse(yaml).is_ok());
+    }
+
+    #[test]
+    fn accepts_sua_application_server() {
+        // An AS served by sua ASPs validates the same way an M3UA AS does.
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: s1, adaptation: sua, role: server, addrs: [10.0.0.1], port: 14001 }
+application_servers:
+  - { name: sccp-as, traffic_mode: loadshare, routing_context: 5, asps: [s1] }
+mtp3_routes:
+  - { dpc: 2000, as: sccp-as, priority: 1 }
+"#;
+        assert!(Config::parse(yaml).is_ok());
+    }
+
+    #[test]
+    fn rejects_application_server_mixing_adaptations() {
+        // All ASPs of an AS must share one adaptation (no mixing m3ua + sua).
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: m1, adaptation: m3ua, role: server, addrs: [10.0.0.1], port: 2905 }
+  - { id: s1, adaptation: sua,  role: server, addrs: [10.0.0.1], port: 14001 }
+application_servers:
+  - { name: mixed, traffic_mode: loadshare, routing_context: 5, asps: [m1, s1] }
+"#;
+        let err = Config::parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("must share one adaptation"));
     }
 
     #[test]

@@ -8,6 +8,24 @@ All notable changes are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **SUA (RFC 3868) adaptation.** A `sua` association is now a working transport,
+  no longer reserved-and-refused. It runs the same ASPSM/ASPTM handshake as M3UA
+  (ASP-UP/-ACK, ASP-ACTIVE/-ACK honouring the AS traffic mode, ASP-INACTIVE/DOWN,
+  BEAT) to bring a SUA Application Server up, then carries **connectionless**
+  SCCP-user traffic (CLDT / CLDR, SCTP PPID 4). An inbound CLDT is bridged
+  one-for-one to the equivalent SCCP message (UDT, or XUDT when it carries an SS7
+  hop counter; CLDR → UDTS) and routed through the *same* GTT / content /
+  local-termination engine as SCCP-over-M3UA and SCCP-over-M2PA; an egress to a
+  `sua` AS re-wraps the routed SCCP-user in a CLDT. The SCCP ⇄ SUA address
+  translation preserves the Global Title / SSN / Point Code, so any-to-any
+  interworking (SUA ↔ M3UA ↔ M2PA) falls out of choosing the egress framing by the
+  egress association's adaptation. SSNM (DUNA/DAVA → PAUSE/RESUME, DAUD answered
+  from the live route state, SCON/DUPU noted) folds into the router exactly as on
+  the M3UA path. An Application Server may now be served by SUA ASPs, and all ASPs
+  of one AS must share a single adaptation (all M3UA or all SUA). Backed by the
+  `sua` 1.0 codec crate. The SUA **connection-oriented** set
+  (CORE/COAK/CODT/CODA/…) is out of scope this phase; only connectionless routing
+  is carried.
 - **Optional ISUP-aware screening on the SI=5 transit path.** A tenant can add an
   `isup_screening:` block (a `default` action plus ordered `block` / `allow` rules
   matching on the ISUP `message_type` and/or a called- / calling-party-number
@@ -22,6 +40,8 @@ All notable changes are documented here. The format follows
 - The `sigtran_isup_screened_total{reason}` metric family.
 
 ### Changed
+- Depends on `sua` 1.0.0 (the RFC 3868 SUA message + parameter codec) for the SUA
+  adaptation and its CLDT ⇄ SCCP-user bridge.
 - Depends on `itu-isup` 1.0.0 (the Q.763 ISUP message + parameter codec), decoded
   on the transit path only when a tenant configures screening.
 
