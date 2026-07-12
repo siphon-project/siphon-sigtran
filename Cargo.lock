@@ -1021,10 +1021,11 @@ dependencies = [
 
 [[package]]
 name = "gsm_cap"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c0ed3d5427a52f29771cc6bcef3d653c6211e68de91c15c8e15b16cf0dd21d7"
+checksum = "db15b010fc1ea006be4fa048f6d1e2a3756e07000bc1205b78fe135f10387e22"
 dependencies = [
+ "inap",
  "rasn",
  "thiserror 2.0.18",
 ]
