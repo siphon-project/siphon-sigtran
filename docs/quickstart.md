@@ -8,9 +8,7 @@ termination path without any peer at all, using the built-in loopback seam.
     siphon-sigtran is a library, not a server. It runs inside a
     [SIPhon](https://siphon-sip.org/) binary that registers the addon at
     startup; see [Using it in a SIPhon build](integration.md). This page
-    assumes you have that binary (call it `siphon`). The pure-Rust crate works
-    without SIPhon entirely; see [the Rust quickstart](#the-rust-quickstart)
-    below.
+    assumes you have that binary (call it `siphon`).
 
 ## 1. The config
 
@@ -36,27 +34,33 @@ sccp:
   local_ssns: [8]        # we own SSN 8; inbound for it terminates locally
 ```
 
-See [Configuration](configuration.md) for every field.
+See [Configuration](configuration.md) for every field. Point your main SIPhon
+config at it, so the binary loads and configures the node at startup:
+
+```yaml
+# siphon.yaml (main config)
+extensions:
+  sigtran: sigtran.yaml
+```
 
 ## 2. The script
 
 ```python
-import siphon
 from siphon import gsm_map
 
-node = siphon.configure("sigtran.yaml")
-
-@gsm_map.on_mo_forward_sm
+@gsm_map.on_operation("mo-forward-sm")
 async def on_mo(dlg, arg):
     # arg.sm_rp_oa / arg.sm_rp_da / arg.sm_rp_ui are the raw address + TPDU bytes.
     dlg.reply(gsm_map.mo_forward_sm_res())   # returnResultLast, in a closing End
     dlg.end()
 ```
 
-Two lines of policy: configure the node, terminate mobile-originated SMS with
-an ack. `siphon.configure` accepts a path, an inline YAML string, or a dict;
-it validates the config the same way the Rust loader does and returns a
-[`Node`](script-api.md#node) handle.
+One handler of policy: terminate mobile-originated SMS with an ack. The binary
+configured the node from `sigtran.yaml`; the script just registers handlers.
+`@gsm_map.on_operation("<name>")` names the operation by its kebab-case name (the
+same `on_<message>("<name>")` shape as `@smpp.on_pdu`); it takes several
+pipe-separated, and a bare `@gsm_map.on_operation` is a catch-all. See the full
+selector list in the [Script API](script-api.md#on_operation).
 
 ## 3. Run it
 
@@ -73,12 +77,13 @@ in Rust, so nothing is dropped ([Concepts](concepts.md#hot-reload)).
 
 ## 4. Prove the path, no peer needed
 
-You do not need a live SS7 peer to see termination work. The `Node` handle can
-assemble a genuine inbound `Begin` (real TCAP in a real SCCP UDT) and push it
-through the dialogue engine:
+You do not need a live SS7 peer to test the handler. In a test, `siphon.configure`
+builds a node and hands back a `Node` you can drive: assemble a genuine inbound
+`Begin` (real TCAP in a real SCCP UDT) and push it through the dialogue engine.
 
 ```python
-# Append to the script above.
+# In a test (not the live script — the binary configures the live node).
+node = siphon.configure("sigtran.yaml")
 begin = node.assemble_begin(op="mo-forward-sm",
                             called_gt="15550100", called_ssn=8,
                             calling_gt="15550142")
@@ -87,8 +92,9 @@ print(f"terminated MO-ForwardSM, {len(replies)} reply MSU(s)")
 ```
 
 `deliver` returns the SCCP payloads the node would send back: here one `End`
-carrying the `returnResultLast` your handler staged. The same seam is how the
-crate's own integration tests drive the engine.
+carrying the `returnResultLast` your handler staged. This is the same seam the
+crate's own integration tests drive; see
+[Testing your handlers](script-api.md#testing).
 
 ## Next
 
@@ -99,25 +105,3 @@ crate's own integration tests drive the engine.
   [Script API](script-api.md).
 - **Ship it**: [Deployment](deployment.md) and
   [Kubernetes & scaling](kubernetes.md).
-
-## The Rust quickstart
-
-The default crate build pulls neither pyo3 nor SIPhon, so the routing brain is
-usable from any Rust program:
-
-```rust
-use siphon_sigtran::{Config, Router};
-use siphon_sigtran::routing::{Inbound, RouteDecision};
-
-let config = Config::load("sigtran.yaml")?;
-let router = Router::new(&config);
-
-// A message addressed to a point code the node doesn't own transits: the
-// route resolver picks the egress.
-let decision = router.route(&Inbound { dpc: 2000, ..Default::default() });
-assert!(matches!(decision, RouteDecision::Route { .. }));
-# Ok::<(), siphon_sigtran::Error>(())
-```
-
-The [API docs on docs.rs](https://docs.rs/siphon-sigtran) cover the pure-Rust
-surface: `Config`, `Router`, the transport, and the dialogue engine.

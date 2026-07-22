@@ -692,7 +692,58 @@ fn engine_with(ssn: u8, op: i64, handler: Arc<dyn TerminationHandler>) -> Dialog
     e
 }
 
+/// A handler that records its tag when it fires (then answers so the dialogue
+/// closes cleanly), for asserting *which* of two competing handlers ran.
+struct Tagger(&'static str, Arc<Mutex<Vec<&'static str>>>);
+impl TerminationHandler for Tagger {
+    fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
+        self.1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(self.0);
+        dlg.reply(op.operation_code, Some(mo_forward_sm_res()));
+        dlg.end();
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn specific_handler_wins_over_a_catch_all_regardless_of_order() {
+    let op = gsm_map::op_codes::SEND_ROUTING_INFO_FOR_SM;
+    let otid = [0x11, 0x22, 0x33, 0x44];
+    let arg = vec![0x05, 0x00]; // a BER NULL; the Tagger ignores the argument
+    let deliver = |e: &DialogueEngine| {
+        e.deliver(
+            &begin_msu(op, arg.clone(), &AC_SRI_SM, SubsystemNumber::Hlr, &otid),
+            "ingress",
+        );
+    };
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    // Catch-all registered AFTER the specific handler: the specific one still wins.
+    let mut e = DialogueEngine::new(Tcap::default());
+    e.register(6, op, Arc::new(Tagger("specific", log.clone())));
+    e.register_fallback(6, op, Arc::new(Tagger("catch-all", log.clone())));
+    deliver(&e);
+
+    // Specific registered AFTER the catch-all: the specific one still wins.
+    let mut e = DialogueEngine::new(Tcap::default());
+    e.register_fallback(6, op, Arc::new(Tagger("catch-all", log.clone())));
+    e.register(6, op, Arc::new(Tagger("specific", log.clone())));
+    deliver(&e);
+
+    // No specific handler: the catch-all fills the gap.
+    let mut e = DialogueEngine::new(Tcap::default());
+    e.register_fallback(6, op, Arc::new(Tagger("catch-all", log.clone())));
+    deliver(&e);
+
+    assert_eq!(
+        *log.lock().unwrap_or_else(|e| e.into_inner()),
+        vec!["specific", "specific", "catch-all"],
+        "a specific handler beats a catch-all in either order; the catch-all only fills the gap"
+    );
+}
 
 #[test]
 fn sri_sm_request_gets_a_return_result_in_an_end() {

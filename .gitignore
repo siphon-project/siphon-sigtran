@@ -2,9 +2,6 @@
 **/*.rs.bk
 *.pdb
 
-# Local project context, not shipped.
-CLAUDE.md
-
 # criterion output
 /criterion
 

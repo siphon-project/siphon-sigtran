@@ -32,13 +32,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rasn::types::{Any, Oid};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use async_sctp::{SctpAssociation, SctpConfig, SctpListener};
 
-use gsm_cap::operations::InitialDpArg;
+use gsm_cap::operations::{EventReportBcsmArg, InitialDpArg, RequestReportBcsmEventArg};
+use gsm_cap::types::{BcsmEvent, EventTypeBcsm, MonitorMode};
 use gsm_map::operations::location::UpdateLocationArg;
 use gsm_map::operations::mo_forward_sm::MoForwardSmArg;
 use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
@@ -53,14 +54,20 @@ use sccp::{
 };
 use sua::{GlobalTitle as SuaGt, MessageType as SuaType, SuaAddress, SuaMessage};
 use tcap::dialogue::{DialoguePdu, DialoguePortion};
-use tcap::{Begin, Component, Invoke, OperationCode, ReturnResult, ReturnResultValue, TcapMessage};
+use tcap::{
+    Begin, Component, Continue as TcapContinue, End, Invoke, OperationCode, ReturnResult,
+    ReturnResultValue, TcapMessage,
+};
 
 use siphon_sigtran::config::{Config, Tcap};
-use siphon_sigtran::dialogue::{Dialogue, DialogueEngine, IncomingOp, TerminationHandler};
+use siphon_sigtran::dialogue::{
+    Dialogue, DialogueEngine, IncomingOp, OutgoingBegin, PeerComponent, PeerTurn,
+    TerminationHandler,
+};
 use siphon_sigtran::metrics::{self, LoopKind, ScreenReason};
 use siphon_sigtran::mtp3::route::Destination;
 use siphon_sigtran::routing::{Inbound, RouteDecision, Router};
-use siphon_sigtran::transport::next_status;
+use siphon_sigtran::transport::{next_status, Origination};
 use siphon_sigtran::TransportHandle;
 
 // ── Synthetic fixed parameters ───────────────────────────────────────────────
@@ -752,7 +759,7 @@ associations:
 application_servers:
   - {{ name: hlr, traffic_mode: override, routing_context: 100, asps: [hlr-a] }}
 linksets:
-  - {{ name: transit, links: [{{assoc: xit-1, slc: 0}}] }}
+  - {{ name: transit, links: [{{assoc: xit-1}}] }}
 mtp3_routes:
   - {{ dpc: 2000, as: hlr,          priority: 1 }}
   - {{ dpc: 2000, linkset: transit, priority: 2 }}
@@ -1060,7 +1067,7 @@ async fn wire_transfers_non_sccp_by_dpc() {
 // ── Scenario 4b: ISUP screening on the SI=5 transit path ─────────────────────
 
 /// Ingress SG + AS `hlr`, with ISUP screening: block an IAM whose called-party
-/// number begins `1900`, allow everything else. Route 2000 → hlr.
+/// number begins `1999`, allow everything else. Route 2000 → hlr.
 const SCREEN_NODE: &str = r#"
 node: { point_code: 1000, variant: ITU, network_indicator: international }
 associations:
@@ -1076,12 +1083,12 @@ isup_screening:
   default: allow
   rules:
     - name: block-premium
-      match: { message_type: iam, called_prefix: "1900" }
+      match: { message_type: iam, called_prefix: "1999" }
       action: block
 "#;
 
 /// A genuine ISUP Initial Address Message to `called` (national number), encoded
-/// as the MTP3-user payload an M3UA DATA carries for `SI=5`. Synthetic +1-555/1900
+/// as the MTP3-user payload an M3UA DATA carries for `SI=5`. Synthetic +1-555/1999
 /// digits.
 fn isup_iam(called: &str) -> Vec<u8> {
     itu_isup::Message::iam(
@@ -1128,9 +1135,9 @@ async fn wire_isup_screening_drops_blocked_passes_allowed() {
         "AS hlr never came up"
     );
 
-    // 1. An ISUP IAM to a called number the block rule matches (prefix 1900) is
+    // 1. An ISUP IAM to a called number the block rule matches (prefix 1999) is
     //    screened: dropped before the transit, never forwarded, and counted.
-    let blocked = isup_iam("1900123");
+    let blocked = isup_iam("1999123");
     src.send_in(&m3ua_data_si(&blocked, SI_ISUP, OPC_UPSTREAM, DPC_HLR, 0))
         .await;
     assert!(
@@ -1546,6 +1553,615 @@ async fn wire_terminates_sri_sm_in_the_dialogue_engine() {
 
     peer.close();
     handle.shutdown();
+}
+
+// ── Scenario 8b: MAP dialogue origination over the wire (the node initiates) ──
+
+/// A node that owns HLR (SSN 6) locally AND routes DPC 2000 to an M3UA AS `hlr`.
+/// It originates an SRI-SM toward 2000 (out to the AS peer) and correlates the
+/// peer's response, which comes back addressed to us route-on-SSN 6
+/// (→ Local → the dialogue engine).
+const ORIGINATION_NODE: &str = r#"
+node: { point_code: 1000, variant: ITU, network_indicator: international }
+associations:
+  - { id: hlr, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+application_servers:
+  - { name: hlr, traffic_mode: override, routing_context: 100, asps: [hlr] }
+mtp3_routes:
+  - { dpc: 2000, as: hlr, priority: 1 }
+sccp:
+  local_ssns: [6]
+"#;
+
+/// An originating handler (the test-side mirror of the addon's private
+/// `OriginationHandler`): `on_start` stages the SRI-SM invoke that opens the
+/// dialogue; `on_continue` hands the peer's response back over a oneshot so the
+/// test can assert the correlation fired.
+struct WireOriginator {
+    op: i64,
+    arg: Vec<u8>,
+    responder: std::sync::Mutex<Option<oneshot::Sender<PeerTurn>>>,
+}
+impl TerminationHandler for WireOriginator {
+    fn on_start(&self, dlg: &mut Dialogue) {
+        dlg.invoke(self.op, Some(self.arg.clone()));
+        dlg.send();
+    }
+    fn on_continue(&self, _dlg: &mut Dialogue, peer: &PeerTurn) {
+        if let Some(tx) = self.responder.lock().unwrap().take() {
+            let _ = tx.send(peer.clone());
+        }
+    }
+}
+
+/// The 4-octet TCAP OTID the node allocated for an originated Begin, recovered
+/// from the M3UA DATA frame it emitted (so the peer can address its reply DTID).
+fn otid_of_begin(payload: &[u8]) -> Option<Vec<u8>> {
+    let msg = M3uaMessage::decode(payload).ok()?;
+    let pd = msg.protocol_data().ok()?;
+    let udt = match SccpMessage::decode(&pd.user_data).ok()? {
+        SccpMessage::Udt(u) => u,
+        _ => return None,
+    };
+    match tcap::decode(&udt.data).ok()? {
+        TcapMessage::Begin(b) => Some(b.otid.to_vec()),
+        _ => None,
+    }
+}
+
+/// A peer HLR's backward `End` carrying a ReturnResultLast(SRI-SM result)
+/// answering invoke id 1, addressed dtid = the node's OTID, over SCCP
+/// route-on-SSN 6 back to the node (→ Local termination in the engine).
+fn sri_sm_reply_end(node_otid: &[u8]) -> Vec<u8> {
+    let res = RoutingInfoForSmRes {
+        imsi: imsi_bytes(HLR_IMSI).into(),
+        location_info_with_lmsi: LocationInfoWithLmsi {
+            network_node_number: isdn(SERVING_MSC).into(),
+            lmsi: None,
+            gprs_node_indicator: None,
+            additional_number: None,
+        },
+    };
+    let end = End {
+        dtid: node_otid.to_vec().into(),
+        dialogue_portion: None,
+        components: Some(vec![Component::ReturnResultLast(ReturnResult {
+            invoke_id: 1,
+            result: Some(ReturnResultValue {
+                operation_code: OperationCode::Local(
+                    gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+                ),
+                parameter: Some(Any::new(
+                    rasn::ber::encode(&res).expect("encode sri-sm res"),
+                )),
+            }),
+        })]),
+    };
+    let tcap = tcap::encode(&TcapMessage::End(end)).expect("encode end");
+    sccp_udt_to_ssn(SubsystemNumber::Hlr, &tcap)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_originates_sri_sm_and_correlates_the_response() {
+    let Some(mut handle) = start_node(ORIGINATION_NODE, "wire_originate").await else {
+        return;
+    };
+
+    // One engine drives BOTH the outbound Begin (serve_originations) and the
+    // inbound response correlation (serve_dialogues); they must share it, or the
+    // response would never find the originated dialogue.
+    let engine = Arc::new(DialogueEngine::new(Tcap::default()));
+    handle.serve_dialogues(engine.clone());
+    handle.serve_originations(engine.clone());
+
+    // A peer stands in for the HLR: it connects to the node's `hlr` AS
+    // association, so the node's originated Begin (dpc 2000 → AS hlr) reaches it.
+    let hlr = handle.bound_addr("hlr").expect("hlr bound");
+    let Some(mut peer) = AspPeer::connect(hlr, 100).await else {
+        eprintln!("SKIP wire_originate: hlr connect failed");
+        return;
+    };
+    assert!(
+        wait_route(
+            handle.router(),
+            DPC_HLR,
+            &Destination::ApplicationServer("hlr".into())
+        )
+        .await,
+        "AS hlr never came up"
+    );
+
+    // Originate: push an SRI-SM origination onto the transport's outbound seam.
+    let (done_tx, done_rx) = oneshot::channel();
+    let handler = Arc::new(WireOriginator {
+        op: gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        arg: sri_sm_arg("15559999"),
+        responder: std::sync::Mutex::new(Some(done_tx)),
+    });
+    let gt = |digits: &str| GlobalTitle::Gt0100 {
+        translation_type: 0,
+        numbering_plan: 1,
+        encoding_scheme: 1,
+        nature_of_address: 4,
+        digits: digits.to_string(),
+    };
+    let req = OutgoingBegin {
+        application_context: AC_SRI_SM.to_vec(),
+        called: SccpAddress::with_gt(gt("15559999"), Some(SubsystemNumber::Hlr)),
+        calling: SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Msc)),
+        opc: NODE_PC,
+        dpc: DPC_HLR,
+        ni: NetworkIndicator::International.bits(),
+        sls: 0,
+        ingress_assoc: String::new(),
+    };
+    handle
+        .origin_sender()
+        .send(Origination { req, handler })
+        .expect("origination channel accepts the request");
+
+    // The peer receives the node's originated Begin.
+    let begin_frame = peer
+        .recv_out()
+        .await
+        .expect("the node originated a Begin to the HLR peer");
+    let (dpc, si, op) = decode_m3ua(&begin_frame);
+    assert_eq!(dpc, DPC_HLR, "originated Begin addressed to the HLR DPC");
+    assert_eq!(si, SI_SCCP);
+    assert_eq!(
+        op,
+        Some(gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM),
+        "the originated Begin carries the SRI-SM invoke"
+    );
+    let node_otid = otid_of_begin(&begin_frame).expect("originated Begin has an OTID");
+
+    // The peer answers: an End(SRI-SM result) addressed to the node's OTID, back
+    // over SCCP route-on-SSN 6 (→ Local → the engine correlates it). The reply's
+    // OPC is the peer's PC (not ours), so the own-OPC loop guard passes it.
+    let reply = sri_sm_reply_end(&node_otid);
+    let reply_frame = m3ua_sccp(&reply, DPC_HLR, NODE_PC, 0);
+    peer.send_in(&reply_frame).await;
+
+    // The origination handler observed the correlated response.
+    let peer_turn = timeout(Duration::from_secs(5), done_rx)
+        .await
+        .expect("the originated dialogue got a response in time")
+        .expect("the response was delivered to the origination handler");
+    let (op, imsi, node) = peer_turn
+        .components
+        .iter()
+        .find_map(|c| match c {
+            PeerComponent::Result {
+                operation_code,
+                parameter,
+                ..
+            } => {
+                let res: RoutingInfoForSmRes =
+                    rasn::ber::decode(parameter.as_ref()?.as_slice()).ok()?;
+                Some((
+                    *operation_code,
+                    res.imsi.to_vec(),
+                    res.location_info_with_lmsi.network_node_number.to_vec(),
+                ))
+            }
+            _ => None,
+        })
+        .expect("the peer turn carries an SRI-SM ReturnResult");
+    assert_eq!(op, Some(gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM));
+    assert_eq!(imsi, imsi_bytes(HLR_IMSI), "the HLR IMSI came back");
+    assert_eq!(node, isdn(SERVING_MSC), "the serving MSC number came back");
+    assert_eq!(engine.open_dialogues(), 0, "the originated dialogue closed");
+
+    // Wireshark gate: both the node's originated Begin and the HLR's reply End
+    // must dissect clean through the MAP dissector (no BER / malformed / expert
+    // errors), proving the origination path emits genuinely valid TCAP + MAP, not
+    // merely non-erroring framing. Set `SIGTRAN_PCAP_OUT=<path>` to keep the
+    // capture for manual review (frame 1 = originated Begin, frame 2 = HLR reply).
+    if tshark_available() {
+        let frames = [
+            eth_ipv4_sctp(&sctp_packet(&begin_frame, PPID_M3UA, 1, 1)),
+            eth_ipv4_sctp(&sctp_packet(&reply_frame, PPID_M3UA, 1, 2)),
+        ];
+        let keep = std::env::var("SIGTRAN_PCAP_OUT").ok();
+        let path = keep
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("sigtran_originate_{}.pcap", std::process::id()))
+            });
+        write_pcap(&path, &frames).expect("write pcap");
+
+        let out = Command::new("tshark")
+            .args(["-r", path.to_str().unwrap(), "-V"])
+            .output()
+            .expect("run tshark -V");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let bad: Vec<String> = text
+            .lines()
+            .filter(|l| {
+                let ll = l.to_ascii_lowercase();
+                ll.contains("ber error")
+                    || ll.contains("malformed")
+                    || (ll.contains("expert info") && (ll.contains("error") || ll.contains("warn")))
+                    || ll.contains("beyond the end")
+                    || ll.contains("dissector bug")
+            })
+            .map(|l| l.trim().to_string())
+            .collect();
+
+        let proto = Command::new("tshark")
+            .args([
+                "-r",
+                path.to_str().unwrap(),
+                "-T",
+                "fields",
+                "-e",
+                "frame.protocols",
+            ])
+            .output()
+            .expect("run tshark -T fields");
+        let proto_text = String::from_utf8_lossy(&proto.stdout);
+        let map_frames = proto_text.lines().filter(|l| l.contains("gsm_map")).count();
+
+        if let Some(kept) = &keep {
+            eprintln!(
+                "wire_originate: kept capture at {kept} (2 frames: originated Begin + HLR reply)"
+            );
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+
+        assert!(
+            bad.is_empty(),
+            "tshark flagged the originated round-trip:\n{}",
+            bad.join("\n")
+        );
+        // The originated Begin dissects down to the MAP layer (the SRI-SM invoke),
+        // proving the origination framing is valid application-layer traffic on the
+        // wire, not merely non-erroring at SCTP. (The reply's returnResult reaches
+        // gsm_map only when tshark correlates the TCAP transaction, so the floor is
+        // one; the `bad` filter above already scanned both frames for encoding
+        // errors.)
+        assert!(
+            map_frames >= 1,
+            "the originated Begin did not dissect through gsm_map (got {map_frames})"
+        );
+    } else {
+        eprintln!(
+            "SKIP wire_originate dissection: tshark not installed (origination path still proven)"
+        );
+    }
+
+    peer.close();
+    handle.shutdown();
+}
+
+// ── Scenario 8c: full-flow sample captures (a concatenated SMS + a CAMEL ──────
+//     session). Assembled with the crate's own SS7 codecs — the same encoders a
+//     live node emits — so each dissects clean in Wireshark and shows the whole
+//     TCAP dialogue: Begin → Continue → Continue → End.
+
+/// shortMsgMT-RelayContext v3 (MT-ForwardSM). Binds Wireshark's MAP dissector.
+const AC_MT_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 25, 3];
+
+/// An `Invoke` component with an explicit id / operation / optional argument.
+fn invoke_comp(id: i64, op: i64, arg: Option<Vec<u8>>) -> Component {
+    Component::Invoke(Invoke {
+        invoke_id: id,
+        linked_id: None,
+        operation_code: OperationCode::Local(op),
+        parameter: arg.map(Any::new),
+    })
+}
+
+/// A `ReturnResultLast` component answering `id` for `op` (optional parameter).
+fn result_comp(id: i64, op: i64, param: Option<Vec<u8>>) -> Component {
+    Component::ReturnResultLast(ReturnResult {
+        invoke_id: id,
+        result: Some(ReturnResultValue {
+            operation_code: OperationCode::Local(op),
+            parameter: param.map(Any::new),
+        }),
+    })
+}
+
+/// An AARE dialogue portion accepting the application context `ac`.
+fn aare(ac: &[u32]) -> DialoguePortion {
+    DialoguePortion::aare_accept(Oid::new(ac).expect("valid application-context OID"))
+}
+
+/// A TCAP `Begin` with an explicit OTID, dialogue portion, and components.
+fn tcap_begin_tid(otid: &[u8], dp: Option<DialoguePortion>, comps: Vec<Component>) -> Vec<u8> {
+    tcap::encode(&TcapMessage::Begin(Begin {
+        otid: otid.to_vec().into(),
+        dialogue_portion: dp,
+        components: Some(comps),
+    }))
+    .expect("encode begin")
+}
+
+/// A TCAP `Continue` (otid = ours, dtid = the peer's) holding the dialogue open.
+fn tcap_cont(
+    otid: &[u8],
+    dtid: &[u8],
+    dp: Option<DialoguePortion>,
+    comps: Vec<Component>,
+) -> Vec<u8> {
+    tcap::encode(&TcapMessage::Continue(TcapContinue {
+        otid: otid.to_vec().into(),
+        dtid: dtid.to_vec().into(),
+        dialogue_portion: dp,
+        components: Some(comps),
+    }))
+    .expect("encode continue")
+}
+
+/// A TCAP `End` (dtid = the peer's) closing the dialogue.
+fn tcap_end_comps(dtid: &[u8], dp: Option<DialoguePortion>, comps: Vec<Component>) -> Vec<u8> {
+    tcap::encode(&TcapMessage::End(End {
+        dtid: dtid.to_vec().into(),
+        dialogue_portion: dp,
+        components: Some(comps),
+    }))
+    .expect("encode end")
+}
+
+/// A bare TCAP `End` (dtid = the peer's) closing the dialogue with no components.
+fn tcap_end_bare(dtid: &[u8], dp: Option<DialoguePortion>) -> Vec<u8> {
+    tcap::encode(&TcapMessage::End(End {
+        dtid: dtid.to_vec().into(),
+        dialogue_portion: dp,
+        components: None,
+    }))
+    .expect("encode end")
+}
+
+/// A GSM 03.40 SMS-DELIVER TPDU carrying one segment of a 2-part concatenated
+/// SMS: 8-bit data with a User-Data-Header (concat IE, reference 0x42, 2 parts,
+/// this `part`) then a text payload — a realistic multipart body in `sm-RP-UI`.
+fn sms_deliver_udh(part: u8) -> Vec<u8> {
+    let payload: &[u8] = if part == 1 {
+        b"Concatenated SMS, segment one. "
+    } else {
+        b"Segment two, and the end."
+    };
+    let udh = [0x05u8, 0x00, 0x03, 0x42, 0x02, part]; // UDHL=5; concat IE ref 0x42, 2 parts, #part
+    let mut tpdu = vec![
+        0x40, // TP-MTI = SMS-DELIVER, TP-UDHI = 1 (a User-Data-Header is present)
+        0x08, 0x91, 0x51, 0x55, 0x10, 0x10, // TP-OA: +15550101 (international)
+        0x00, // TP-PID
+        0x04, // TP-DCS: 8-bit data
+        0x22, 0x70, 0x21, 0x41, 0x30, 0x00, 0x00, // TP-SCTS (synthetic timestamp)
+    ];
+    tpdu.push((udh.len() + payload.len()) as u8); // TP-UDL
+    tpdu.extend_from_slice(&udh);
+    tpdu.extend_from_slice(payload);
+    tpdu
+}
+
+/// An MT-ForwardSM argument for one concat segment; `more` sets
+/// `moreMessagesToSend` (present on every segment but the last).
+fn mt_fwd_arg(part: u8, more: bool) -> Vec<u8> {
+    let arg = MtForwardSmArg {
+        sm_rp_da: SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
+        sm_rp_oa: SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
+        sm_rp_ui: sms_deliver_udh(part).into(),
+        more_messages_to_send: more.then_some(()),
+    };
+    rasn::ber::encode(&arg).expect("encode mt-forwardSM")
+}
+
+/// Write M3UA `frames` to a pcap, dissect them clean in tshark (no BER /
+/// malformed / expert error, and the chain reaches `want_proto`), and — when
+/// `SIGTRAN_PCAP_DIR` names a directory — keep it there as `<name>.pcap` for
+/// manual review.
+fn write_and_dissect(name: &str, frames: &[Vec<u8>], want_proto: &str) {
+    let eth: Vec<Vec<u8>> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| eth_ipv4_sctp(&sctp_packet(f, PPID_M3UA, 1, i as u32 + 1)))
+        .collect();
+    let keep = std::env::var("SIGTRAN_PCAP_DIR").ok();
+    let path = match &keep {
+        Some(dir) => std::path::PathBuf::from(dir).join(format!("{name}.pcap")),
+        None => std::env::temp_dir().join(format!("sigtran_{name}_{}.pcap", std::process::id())),
+    };
+    write_pcap(&path, &eth).expect("write pcap");
+
+    let out = Command::new("tshark")
+        .args(["-r", path.to_str().unwrap(), "-V"])
+        .output()
+        .expect("run tshark -V");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let bad: Vec<String> = text
+        .lines()
+        .filter(|l| {
+            let ll = l.to_ascii_lowercase();
+            ll.contains("ber error")
+                || ll.contains("malformed")
+                || (ll.contains("expert info") && (ll.contains("error") || ll.contains("warn")))
+                || ll.contains("beyond the end")
+                || ll.contains("dissector bug")
+        })
+        .map(|l| l.trim().to_string())
+        .collect();
+
+    let proto = Command::new("tshark")
+        .args([
+            "-r",
+            path.to_str().unwrap(),
+            "-T",
+            "fields",
+            "-e",
+            "frame.protocols",
+        ])
+        .output()
+        .expect("run tshark -T fields");
+    let proto_text = String::from_utf8_lossy(&proto.stdout);
+
+    if let Some(dir) = &keep {
+        eprintln!(
+            "wire_samples: kept {}/{name}.pcap ({} frame(s))",
+            dir,
+            frames.len()
+        );
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+
+    assert!(bad.is_empty(), "tshark flagged {name}:\n{}", bad.join("\n"));
+    assert!(
+        proto_text.lines().any(|l| l.contains(want_proto)),
+        "{name} did not dissect through {want_proto}: {}",
+        proto_text.trim()
+    );
+}
+
+#[test]
+fn wire_full_dialogue_captures_encode_clean() {
+    if !tshark_available() {
+        eprintln!("SKIP wire_full_dialogue_captures: tshark not installed");
+        return;
+    }
+
+    // A concatenated SMS: SMSC (1000) delivers a 2-segment MT message to the VMSC
+    // (2000) in ONE TCAP dialogue — Begin(part 1, moreMessagesToSend) →
+    // Continue(ack) → Continue(part 2) → End(ack), closing the dialogue.
+    let smsc = [0xAAu8; 4];
+    let vmsc = [0xBBu8; 4];
+    let op = gsm_map::types::op_codes::MT_FORWARD_SM;
+    let sms = [
+        m3ua_sccp(
+            &sccp_udt(
+                SubsystemNumber::Msc,
+                &tcap_begin_tid(
+                    &smsc,
+                    Some(aarq(&AC_MT_RELAY)),
+                    vec![invoke_comp(1, op, Some(mt_fwd_arg(1, true)))],
+                ),
+            ),
+            1000,
+            2000,
+            0,
+        ),
+        m3ua_sccp(
+            &sccp_udt(
+                SubsystemNumber::Msc,
+                &tcap_cont(
+                    &vmsc,
+                    &smsc,
+                    Some(aare(&AC_MT_RELAY)),
+                    vec![result_comp(1, op, None)],
+                ),
+            ),
+            2000,
+            1000,
+            0,
+        ),
+        m3ua_sccp(
+            &sccp_udt(
+                SubsystemNumber::Msc,
+                &tcap_cont(
+                    &smsc,
+                    &vmsc,
+                    None,
+                    vec![invoke_comp(2, op, Some(mt_fwd_arg(2, false)))],
+                ),
+            ),
+            1000,
+            2000,
+            0,
+        ),
+        m3ua_sccp(
+            &sccp_udt(
+                SubsystemNumber::Msc,
+                &tcap_end_comps(&smsc, None, vec![result_comp(2, op, None)]),
+            ),
+            2000,
+            1000,
+            0,
+        ),
+    ];
+    write_and_dissect("concat_sms", &sms, "gsm_sms");
+
+    // A CAMEL session: the gsmSSF (4000) triggers a call at the SCP (1000) —
+    // Begin(initialDP) → Continue(requestReportBCSMEvent + continue) →
+    // Continue(eventReportBCSM: oDisconnect) → End(releaseCall), closing it.
+    let ssf = [0xCCu8; 4];
+    let scf = [0xDDu8; 4];
+    let rrbe = gsm_cap::encode(&RequestReportBcsmEventArg {
+        bcsm_events: vec![BcsmEvent {
+            event_type_bcsm: EventTypeBcsm::ODisconnect,
+            monitor_mode: MonitorMode::NotifyAndContinue,
+            leg_id: None,
+        }],
+    })
+    .expect("encode rrbe");
+    let erb = gsm_cap::encode(&EventReportBcsmArg {
+        event_type_bcsm: EventTypeBcsm::ODisconnect,
+        leg_id: None,
+        misc_call_info: None,
+    })
+    .expect("encode erb");
+    let scp = SubsystemNumber::from_u8(146);
+    let camel = [
+        m3ua_sccp(
+            &sccp_udt(
+                scp,
+                &tcap_begin_tid(
+                    &ssf,
+                    Some(aarq(&AC_CAP)),
+                    vec![invoke_comp(
+                        1,
+                        gsm_cap::op_codes::INITIAL_DP,
+                        Some(initial_dp_arg("001010000000042")),
+                    )],
+                ),
+            ),
+            4000,
+            1000,
+            0,
+        ),
+        m3ua_sccp(
+            &sccp_udt(
+                scp,
+                &tcap_cont(
+                    &scf,
+                    &ssf,
+                    Some(aare(&AC_CAP)),
+                    vec![
+                        invoke_comp(2, gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT, Some(rrbe)),
+                        invoke_comp(3, gsm_cap::op_codes::CONTINUE, None),
+                    ],
+                ),
+            ),
+            1000,
+            4000,
+            0,
+        ),
+        m3ua_sccp(
+            &sccp_udt(
+                scp,
+                &tcap_cont(
+                    &ssf,
+                    &scf,
+                    None,
+                    vec![invoke_comp(
+                        4,
+                        gsm_cap::op_codes::EVENT_REPORT_BCSM,
+                        Some(erb),
+                    )],
+                ),
+            ),
+            4000,
+            1000,
+            0,
+        ),
+        // The call has cleared (the SSF reported oDisconnect), so the SCP closes
+        // the CAMEL dialogue with a bare TC-END.
+        m3ua_sccp(&sccp_udt(scp, &tcap_end_bare(&ssf, None)), 1000, 4000, 0),
+    ];
+    write_and_dissect("camel_session", &camel, "camel");
 }
 
 // ── Scenario 9: SUA CLDT routed via GTT to an egress SUA AS ───────────────────

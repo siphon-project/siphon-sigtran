@@ -6,10 +6,13 @@
 use async_sctp::SctpAssociation;
 use m3ua::{M3uaMessage, MessageType};
 use mtp3::{Mtp3Event, PointCode};
-use sccp::{ExtendedUnitDataService, GlobalTitle, LongUnitDataService, ReturnCause, SccpMessage};
+use sccp::{
+    ExtendedUnitDataService, GlobalTitle, LongUnitDataService, ReturnCause, SccpMessage,
+    UnitDataService,
+};
 
 use super::framing::{self, Msu};
-use super::{LocalDelivery, TaskCtx};
+use super::{LocalDelivery, Registry, TaskCtx};
 use crate::config::Adaptation;
 use crate::isup::{IsupScreen, Screened};
 use crate::metrics::{self, LoopKind};
@@ -98,6 +101,38 @@ fn selector_from_gt(gt: &GlobalTitle) -> GttSelector {
     }
 }
 
+/// Stamp new called-party GT digits on a connectionless SCCP message (UDT / XUDT
+/// / LUDT), preserving the GT indicator / TT / NP / NAI and the SSN, for a content
+/// rule's `rewrite_cdpa_gt`. Returns the re-encoded payload, or `None` if the
+/// message is not a rewritable type or fails to re-encode.
+fn rewrite_called_gt(payload: &[u8], digits: &str) -> Option<Vec<u8>> {
+    let mut msg = SccpMessage::decode(payload).ok()?;
+    let rewritten = match &mut msg {
+        SccpMessage::Udt(m) => set_gt_digits(&mut m.called_party.global_title, digits),
+        SccpMessage::Xudt(m) => set_gt_digits(&mut m.called_party.global_title, digits),
+        SccpMessage::Ludt(m) => set_gt_digits(&mut m.called_party.global_title, digits),
+        _ => false,
+    };
+    if !rewritten {
+        return None;
+    }
+    msg.encode().ok()
+}
+
+/// Replace a Global Title's digits in place, keeping every other field. Returns
+/// `false` for a `NoTitle` address (nothing to rewrite).
+fn set_gt_digits(gt: &mut GlobalTitle, new: &str) -> bool {
+    let slot = match gt {
+        GlobalTitle::Gt0001 { digits, .. } => digits,
+        GlobalTitle::Gt0010 { digits, .. } => digits,
+        GlobalTitle::Gt0011 { digits, .. } => digits,
+        GlobalTitle::Gt0100 { digits, .. } => digits,
+        GlobalTitle::NoTitle => return false,
+    };
+    *slot = new.to_string();
+    true
+}
+
 /// Route one inbound MSU and act on the decision. `inbound_assoc` is the id of
 /// the association the MSU arrived on; it feeds the route-reflect loop guard.
 pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
@@ -120,7 +155,14 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
     // The AS / linkset the MSU arrived over, for the route-reflect guard.
     let inbound_src = ctx.registry.inbound_destination(inbound_assoc);
 
-    let inbound = inbound_from_msu(&msu);
+    let mut inbound = inbound_from_msu(&msu);
+    // Content routing needs the decoded application layer. Decode it only when the
+    // tenant actually has content rules, so a pure-transit node pays nothing.
+    if msu.si == framing::SI_SCCP && ctx.router.tenant_has_content_rules(&ctx.tenant) {
+        if let Ok(sccp) = SccpMessage::decode(&msu.payload) {
+            inbound.view = crate::content::decode_map_view(&sccp);
+        }
+    }
     match ctx.router.route_in(&ctx.tenant, &inbound) {
         RouteDecision::Route { via } => {
             // ISUP screening on the SI=5 transit path (opt-in per tenant). Only an
@@ -138,11 +180,12 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
                 loop_reflect(&via, &msu, inbound_assoc);
                 return;
             }
-            send_via(&via, &msu, ctx).await
+            send_via(&via, &msu, &ctx.registry).await
         }
         RouteDecision::RouteTo {
             dpc,
             via: Some(via),
+            rewrite_cdpa_gt,
             ..
         } => {
             if is_reflection(inbound_src.as_ref(), &via) {
@@ -152,9 +195,7 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
             // A GTT / content result to a concrete DPC is an SCCP relay point, so
             // apply the SCCP hop counter (the standard GTT loop breaker) before
             // relaying. It decrements XUDT/LUDT and drops + returns a violation at
-            // zero. (SCCP CdPA GT / SSN rewrite from a content rule is not applied
-            // on the wire yet, that rides the dialogue-SAP work; the DPC-level
-            // relay is honoured here.)
+            // zero.
             let payload = match hop_counter_guard(&msu, ctx, inbound_src.as_ref()).await {
                 HopGuard::Forward(payload) => payload,
                 HopGuard::Exhausted => return,
@@ -162,10 +203,22 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
             let mut out = msu.clone();
             out.dpc = dpc;
             out.payload = payload;
-            send_via(&via, &out, ctx).await;
+            // A content rule's `rewrite_cdpa_gt` stamps new called-party GT digits
+            // on the egress SCCP before relay; a re-encode failure forwards the
+            // message unchanged rather than dropping a good one.
+            if let Some(gt) = &rewrite_cdpa_gt {
+                match rewrite_called_gt(&out.payload, gt) {
+                    Some(rewritten) => out.payload = rewritten,
+                    None => eprintln!(
+                        "siphon-sigtran: rewrite_cdpa_gt re-encode failed, forwarding unchanged"
+                    ),
+                }
+            }
+            send_via(&via, &out, &ctx.registry).await;
         }
         RouteDecision::RouteTo { dpc, via: None, .. } => {
-            eprintln!("siphon-sigtran: no MTP3 route to translated DPC {dpc}, dropping");
+            eprintln!("siphon-sigtran: no MTP3 route to translated DPC {dpc}, returning on error");
+            return_undeliverable(&msu, ReturnCause::MtpFailure, ctx, inbound_src.as_ref()).await;
         }
         RouteDecision::Local => {
             // Local termination: hand the MSU (and the association it arrived on,
@@ -181,14 +234,20 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
         }
         RouteDecision::CrossTenant { tenant, .. } => {
             eprintln!(
-                "siphon-sigtran: cross-tenant hand-off to `{tenant}` not wired on the transport yet"
+                "siphon-sigtran: cross-tenant hand-off to `{tenant}` not wired on the transport \
+                 yet, returning on error"
             );
-        }
-        RouteDecision::Python { hook } => {
-            eprintln!("siphon-sigtran: content rule deferred to python hook `{hook}` (phase-3)");
+            return_undeliverable(&msu, ReturnCause::SccpFailure, ctx, inbound_src.as_ref()).await;
         }
         RouteDecision::Drop { reason } => {
             eprintln!("siphon-sigtran: dropping MSU to {}: {reason}", msu.dpc);
+            return_undeliverable(
+                &msu,
+                ReturnCause::NoTranslationForAddress,
+                ctx,
+                inbound_src.as_ref(),
+            )
+            .await;
         }
     }
 }
@@ -315,8 +374,9 @@ async fn hop_counter_guard(
         msu.opc, msu.dpc
     );
     if let Some(src) = inbound_src {
-        if let Some(ret) = hop_violation_return(msu, &sccp, ctx) {
-            send_via(src, &ret, ctx).await;
+        let our_pc = ctx.router.node_point_code(&ctx.tenant);
+        if let Some(ret) = sccp_return(msu, &sccp, ReturnCause::HopCounterViolation, our_pc) {
+            send_via(src, &ret, &ctx.registry).await;
         }
     }
     HopGuard::Exhausted
@@ -333,15 +393,23 @@ fn set_hop_counter(msg: &mut SccpMessage, hop: u8) {
     }
 }
 
-/// Build the XUDTS / LUDTS "hop counter violation" return for an exhausted
-/// message, addressed back to the originator (called / calling swapped). Returns
-/// `None` when the message did not ask to be returned on error, or is itself a
-/// service message (a return is never returned).
-fn hop_violation_return(inbound: &Msu, sccp: &SccpMessage, ctx: &TaskCtx) -> Option<Msu> {
+/// Build an SCCP return (UDTS / XUDTS / LUDTS) for a connectionless message that
+/// could not be delivered, addressed back to the originator (called / calling
+/// swapped) and carrying `cause`. `our_pc` is the node's point code in the tenant
+/// (the return's OPC). Returns `None` when the message did not ask to be returned
+/// on error, or is itself a service message (a return is never returned). This is
+/// the Q.714 "always answer an undeliverable SCCP message" seam.
+fn sccp_return(
+    inbound: &Msu,
+    sccp: &SccpMessage,
+    cause: ReturnCause,
+    our_pc: Option<u32>,
+) -> Option<Msu> {
     let return_on_error = match sccp {
+        SccpMessage::Udt(m) => m.message_handling == SCCP_RETURN_ON_ERROR,
         SccpMessage::Xudt(m) => m.message_handling == SCCP_RETURN_ON_ERROR,
         SccpMessage::Ludt(m) => m.message_handling == SCCP_RETURN_ON_ERROR,
-        _ => false,
+        SccpMessage::Udts(_) | SccpMessage::Xudts(_) | SccpMessage::Ludts(_) => false,
     };
     if !return_on_error {
         return None;
@@ -352,28 +420,18 @@ fn hop_violation_return(inbound: &Msu, sccp: &SccpMessage, ctx: &TaskCtx) -> Opt
     let from = sccp.called_party().clone();
     let data = sccp.data().to_vec();
     let payload = match sccp {
-        SccpMessage::Ludt(_) => SccpMessage::Ludts(LongUnitDataService::new(
-            ReturnCause::HopCounterViolation,
-            to,
-            from,
-            data,
-        )),
-        _ => SccpMessage::Xudts(ExtendedUnitDataService::new(
-            ReturnCause::HopCounterViolation,
-            to,
-            from,
-            data,
-        )),
+        SccpMessage::Ludt(_) => SccpMessage::Ludts(LongUnitDataService::new(cause, to, from, data)),
+        SccpMessage::Xudt(_) => {
+            SccpMessage::Xudts(ExtendedUnitDataService::new(cause, to, from, data))
+        }
+        _ => SccpMessage::Udts(UnitDataService::new(cause, to, from, data)),
     }
     .encode()
     .ok()?;
 
     // We originate the return: OPC is our own point code, DPC is whoever sent it
     // to us; SLS / NI / MP mirror the inbound so it follows the same path back.
-    let opc = ctx
-        .router
-        .node_point_code(&ctx.tenant)
-        .unwrap_or(inbound.dpc);
+    let opc = our_pc.unwrap_or(inbound.dpc);
     Some(Msu {
         opc,
         dpc: inbound.opc,
@@ -385,9 +443,36 @@ fn hop_violation_return(inbound: &Msu, sccp: &SccpMessage, ctx: &TaskCtx) -> Opt
     })
 }
 
-/// Forward an MSU on a resolved [`Destination`]'s egress association(s).
-async fn send_via(via: &Destination, msu: &Msu, ctx: &TaskCtx) {
-    let selected = ctx.registry.select(via, msu.sls);
+/// Answer an undeliverable inbound SCCP message with an SCCP return carrying
+/// `cause`, back over the association it arrived on, when the originator asked to
+/// be returned on error. A no-op for non-SCCP, an undecodable payload, or a
+/// message with no return option. Keeps the "always answer" invariant on the SCCP
+/// drop paths (no translation, no route, cross-tenant, deferred-to-Python).
+async fn return_undeliverable(
+    msu: &Msu,
+    cause: ReturnCause,
+    ctx: &TaskCtx,
+    inbound_src: Option<&Destination>,
+) {
+    if msu.si != framing::SI_SCCP {
+        return;
+    }
+    let Some(src) = inbound_src else { return };
+    let Ok(sccp) = SccpMessage::decode(&msu.payload) else {
+        return;
+    };
+    let our_pc = ctx.router.node_point_code(&ctx.tenant);
+    if let Some(ret) = sccp_return(msu, &sccp, cause, our_pc) {
+        send_via(src, &ret, &ctx.registry).await;
+    }
+}
+
+/// Forward an MSU on a resolved [`Destination`]'s egress association(s). Takes
+/// the [`Registry`] directly (not the whole [`TaskCtx`]) so the origination path
+/// — which routes an originated `Begin` by DPC without an inbound context — can
+/// reuse the same egress selection + framing as the transfer path.
+pub(crate) async fn send_via(via: &Destination, msu: &Msu, registry: &Registry) {
+    let selected = registry.select(via, msu.sls);
     if selected.is_empty() {
         eprintln!(
             "siphon-sigtran: no active egress for {via} (dpc {})",
@@ -523,5 +608,101 @@ pub async fn handle_ssnm(msg: &M3uaMessage, ctx: &TaskCtx, reply: &SctpAssociati
             eprintln!("siphon-sigtran: DUPU (destination user part unavailable) noted");
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sccp::{GlobalTitle, SccpAddress, SubsystemNumber, UnitData};
+
+    fn gt(digits: &str) -> GlobalTitle {
+        GlobalTitle::Gt0100 {
+            translation_type: 0,
+            numbering_plan: 1,
+            encoding_scheme: 1,
+            nature_of_address: 4,
+            digits: digits.to_string(),
+        }
+    }
+
+    fn udt_msu(message_handling: u8) -> Msu {
+        let mut udt = UnitData::new(
+            SccpAddress::with_gt(gt("15550100"), Some(SubsystemNumber::Hlr)),
+            SccpAddress::with_gt(gt("15550170"), Some(SubsystemNumber::Msc)),
+            vec![0x01, 0x02, 0x03],
+        );
+        udt.message_handling = message_handling;
+        Msu {
+            opc: 4000,
+            dpc: 1000,
+            si: framing::SI_SCCP,
+            ni: 0,
+            mp: 0,
+            sls: 5,
+            payload: SccpMessage::Udt(udt).encode().expect("encode udt"),
+        }
+    }
+
+    #[test]
+    fn undeliverable_return_on_error_udt_gets_a_udts_back() {
+        // A UDT that asked to be returned on error, undeliverable, gets a UDTS back
+        // to the originator: our OPC, their DPC, called/calling swapped, cause set.
+        let inbound = udt_msu(SCCP_RETURN_ON_ERROR);
+        let sccp = SccpMessage::decode(&inbound.payload).unwrap();
+
+        let ret = sccp_return(
+            &inbound,
+            &sccp,
+            ReturnCause::NoTranslationForAddress,
+            Some(1000),
+        )
+        .expect("a return is generated for a return-on-error message");
+        assert_eq!(ret.opc, 1000, "return OPC is our point code");
+        assert_eq!(ret.dpc, 4000, "return DPC is the originator");
+        assert_eq!(
+            ret.sls, 5,
+            "SLS mirrors the inbound so it follows the path back"
+        );
+
+        match SccpMessage::decode(&ret.payload).unwrap() {
+            SccpMessage::Udts(u) => {
+                assert_eq!(u.return_cause, ReturnCause::NoTranslationForAddress);
+                assert_eq!(u.called_party.global_title.digits(), Some("15550170")); // was calling
+                assert_eq!(u.calling_party.global_title.digits(), Some("15550100")); // was called
+                assert_eq!(u.data, vec![0x01, 0x02, 0x03]);
+            }
+            other => panic!("expected a UDTS return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_return_when_the_message_did_not_ask_for_one() {
+        let inbound = udt_msu(0); // no return-on-error option
+        let sccp = SccpMessage::decode(&inbound.payload).unwrap();
+        assert!(sccp_return(&inbound, &sccp, ReturnCause::MtpFailure, Some(1000)).is_none());
+    }
+
+    #[test]
+    fn rewrite_called_gt_restamps_digits_preserving_the_rest() {
+        // A content rule's rewrite_cdpa_gt restamps the called-party GT digits and
+        // leaves the SSN, the calling party, and the user data untouched.
+        let udt = UnitData::new(
+            SccpAddress::with_gt(gt("15550100"), Some(SubsystemNumber::Hlr)),
+            SccpAddress::with_gt(gt("15550170"), Some(SubsystemNumber::Msc)),
+            vec![0xAA, 0xBB],
+        );
+        let payload = SccpMessage::Udt(udt).encode().unwrap();
+
+        let rewritten = rewrite_called_gt(&payload, "15550199").expect("rewrite applies to a UDT");
+        match SccpMessage::decode(&rewritten).unwrap() {
+            SccpMessage::Udt(m) => {
+                assert_eq!(m.called_party.global_title.digits(), Some("15550199"));
+                assert_eq!(m.called_party.ssn.map(|s| s.value()), Some(6)); // HLR SSN kept
+                assert_eq!(m.calling_party.global_title.digits(), Some("15550170"));
+                assert_eq!(m.data, vec![0xAA, 0xBB]);
+            }
+            other => panic!("expected a UDT, got {other:?}"),
+        }
     }
 }

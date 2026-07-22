@@ -38,7 +38,7 @@ application_servers:
   - { name: hlr, traffic_mode: loadshare, routing_context: 100, asps: [hlr-a, hlr-b] }
 
 linksets:
-  - { name: transit, links: [{assoc: xit-1, slc: 0}] }
+  - { name: transit, links: [{assoc: xit-1}] }
 
 mtp3_routes:
   - { dpc: 2000, as: hlr,          priority: 1 }
@@ -53,92 +53,46 @@ sccp:
 content_routing:
   protocol: gsm-map
   address_tables:
-    - { name: home-subs, addrs: ["15550142", "15550143"] }
+    - { name: home-subs,        addrs: ["15550142", "15550143"] }
+    - { name: blocked-carriers, addrs: ["15550190"] }
   rules:
-    - name: fs11-cat3-sri-sm
-      match:  { operation: sri-sm }
-      action: { python: on_screen }
-    - name: np-dip
-      match:  { operation: sri-sm }
-      action: { python: on_np_dip }
+    - name: screen-blocked-sri-sm       # GSMA FS.11 category-3 style screen
+      match:  { operation: sri-sm, cgpa_gt_in: blocked-carriers }
+      action: { screen: true }
+    - name: home-sri-sm
+      match:  { operation: sri-sm, cgpa_gt_in: home-subs }
+      action: { route: {group: ag-router} }
 ```
 
 Note this STP owns no subsystems: no `local_ssns`, so nothing terminates. DPC
 2000 has a primary AS route and an M2PA alternate; if the AS drops, the
 resolver fails over to the transit linkset automatically.
 
-## Three ways to override
+## Program the Rust tables live
 
-Per-MSU routing always runs in Rust. Python overrides it three ways, in rising
-hot-path cost. Pick the cheapest that fits.
-
-### 1. Program the Rust tables live
-
-Runs once at script load, after the node is configured. Ideal for external
-feeds, portal edits, or learned routes; no per-MSU Python cost because the
-decision stays in the Rust tables.
+Per-MSU routing always runs in Rust. Beyond the static `sigtran.yaml`, a script
+programs the same Rust tables at load time, so the decision stays in Rust with no
+per-MSU Python cost. Ideal for external feeds, portal edits, learned routes, or
+seeding a cache.
 
 ```python
 from siphon import ss7
 
-ss7.routes.add(dpc=2000, linkset="transit", priority=3)   # an extra alternate path
+# An extra alternate path, a GTT prefix rule, and a content rule, all live.
+ss7.routes.add(dpc=2000, linkset="transit", priority=3)
 ss7.gtt.add(match={"gt_prefix": "155502"}, to={"dpc": 2006, "ssn": 6})
 ss7.content.address_table("home-subs").add("15550199")
 ss7.content.add_rule(
-    name="steer-partner-x",
+    name="steer-home-sri-sm",
     match={"operation": "sri-sm", "cgpa_gt_in": "home-subs"},
     action={"route": {"group": "ag-router"}},
 )
 ```
 
-### 2. Deferred rule hooks
-
-A content rule whose action is `{python: <name>}` hands the matching messages
-to a named hook. `msg` is the read-only decoded [`MapView`](../script-api.md#mapview):
-`.operation`, `.cgpa_gt`, `.cdpa_gt`, `.imsi`, `.msisdn`, `.opc`, `.dpc`. The
-hook returns a [decision](../script-api.md#decisions).
-
-```python
-_ported = {"15550142": 2006}          # a live NP database in production
-trusted_carriers = {"15551000", "15552000"}
-
-@ss7.content.on("on_np_dip")
-async def np_dip(msg):
-    pc = _ported.get(msg.msisdn)
-    if pc is not None:
-        ss7.routes.cache(msg.cdpa_gt, dpc=pc, ssn=6, ttl=3600)   # subsequent MSUs route in Rust
-        return ss7.route(dpc=pc, ssn=6)
-    return ss7.route_default()
-
-@ss7.content.on("on_screen")
-async def screen(msg):
-    if msg.cgpa_gt not in trusted_carriers:
-        return ss7.drop(reason="untrusted SRI-SM origin")   # GSMA FS.11 category-3 screen
-    return ss7.allow()
-```
-
-The number-portability hook writes its answer back with
-`ss7.routes.cache(...)`, so it dips the external database once per GT and every
-later message for that title routes in Rust.
-
-### 3. A selector-gated general override
-
-The broadest hook. The `when=` selector keeps it off the hot path for
-everything it does not match.
-
-```python
-@ss7.on_route(when="operation == 'sri-sm' and dpc == 2000")
-async def override(msg):
-    if maintenance_mode():
-        return ss7.route(linkset="transit")   # force this class via the alternate
-    return ss7.route_default()                # else let the Rust tables / config decide
-```
-
-!!! warning "Mind the selector"
-    Drop `when=` and this hook sees **every** routing decision, capping an
-    STP's throughput at the interpreter. On a transit node, keep the selector
-    tight, or push the decision into config or a live table instead. See
-    [the cost ladder](../concepts.md#the-cost-ladder).
+A content rule's action is `route` (to a `dpc`+`ssn` or a `group`),
+`rewrite_cdpa_gt`, or `screen`. Programming these live prepends them over the
+static config rules (first match wins), and every subsequent decision runs in
+Rust at line rate.
 
 ## What you get for free
 

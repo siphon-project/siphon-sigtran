@@ -166,11 +166,11 @@ pub const PPID_SUA: u32 = 4;
 ///
 /// Errors on any message outside the connectionless set (the connection-oriented
 /// CORE/CODT/… are not bridged this phase).
-pub fn extract_sua(payload: &[u8], node_pc: u32) -> Result<Msu, TransportError> {
+pub fn extract_sua(payload: &[u8], node_pc: u32, node_ni: u8) -> Result<Msu, TransportError> {
     let msg = SuaMessage::decode(payload)?;
     match msg.message_type {
-        SuaType::Cldt => cldt_to_msu(&msg, node_pc),
-        SuaType::Cldr => cldr_to_msu(&msg, node_pc),
+        SuaType::Cldt => cldt_to_msu(&msg, node_pc, node_ni),
+        SuaType::Cldr => cldr_to_msu(&msg, node_pc, node_ni),
         other => Err(TransportError::Framing(format!(
             "expected SUA CLDT/CLDR, got {other}"
         ))),
@@ -180,7 +180,7 @@ pub fn extract_sua(payload: &[u8], node_pc: u32) -> Result<Msu, TransportError> 
 /// Bridge a CLDT to an [`Msu`] carrying the equivalent SCCP UDT (or XUDT when the
 /// CLDT carries an SS7 hop counter, so the SCCP hop-counter guard applies on a
 /// GTT relay exactly as it would for a native XUDT).
-fn cldt_to_msu(msg: &SuaMessage, node_pc: u32) -> Result<Msu, TransportError> {
+fn cldt_to_msu(msg: &SuaMessage, node_pc: u32, node_ni: u8) -> Result<Msu, TransportError> {
     let dest = msg.destination_address()?;
     let src = msg.source_address()?;
     let data = msg.data().unwrap_or(&[]).to_vec();
@@ -205,7 +205,7 @@ fn cldt_to_msu(msg: &SuaMessage, node_pc: u32) -> Result<Msu, TransportError> {
         opc: src.point_code.unwrap_or(0),
         dpc: sua_dest_dpc(&dest, node_pc),
         si: SI_SCCP,
-        ni: NetworkIndicator::International.bits(),
+        ni: node_ni,
         mp: 0,
         sls: (msg.sequence_control().unwrap_or(0) & 0xFF) as u8,
         payload: sccp.encode()?,
@@ -215,7 +215,7 @@ fn cldt_to_msu(msg: &SuaMessage, node_pc: u32) -> Result<Msu, TransportError> {
 /// Bridge a CLDR (connectionless error response) to an [`Msu`] carrying the
 /// equivalent SCCP UDTS, mapping the SUA SCCP-Cause value onto the SCCP return
 /// cause.
-fn cldr_to_msu(msg: &SuaMessage, node_pc: u32) -> Result<Msu, TransportError> {
+fn cldr_to_msu(msg: &SuaMessage, node_pc: u32, node_ni: u8) -> Result<Msu, TransportError> {
     let dest = msg.destination_address()?;
     let src = msg.source_address()?;
     let data = msg.data().unwrap_or(&[]).to_vec();
@@ -227,7 +227,7 @@ fn cldr_to_msu(msg: &SuaMessage, node_pc: u32) -> Result<Msu, TransportError> {
         opc: src.point_code.unwrap_or(0),
         dpc: sua_dest_dpc(&dest, node_pc),
         si: SI_SCCP,
-        ni: NetworkIndicator::International.bits(),
+        ni: node_ni,
         mp: 0,
         sls: 0,
         payload: SccpMessage::Udts(udts).encode()?,
@@ -505,9 +505,11 @@ mod tests {
         let cldt =
             SuaMessage::cldt(100, 0, &source, &dest, 7, Some(15), vec![0x62, 0x40, 0x01]).unwrap();
 
-        // Inbound: CLDT (with SS7 hop counter) → MSU carrying an SCCP XUDT.
-        let msu = extract_sua(&cldt.encode(), NODE_PC).unwrap();
+        // Inbound: CLDT (with SS7 hop counter) → MSU carrying an SCCP XUDT. The
+        // node's configured network indicator (here national = 2) is stamped on it.
+        let msu = extract_sua(&cldt.encode(), NODE_PC, 2).unwrap();
         assert_eq!(msu.si, SI_SCCP);
+        assert_eq!(msu.ni, 2, "the configured network indicator is stamped");
         assert_eq!(
             msu.dpc, NODE_PC,
             "GT-routed CLDT stamped with node PC for GTT"
@@ -537,7 +539,7 @@ mod tests {
         let source = SuaAddress::with_gt(SuaGt::e164("15550100"), Some(8));
         let dest = SuaAddress::with_gt(SuaGt::e164("15559999"), Some(6));
         let cldt = SuaMessage::cldt(1, 0, &source, &dest, 0, None, vec![0xAA]).unwrap();
-        let msu = extract_sua(&cldt.encode(), NODE_PC).unwrap();
+        let msu = extract_sua(&cldt.encode(), NODE_PC, 0).unwrap();
         assert!(matches!(
             SccpMessage::decode(&msu.payload).unwrap(),
             SccpMessage::Udt(_)
@@ -550,7 +552,7 @@ mod tests {
         let source = SuaAddress::with_ssn_pc(8, 1000);
         let dest = SuaAddress::with_ssn_pc(6, 2000);
         let cldt = SuaMessage::cldt(1, 0, &source, &dest, 0, None, vec![0xAB, 0xCD]).unwrap();
-        let msu = extract_sua(&cldt.encode(), NODE_PC).unwrap();
+        let msu = extract_sua(&cldt.encode(), NODE_PC, 0).unwrap();
         assert_eq!(
             msu.dpc, 2000,
             "route-on-PC CLDT transits to the addressed DPC"
@@ -561,7 +563,7 @@ mod tests {
     #[test]
     fn extract_sua_rejects_non_connectionless() {
         let aspup = SuaMessage::asp_up(None, None).encode();
-        assert!(extract_sua(&aspup, NODE_PC).is_err());
+        assert!(extract_sua(&aspup, NODE_PC, 0).is_err());
     }
 
     /// SUA cannot carry a non-SCCP user part.

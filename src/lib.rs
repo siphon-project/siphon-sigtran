@@ -75,12 +75,11 @@
 //! - [`python`] (feature `python`): the siphon addon face, built and tested
 //!   against siphon-sip the way the sibling addons `siphon-smpp` and
 //!   `siphon-http` are. A composing siphon binary calls `python::register(py,
-//!   parent)` at startup to mount the `ss7` / `gsm_map` / `gsm_cap` namespaces
-//!   onto the `siphon` package module. Scripts then program the Rust routing
-//!   tables live (`ss7.routes` / `ss7.gtt` / `ss7.content`), defer a rule to a
-//!   hook (`@ss7.content.on` / `@ss7.on_route`), and terminate MAP/CAP dialogues
-//!   (`@gsm_map.on_*` / `@gsm_cap.on_*`). There is no wheel and no PyPI package;
-//!   the default crate build pulls neither pyo3 nor siphon.
+//!   parent)` at startup to mount the `ss7` / `gsm_map` / `gsm_cap` / `inap`
+//!   namespaces onto the `siphon` package module. Scripts then program the Rust
+//!   routing tables live (`ss7.routes` / `ss7.gtt` / `ss7.content`) and terminate
+//!   MAP/CAP/INAP dialogues (`@ns.on_operation("<name>")`). There is no wheel and
+//!   no PyPI package; the default crate build pulls neither pyo3 nor siphon.
 //!
 //! ## Quickstart
 //!

@@ -74,17 +74,21 @@ An STP relays those for free.
 
 ## Loop guards
 
-An STP that loops is a signalling storm, so transit carries two runtime guards.
-Each drops the offending MSU and counts it in
+An STP that loops is a signalling storm, so transit carries runtime guards. Each
+drops the offending MSU and counts it in
 `sigtran_loops_detected_total{kind=...}`:
 
 - **own-opc**: the originating point code of a transit MSU equals the node's
   own point code, so a message the node originated has come back. Dropped.
 - **route-reflect**: the only available route would send the MSU back out the
   linkset it arrived on. Dropped rather than reflected.
+- **hop-counter**: an SCCP XUDT/LUDT carries a Q.713 hop counter, decremented at
+  each GTT relay; at zero the message is a translation loop, dropped and returned
+  as an XUDTS/LUDTS "hop counter violation" when it asked to be returned on error.
 
-These catch route-config loops that no upper-layer mechanism sees (call-control
-SIs have no application-level hop counter). Because they run on the transit
+The first two catch route-config loops that no upper-layer mechanism sees
+(call-control SIs have no application-level hop counter); the hop counter is the
+SCCP-layer complement on the GTT relay path. Because they run on the transit
 path, they cost nothing on the normal case and show up on a graph when a route
 table is wrong.
 
@@ -96,22 +100,31 @@ config load error.
 
 | Operation | Match name | Terminate with |
 |---|---|---|
-| SendRoutingInfoForSM | `sri-sm` | `@gsm_map.on_send_routing_info_for_sm` |
-| MO-ForwardSM | `mo-forward-sm` | `@gsm_map.on_mo_forward_sm` |
-| MT-ForwardSM | `mt-forward-sm` | `@gsm_map.on_mt_forward_sm` |
-| updateLocation | `update-location` | `@gsm_map.on_update_location` |
-| cancelLocation | `cancel-location` | *(match / route only)* |
-| sendAuthenticationInfo | `send-auth-info` | *(match / route only)* |
+| SendRoutingInfoForSM | `sri-sm` | `@gsm_map.on_operation("sri-sm")` |
+| MO-ForwardSM | `mo-forward-sm` | `@gsm_map.on_operation("mo-forward-sm")` |
+| MT-ForwardSM | `mt-forward-sm` | `@gsm_map.on_operation("mt-forward-sm")` |
+| updateLocation | `update-location` | `@gsm_map.on_operation("update-location")` |
+| cancelLocation | `cancel-location` | `@gsm_map.on_operation("cancel-location")` |
+| sendAuthenticationInfo | `send-auth-info` | `@gsm_map.on_operation("send-auth-info")` |
 | insertSubscriberData | `insert-subscriber-data` | *(staged as an invoke leg)* |
-| provideSubscriberInfo | `provide-subscriber-info` | *(match / route only)* |
-| initialDP (CAMEL) | `initial-dp` | `@gsm_cap.on_initial_dp` |
+| provideSubscriberInfo | `provide-subscriber-info` | `@gsm_map.on_operation("provide-subscriber-info")` |
+| initialDP (CAMEL/INAP) | `initial-dp` | `@gsm_cap.on_operation("initial-dp")` / `@inap.on_operation("initial-dp")` |
 | connect (CAMEL) | `connect` | *(staged as an invoke via `gsm_cap.connect`)* |
 
-Operations without a decorator are still first-class for **routing**: you can
-match and route or screen them at the content layer. Terminating one means
-owning that subsystem and answering the dialogue; the decorators cover the
-operations the cookbook builds on. The full MAP/CAP argument surface lives in
-the published `gsm_map` / `gsm_cap` codecs.
+The **match** names above are the content-rule vocabulary (`operation:`). The
+**termination** vocabulary is a per-namespace superset (it adds `ready-for-sm`,
+`purge-ms`, `report-sm-delivery-status`, `event-report-bcsm`, and the INAP
+operations); the full list each `on_operation` accepts is in the
+[Script API](script-api.md#gsm-map). One handler can take several operations
+pipe-separated (`@gsm_map.on_operation("mo-forward-sm|mt-forward-sm")`), the same
+`on_<message>("<name>")` shape as `@smpp.on_pdu` and the SIP proxy's
+`@proxy.on_request`.
+
+Operations staged only as an invoke (`insert-subscriber-data`, `connect`) are not
+terminated; you send them inside an open dialogue. Anything you don't terminate is
+still first-class for **routing**: match and route or screen it at the content
+layer. The full MAP/CAP argument surface lives in the published `gsm_map` /
+`gsm_cap` codecs.
 
 ## Termination shapes { #termination }
 
@@ -125,9 +138,6 @@ your handler. Three shapes cover MAP and CAMEL practice:
   that keeps the dialogue open (an updateLocation answered with an
   insertSubscriberData invoke), and the peer's follow-up re-enters the handler
   to finish with an `End`. See [Building an HLR](cookbook/hlr.md).
-- **originating**: the node opens the dialogue itself with `gsm_map.begin`,
-  stages the opening invoke, and drives each leg; an SMSC doing SRI-SM then a
-  multi-segment MT-ForwardSM. See [Building an SMSC](cookbook/smsc.md).
 
 Invoke and dialogue timers, and the dialogue ceiling, come from the
 [`tcap:` block](configuration.md#tcap) and are enforced by the engine.
@@ -156,6 +166,7 @@ call. The families:
 | `sigtran_invoke_timeouts_total` | counter | `operation` |
 | `sigtran_abort_total` | counter | `source` |
 | `sigtran_loops_detected_total` | counter | `kind` |
+| `sigtran_isup_screened_total` | counter | `reason` |
 
 Good first panels: linkset / ASP state and route availability (is the node
 wired up?), MSU rate by SI, GTT translations vs errors, active dialogues, and

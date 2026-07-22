@@ -25,7 +25,7 @@ the dialogue so the Connect rides the closing message.
 ```python
 from siphon import gsm_cap
 
-@gsm_cap.on_initial_dp
+@gsm_cap.on_operation("initial-dp")
 async def on_idp(dlg, idp):
     target = reroute(idp.called_party_number)      # your routing logic
     dlg.invoke(gsm_cap.connect(destination_routing_address=[target]))
@@ -33,16 +33,17 @@ async def on_idp(dlg, idp):
 
 
 def reroute(called_party_number):
-    """Map the dialled number to a new destination (called-party-number bytes).
+    """Map the dialled number to a new destination (an E.164 digit string).
 
     A fixed reroute here; replace with a portability dip, a time-of-day plan,
     or a per-subscriber service."""
     _ = called_party_number
-    return b"\x00\x15\x55\x01\x99"
+    return "15550199"
 ```
 
 That is the whole node. `gsm_cap.connect` takes a list of destination
-called-party-number byte strings and stages a CAP Connect invoke;
+called-party numbers (each an E.164 digit string, encoded for you, or raw bytes)
+and stages a CAP Connect invoke;
 [`dlg.end()`](../script-api.md#dialogue) flushes it as the closing End.
 
 ## The config
@@ -77,7 +78,7 @@ A real SCP also does more than connect. Stage several CAP invokes in the one
 dialogue, then flush them together:
 
 ```python
-@gsm_cap.on_initial_dp
+@gsm_cap.on_operation("initial-dp")
 async def on_idp(dlg, idp):
     if barred(idp.calling_party_number):
         dlg.invoke(gsm_cap.release_call(cause=b"\x90\x95"))   # Q.850 call rejected
@@ -99,7 +100,7 @@ async def on_idp(dlg, idp):
   online-charging control (a call-duration limit, say).
 
 When you arm detection points, the gsmSSF reports them back with EventReportBCSM
-in the same dialogue. Terminate those with `@gsm_cap.on_event_report_bcsm` and
+in the same dialogue. Terminate those with `@gsm_cap.on_operation("event-report-bcsm")` and
 drive the next leg (extend the timer, play an announcement, release).
 
 For a routing-heavy node that mixes call control with transit SS7, pair this with

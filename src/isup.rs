@@ -233,14 +233,14 @@ mod tests {
                 "premium",
                 ScreenMatch {
                     message_type: Some("iam".into()),
-                    called_prefix: Some("1900".into()),
+                    called_prefix: Some("1999".into()),
                     calling_prefix: None,
                 },
                 ScreenAction::Block,
             )],
         });
         assert_eq!(
-            scr.screen(&iam("1900555", "1555000")),
+            scr.screen(&iam("1999555", "1555000")),
             Screened::BlockRule {
                 rule: "premium".into()
             }
@@ -292,10 +292,10 @@ mod tests {
             )],
         });
         assert_eq!(
-            scr.screen(&iam("1900555", "1555000")),
+            scr.screen(&iam("1999555", "1555000")),
             Screened::BlockRule { rule: "cli".into() }
         );
-        assert_eq!(scr.screen(&iam("1900555", "1999000")), Screened::Pass);
+        assert_eq!(scr.screen(&iam("1999555", "1999000")), Screened::Pass);
     }
 
     #[test]
@@ -316,7 +316,7 @@ mod tests {
         assert_eq!(scr.screen(&iam("1555555", "1555000")), Screened::Pass);
         // Everything else falls through to the block default.
         assert_eq!(
-            scr.screen(&iam("1900555", "1555000")),
+            scr.screen(&iam("1999555", "1555000")),
             Screened::BlockDefault
         );
     }

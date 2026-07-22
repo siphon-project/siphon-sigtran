@@ -160,13 +160,11 @@ pub struct ApplicationServer {
     pub asps: Vec<String>,
 }
 
-/// A link within a linkset: an association bound to a signalling-link code.
+/// A link within a linkset: the association it rides (which also identifies it).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Link {
     /// The association id this link rides.
     pub assoc: String,
-    /// Signalling Link Selection code within the linkset.
-    pub slc: u8,
 }
 
 /// One `linksets:` entry: an **M2PA linkset** (RFC 4165). M2PA replaces MTP2, so
@@ -298,58 +296,13 @@ pub struct PlmnMapEntry {
     pub e164_prefix: String,
 }
 
-/// The numbering plan a `gt_conversion` rule matches on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ConversionNp {
-    /// E.214 (Mobile Global Title).
-    E214,
-    /// E.164 (ISDN).
-    E164,
-}
-
-/// The `match:` clause of a gt_conversion rule.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ConversionMatch {
-    /// The numbering plan to match (e214 / e164).
-    pub np: ConversionNp,
-    /// Optional addressing hint (e.g. `imsi` for the outbound E.164→E.214 case).
-    #[serde(default)]
-    pub addressing: Option<String>,
-}
-
-/// The `action:` clause of a gt_conversion rule.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ConversionAction {
-    /// Convert E.214 → E.164 via the named map (`plmn_map`).
-    #[serde(default)]
-    pub to_e164_via: Option<String>,
-    /// Convert E.164 → E.214 via the named map (`plmn_map`).
-    #[serde(default)]
-    pub to_e214_via: Option<String>,
-}
-
-/// One `gt_conversion.rules:` entry.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ConversionRule {
-    /// Rule name (for metrics + ordering clarity).
-    pub name: String,
-    /// The match criteria.
-    #[serde(rename = "match")]
-    pub match_: ConversionMatch,
-    /// The conversion to apply.
-    pub action: ConversionAction,
-}
-
-/// The `gt_conversion:` block: E.214 ↔ E.164 mobile-global-title conversion.
+/// The `gt_conversion:` block: E.214 → E.164 mobile-global-title conversion. The
+/// inbound E.214→E.164 pre-step before GTT is driven from the `plmn_map`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GtConversion {
     /// The E.212 → E.164 network numbering map.
     #[serde(default)]
     pub plmn_map: Vec<PlmnMapEntry>,
-    /// The ordered conversion rules.
-    #[serde(default)]
-    pub rules: Vec<ConversionRule>,
 }
 
 /// The `sccp:` block.
@@ -475,9 +428,6 @@ pub struct ContentAction {
     /// Screen/drop the message.
     #[serde(default)]
     pub screen: Option<bool>,
-    /// Defer to a named Python hook (phase-3). The name is carried through.
-    #[serde(default)]
-    pub python: Option<String>,
 }
 
 /// One `content_routing.rules:` entry.
@@ -873,7 +823,18 @@ impl Config {
                             ls.name, link.assoc
                         )))
                     }
-                    Some(Adaptation::M2pa) => {}
+                    Some(Adaptation::M2pa) => {
+                        // M2PA framing is ITU 14-bit only; an ANSI (24-bit) node
+                        // would have its point codes masked and mangled, so reject
+                        // the combination at load rather than corrupt on the wire.
+                        if tenant.variant == Variant::Ansi {
+                            return Err(where_(format!(
+                                "linkset `{}` uses m2pa under the ansi variant, but m2pa framing \
+                                 is ITU 14-bit only; use m3ua associations for an ansi node",
+                                ls.name
+                            )));
+                        }
+                    }
                     Some(other) => {
                         return Err(where_(format!(
                             "linkset `{}` link `{}` is a {other:?} association, \
@@ -984,14 +945,26 @@ impl Config {
                         }
                     }
                 }
-                // Operation names must be recognised.
+                // Operation names must be recognised and belong to the block's
+                // declared `protocol` (a gsm-cap rule cannot match a MAP operation).
                 if let Some(ops) = &rule.match_.operation {
+                    let want_cap = cr.protocol == ContentProtocol::GsmCap;
                     for op in ops.as_slice() {
-                        if crate::content::Operation::from_kebab(op).is_none() {
-                            return Err(where_(format!(
-                                "content rule `{}` names unknown operation `{}`",
-                                rule.name, op
-                            )));
+                        match crate::content::Operation::from_kebab(op) {
+                            None => {
+                                return Err(where_(format!(
+                                    "content rule `{}` names unknown operation `{}`",
+                                    rule.name, op
+                                )))
+                            }
+                            Some(o) if o.is_cap() != want_cap => {
+                                return Err(where_(format!(
+                                    "content rule `{}` operation `{}` does not match the \
+                                     content_routing protocol `{:?}`",
+                                    rule.name, op, cr.protocol
+                                )));
+                            }
+                            Some(_) => {}
                         }
                     }
                 }
@@ -1087,7 +1060,7 @@ application_servers:
   - { name: msc, traffic_mode: override,  routing_context: 101, asps: [msc] }
 
 linksets:
-  - { name: transit, links: [{assoc: xit-1, slc: 0}, {assoc: xit-2, slc: 1}] }
+  - { name: transit, links: [{assoc: xit-1}, {assoc: xit-2}] }
 
 mtp3_routes:
   - { dpc: 2000, as: hlr,          priority: 1 }
@@ -1106,30 +1079,27 @@ sccp:
     plmn_map:
       - { mcc: "001", mnc: "01", e164_prefix: "15551" }
       - { mcc: "001", mnc: "02", e164_prefix: "15552" }
-    rules:
-      - { name: e214-in,  match: {np: e214},                   action: {to_e164_via: plmn_map} }
-      - { name: e214-out, match: {np: e164, addressing: imsi}, action: {to_e214_via: plmn_map} }
 
 content_routing:
   protocol: gsm-map
   address_tables:
     - { name: home-subs, addrs: ["15550142", "15550143"] }
   imsi_tables:
-    - { name: buyer-a, prefixes: ["001010", "001011"] }
+    - { name: customer-a, prefixes: ["001010", "001011"] }
     - { name: sponsor, prefixes: ["00102"] }
   rules:
-    - name: buyer-a-home
-      match:  { operation: [update-location, send-auth-info, cancel-location], imsi_in: buyer-a }
+    - name: customer-a-home
+      match:  { operation: [update-location, send-auth-info, cancel-location], imsi_in: customer-a }
       action: { route: {dpc: 2005, ssn: 6} }
     - name: imsi-steer
       match:  { imsi_prefix: "001" }
-      action: { python: on_imsi_route }
+      action: { screen: true }
     - name: mt-sms-home-route
       match:  { operation: sri-sm, cdpa_gt_in: home-subs }
       action: { route: {group: ag-router}, rewrite_cdpa_gt: "15550100" }
-    - name: sri-sm-np
+    - name: sri-sm-route
       match:  { operation: sri-sm }
-      action: { python: on_np_dip }
+      action: { route: {dpc: 2000, ssn: 6} }
 "#;
 
     #[test]
@@ -1236,7 +1206,7 @@ node: { point_code: 1000, variant: ITU }
 associations:
   - { id: x1, adaptation: m2pa, role: client, addrs: [10.0.0.1], port: 3565, adjacent_pc: 3000 }
 linksets:
-  - { name: ls, links: [{assoc: x1, slc: 0}] }
+  - { name: ls, links: [{assoc: x1}] }
 mtp3_routes:
   - { dpc: 2000, linkset: nope, priority: 1 }
 "#;
@@ -1270,7 +1240,7 @@ associations:
 application_servers:
   - { name: as1, traffic_mode: override, routing_context: 1, asps: [a1] }
 linksets:
-  - { name: ls, links: [{assoc: x1, slc: 0}] }
+  - { name: ls, links: [{assoc: x1}] }
 mtp3_routes:
   - { dpc: 2000, as: as1, linkset: ls, priority: 1 }
 "#;
@@ -1311,10 +1281,25 @@ node: { point_code: 1000, variant: ITU }
 associations:
   - { id: a1, adaptation: m3ua, role: server, addrs: [10.0.0.1], port: 2905 }
 linksets:
-  - { name: ls, links: [{assoc: a1, slc: 0}] }
+  - { name: ls, links: [{assoc: a1}] }
 "#;
         let err = Config::parse(yaml).unwrap_err();
         assert!(err.to_string().contains("carries m2pa links"));
+    }
+
+    #[test]
+    fn rejects_m2pa_under_the_ansi_variant() {
+        // M2PA framing is ITU 14-bit only; an ANSI node with an m2pa linkset would
+        // have its point codes masked and mangled, so it is refused at load.
+        let yaml = r#"
+node: { point_code: 1000, variant: ANSI }
+associations:
+  - { id: m2, adaptation: m2pa, role: client, addrs: [10.0.1.1], port: 3565, adjacent_pc: 3000 }
+linksets:
+  - { name: ls, links: [{assoc: m2}] }
+"#;
+        let err = Config::parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("m2pa under the ansi variant"));
     }
 
     #[test]
@@ -1365,7 +1350,7 @@ node: { point_code: 1000, variant: ITU }
 associations:
   - { id: x1, adaptation: m2pa, role: client, addrs: [10.0.0.1], port: 3565, adjacent_pc: 3000 }
 linksets:
-  - { name: ls, links: [{assoc: ghost, slc: 0}] }
+  - { name: ls, links: [{assoc: ghost}] }
 "#;
         let err = Config::parse(yaml).unwrap_err();
         assert!(err.to_string().contains("unknown association"));
@@ -1378,8 +1363,8 @@ node: { point_code: 1000, variant: ITU }
 associations:
   - { id: x1, adaptation: m2pa, role: client, addrs: [10.0.0.1], port: 3565, adjacent_pc: 3000 }
 linksets:
-  - { name: ls, links: [{assoc: x1, slc: 0}] }
-  - { name: ls, links: [{assoc: x1, slc: 1}] }
+  - { name: ls, links: [{assoc: x1}] }
+  - { name: ls, links: [{assoc: x1}] }
 "#;
         let err = Config::parse(yaml).unwrap_err();
         assert!(err.to_string().contains("duplicate route destination"));
@@ -1419,7 +1404,7 @@ isup_screening:
   default: allow
   rules:
     - name: block-premium
-      match: { message_type: iam, called_prefix: "1900" }
+      match: { message_type: iam, called_prefix: "1999" }
       action: block
     - name: allow-national
       match: { calling_prefix: "1555" }
@@ -1437,7 +1422,7 @@ isup_screening:
         assert_eq!(scr.rules[0].name, "block-premium");
         assert_eq!(scr.rules[0].action, ScreenAction::Block);
         assert_eq!(scr.rules[0].match_.message_type.as_deref(), Some("iam"));
-        assert_eq!(scr.rules[0].match_.called_prefix.as_deref(), Some("1900"));
+        assert_eq!(scr.rules[0].match_.called_prefix.as_deref(), Some("1999"));
     }
 
     #[test]

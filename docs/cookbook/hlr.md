@@ -1,27 +1,25 @@
 # Building an HLR
 
-Mobility signalling, updateLocation, sendAuthenticationInfo, cancelLocation and
-SRI-SM, is the busiest MAP traffic in a core. This recipe builds the node that
-sits in front of it: it steers each subscriber's mobility operations to the
-right home HLR by IMSI, and terminates updateLocation locally to apply policy
-before the subscriber is admitted.
+An HLR is a subscriber database that **answers**. A VLR or MSC queries it as a
+subscriber roams in (updateLocation, sendAuthenticationInfo), an SMSC asks it
+where to deliver (SRI-SM), a VLR tells it a subscriber has gone (purgeMS). Every
+one of those is a MAP operation addressed to the HLR subsystem, and the HLR
+terminates it and replies. This recipe builds that node: it owns SSN 6 and
+answers the mobility and SMS-routing operations sent to it.
 
 ```
-   VLR / MSC ──updateLocation──▶  ┌──────────────────┐
-             ──sendAuthInfo────▶  │   this node      │  ──by IMSI──▶  home HLR A
-             ──SRI-SM──────────▶  │  (siphon-sigtran) │  ──by IMSI──▶  home HLR B
-                                  └──────────────────┘
+   VLR / MSC ──updateLocation──────▶  ┌──────────────────┐
+             ──sendAuthInfo────────▶  │   this HLR       │
+             ──purgeMS─────────────▶  │  (siphon-sigtran) │  ──answer──▶
+   SMSC      ──SRI-SM──────────────▶  └──────────────────┘
 ```
 
-Two halves, both on real API: **route** mobility operations to a home HLR by
-IMSI (content routing), and **terminate** updateLocation to authorize.
+## Own the HLR subsystem
 
-## Route mobility operations by IMSI
-
-An HLR is addressed for a range of IMSIs. The routing half is config: an
-`imsi_table` names the ranges, and a content rule sends the mobility operations
-for those IMSIs to their home HLR. The IMSI lives inside the MAP argument, so
-this is a content-layer decision.
+The config declares the subsystem so mobility operations addressed to it
+terminate here. The associations and route reach the VLRs/MSCs the HLR answers
+(and pushes subscriber data to), so a reply and the insertSubscriberData leg have
+a path back.
 
 ```yaml
 node:
@@ -29,40 +27,22 @@ node:
   variant: itu
 
 associations:
-  - { id: hlr-a, adaptation: m3ua, role: server, addrs: [10.1.0.10], port: 2905 }
+  - { id: vlr-a, adaptation: m3ua, role: server, addrs: [10.1.0.10], port: 2905 }
 
 application_servers:
-  - { name: hlr-a, traffic_mode: loadshare, routing_context: 100, asps: [hlr-a] }
+  - { name: vlr-a, traffic_mode: loadshare, routing_context: 100, asps: [vlr-a] }
 
 mtp3_routes:
-  - { dpc: 2005, as: hlr-a, priority: 1 }
+  - { dpc: 2005, as: vlr-a, priority: 1 }   # reach the querying VLR/MSC to answer
 
 sccp:
-  local_ssns: [6]        # we own the HLR subsystem for the operations we terminate
-
-content_routing:
-  protocol: gsm-map
-  imsi_tables:
-    - { name: customer-a, prefixes: ["001010", "001011"] }
-  rules:
-    - name: customer-a-home
-      match:  { operation: [update-location, send-auth-info, cancel-location], imsi_in: customer-a }
-      action: { route: {dpc: 2005, ssn: 6} }
+  local_ssns: [6]        # we own SSN 6; mobility operations to it terminate here
 ```
 
-Everything for a `customer-a` IMSI routes to DPC 2005 in Rust, at line rate,
-with no script involvement. To steer by a rule the static table can't answer (a
-freshly ported range, a per-subscriber override), defer to a hook exactly as
-the [STP recipe](stp.md#2-deferred-rule-hooks) does, and cache the answer back
-with `ss7.routes.cache(...)`.
+Nothing routes onward. A message addressed to SSN 6 is handed to the dialogue
+engine, which decodes the MAP operation and dispatches it to your handler.
 
-!!! tip "PLMN steering is cheaper at SCCP"
-    Steering by *network* rather than by IMSI range (all of MCC+MNC 001/01 goes
-    to one HLR) is a GTT prefix on the E.214 called party, not a content rule.
-    The subscriber's MCC+MNC is the leading digits of the mobile global title.
-    See [the cost ladder](../concepts.md#the-cost-ladder).
-
-## Terminate updateLocation to authorize
+## Answer updateLocation
 
 Own the operation to make an admission decision. Register a handler for
 updateLocation; the engine hands you the [`Dialogue`](../script-api.md#dialogue)
@@ -75,7 +55,7 @@ from siphon import gsm_map
 
 TRUSTED_VLRS = {"15550180", "15550181"}
 
-@gsm_map.on_update_location
+@gsm_map.on_operation("update-location")
 async def on_update_location(dlg, arg):
     if arg.calling_gt not in TRUSTED_VLRS:
         # Refuse an update from an untrusted VLR (a MAP error on the invoke).
@@ -108,9 +88,9 @@ back. Branch on `is_peer_turn`.
 ```python
 from siphon import gsm_map
 
-HLR_NUMBER = b"\x91\x15\x55\x01\x90"          # our E.164 address, TBCD
+HLR_NUMBER = "15550190"                       # our E.164 address (+1 555 0190)
 
-@gsm_map.on_update_location
+@gsm_map.on_operation("update-location")
 async def on_update_location(dlg, event):
     if event.is_peer_turn:
         # Follow-up leg: the VLR answered our insertSubscriberData.
@@ -143,15 +123,20 @@ The engine drives that shape end to end (it is exercised in the crate's dialogue
 tests and the addon test). It is the same stage-then-flush model the
 [SMSC recipe](smsc.md) uses for multi-segment MT.
 
-## Answer sendAuthenticationInfo
+## Single-shot answers
 
-An authentication query is single-shot: the VLR asks for vectors, the HLR answers
-with them in a closing `End`. Build the vectors with
-`gsm_map.send_authentication_info_res`, quintuplets for UMTS/EPS AKA (each
-`(rand, xres, ck, ik, autn)`) or triplets for GSM (each `(rand, sres, kc)`).
+updateLocation is the multi-leg case. Most of what an HLR answers is single-shot:
+one invoke in, one result out in a closing `End`. Each is named on
+`@gsm_map.on_operation("<name>")` (see the
+[selector list](../script-api.md#on_operation)) and has its own `*_res` builder.
+
+**sendAuthenticationInfo.** The VLR asks for vectors, the HLR answers with them.
+Build the vectors with `gsm_map.send_authentication_info_res`, quintuplets for
+UMTS/EPS AKA (each `(rand, xres, ck, ik, autn)`) or triplets for GSM (each
+`(rand, sres, kc)`).
 
 ```python
-@gsm_map.on_send_authentication_info
+@gsm_map.on_operation("send-auth-info")
 async def on_send_auth_info(dlg, arg):
     vectors = await mint_quintuplets(arg.argument, n=5)   # your Milenage / TUAK
     dlg.reply(gsm_map.send_authentication_info_res(quintuplets=vectors))
@@ -159,10 +144,30 @@ async def on_send_auth_info(dlg, arg):
 ```
 
 `mint_quintuplets` runs your Milenage or TUAK against the subscriber's K / OP; the
-MAP side is one `reply` then `end`. cancelLocation, purgeMS, readyForSM and
-reportSM-DeliveryStatus terminate the same single-shot way, each with its own
-`@gsm_map.on_*` decorator (see the [Script API](../script-api.md#gsm-map)) and its
-own `*_res` builder.
+MAP side is one `reply` then `end`.
+
+**SRI-SM.** An SMSC asks where to deliver a message. The HLR answers with the
+recipient's IMSI and the serving MSC/SGSN so the SMSC can raise the MT dialogue.
+
+```python
+@gsm_map.on_operation("sri-sm")
+async def on_sri_sm(dlg, arg):
+    imsi, msc = await locate(arg.argument)        # look the subscriber up
+    dlg.reply(gsm_map.send_routing_info_for_sm_res(imsi=imsi, network_node_number=msc))
+    dlg.end()
+```
+
+**purgeMS** answers the same single-shot way with `gsm_map.purge_ms_res(...)`, and
+**readyForSM** with `gsm_map.ready_for_sm_res()`.
+
+## Fronting a pool of HLRs
+
+Steering a subscriber's operations to their *home* HLR by IMSI range is a
+different node. That is signalling relay, not an HLR: the front node terminates
+nothing, it routes each mobility operation to the HLR that owns the IMSI. Build
+that as an [STP](stp.md) with a content rule on the IMSI (or, cheaper, a GTT
+prefix on the E.214 called party when a whole network maps to one HLR). See
+[the cost ladder](../concepts.md#the-cost-ladder).
 
 ## Next
 

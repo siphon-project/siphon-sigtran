@@ -8,7 +8,7 @@ has mounted the siphon-sigtran namespaces.
 from siphon import gsm_cap
 
 
-@gsm_cap.on_initial_dp
+@gsm_cap.on_operation("initial-dp")
 async def on_idp(dlg, idp):
     target = reroute(idp.called_party_number)  # your routing logic
     dlg.invoke(gsm_cap.connect(destination_routing_address=[target]))
@@ -16,9 +16,9 @@ async def on_idp(dlg, idp):
 
 
 def reroute(called_party_number):
-    """Map the dialled number to a new destination (called-party-number bytes).
+    """Map the dialled number to a new destination (an E.164 digit string).
 
     Here a fixed reroute; replace with your own logic (a portability dip, a
     time-of-day plan, a per-subscriber service)."""
     _ = called_party_number
-    return b"\x00\x15\x55\x01\x99"
+    return "15550199"

@@ -70,7 +70,7 @@ associations:
 application_servers:
   - { name: hlr, traffic_mode: loadshare, routing_context: 100, asps: [hlr-a] }
 linksets:
-  - { name: transit, links: [{assoc: xit-1, slc: 0}] }
+  - { name: transit, links: [{assoc: xit-1}] }
 mtp3_routes:
   - { dpc: 2000, as: hlr,          priority: 1 }
   - { dpc: 2000, linkset: transit, priority: 2 }
@@ -81,10 +81,10 @@ sccp:
 content_routing:
   protocol: gsm-map
   imsi_tables:
-    - { name: buyer-a, prefixes: ["001010"] }
+    - { name: customer-a, prefixes: ["001010"] }
   rules:
-    - name: buyer-a-home
-      match:  { operation: [update-location], imsi_in: buyer-a }
+    - name: customer-a-home
+      match:  { operation: [update-location], imsi_in: customer-a }
       action: { route: {dpc: 2005, ssn: 6} }
     - name: sri-sm-np
       match:  { operation: sri-sm }
