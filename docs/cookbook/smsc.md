@@ -85,22 +85,24 @@ TPDU that arrives without the RP wrapper (an SMPP `submit_sm`, or a bare
 `sm-RP-UI`) parses just as well with `tpdu.parse_sms_submit(...)` /
 `tpdu.destination_from_tpdu(...)`.
 
-## Mobile-terminated delivery (roadmap)
+## Mobile-terminated delivery
 
 Terminating mobile-originated SMS (above) runs on the wire today. Delivering a
 mobile-**terminated** message is the other half of a store-and-forward SMSC, and
 it **originates** dialogues: an SRI-SM to the HLR to learn the subscriber's IMSI
 and serving MSC, then one MT-ForwardSM dialogue to that MSC held open across the
-segments of a concatenated message. Origination (opening a dialogue the node
-initiates and awaiting the peer's response over SCTP) is a roadmap feature; see
-the [changelog](../../CHANGELOG.md). A terminate-only SMSC front end (decode,
-screen, spool, ack the MO leg) works now.
+segments of a concatenated message. The node opens a dialogue it initiates and
+awaits the peer's response over SCTP with `gsm_map.begin(...)` for a single
+request/response, or `node.originate(...)` with an `on_reply(dlg, peer)` callback
+for a multi-leg delivery (segment 1 with `moreMessagesToSend`, the ack, segment
+2, the closing End). A terminate-only SMSC front end (decode, screen, spool, ack
+the MO leg) works equally well.
 
-When origination lands, the SMS-DELIVER TPDUs, including the User-Data-Header that
-ties the segments together, are built with `tpdu` (TS 23.040 / TS 23.038 /
-TS 24.011); `moreMessagesToSend` and the dialogue lifetime are siphon-sigtran's
-job. siphon-sigtran never inspects the SMS bytes; it carries them and sequences
-the dialogue.
+The SMS-DELIVER TPDUs, including the User-Data-Header that ties the segments
+together, are built with `tpdu` (TS 23.040 / TS 23.038 / TS 24.011);
+`moreMessagesToSend` and the dialogue lifetime are siphon-sigtran's job.
+siphon-sigtran never inspects the SMS bytes; it carries them and sequences the
+dialogue.
 
 ## From here to production
 
