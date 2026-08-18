@@ -1,8 +1,14 @@
-# .github/workflows/audit.yml, RustSec advisory + license/source audit.
+# .github/workflows/audit.yml, RustSec advisory audit.
 #
-# RustSec advisories are time-varying: a new advisory can land against an
-# unchanged dependency, so this runs on a schedule (and whenever the dependency
-# set changes) rather than gating every PR.
+# The time-varying half of the cargo-deny policy. A new RustSec advisory, or a
+# yank of a version already in Cargo.lock, changes this verdict against an
+# unchanged dependency set, so gating PRs on it would turn unrelated feature
+# branches red for something the branch did not do. It runs on a schedule (and
+# whenever the dependency set changes on main) instead, where a fresh finding
+# is surfaced as a failed run rather than as a blocked PR.
+#
+# The deterministic half (bans / licenses / sources) is the `deny` job in
+# .github/workflows/ci.yml, which does gate every PR.
 name: Security audit
 
 on:
@@ -20,11 +26,13 @@ permissions:
   contents: read
 
 jobs:
-  cargo-deny:
-    name: cargo-deny
+  advisories:
+    name: cargo-deny advisories
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
+          arguments: --all-features --locked
           command: check
+          command-arguments: advisories
