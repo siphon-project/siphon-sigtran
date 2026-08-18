@@ -69,9 +69,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::{Adaptation, Association, Config, Role, DEFAULT_TENANT};
-use crate::dialogue::DialogueEngine;
+use crate::dialogue::{DialogueEngine, OutgoingBegin, TerminationHandler};
 use crate::metrics;
-use crate::routing::Router;
+use crate::mtp3::route::Destination;
+use crate::routing::{Inbound, RouteDecision, Router};
 
 mod forward;
 pub mod framing;
@@ -141,6 +142,20 @@ pub struct LocalDelivery {
     pub ingress_assoc: String,
 }
 
+/// An origination request handed to the transport's outbound seam: open a
+/// dialogue the node itself initiates (an SMSC's MT delivery, an SMS-GMSC's
+/// SRI-SM). The engine allocates the transaction and the handler stages the
+/// opening `Invoke` in [`TerminationHandler::on_start`] and observes the peer's
+/// response in [`TerminationHandler::on_continue`]; the transport routes the
+/// resulting `Begin` MSU(s) out by DPC. The peer's response arrives inbound and
+/// correlates through [`TransportHandle::serve_dialogues`] on the same engine.
+pub struct Origination {
+    /// The parameterised opening request (application context, addressing, DPC).
+    pub req: OutgoingBegin,
+    /// The handler driving the originated dialogue.
+    pub handler: Arc<dyn TerminationHandler>,
+}
+
 /// Shared context handed to every association task.
 #[derive(Clone)]
 pub(crate) struct TaskCtx {
@@ -155,10 +170,13 @@ pub(crate) struct TaskCtx {
 pub struct TransportHandle {
     router: Arc<Router>,
     registry: Arc<Registry>,
+    tenant: String,
     bound: HashMap<String, SocketAddr>,
     tasks: Vec<JoinHandle<()>>,
     shutdown_tx: watch::Sender<bool>,
     local_rx: Option<mpsc::Receiver<LocalDelivery>>,
+    origin_tx: mpsc::UnboundedSender<Origination>,
+    origin_rx: Option<mpsc::UnboundedReceiver<Origination>>,
 }
 
 impl TransportHandle {
@@ -184,6 +202,7 @@ impl TransportHandle {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (local_tx, local_rx) = mpsc::channel(1024);
+        let (origin_tx, origin_rx) = mpsc::unbounded_channel();
         let sctp_cfg = SctpConfig::new().nodelay(true);
 
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -256,10 +275,13 @@ impl TransportHandle {
         Ok(Self {
             router,
             registry,
+            tenant: tenant_id.to_string(),
             bound,
             tasks,
             shutdown_tx,
             local_rx: Some(local_rx),
+            origin_tx,
+            origin_rx: Some(origin_rx),
         })
     }
 
@@ -297,6 +319,8 @@ impl TransportHandle {
             return;
         };
         let registry = self.registry.clone();
+        let router = self.router.clone();
+        let tenant = self.tenant.clone();
         let mut shutdown = self.shutdown_tx.subscribe();
         let task = tokio::spawn(async move {
             // Age dialogues once a second; the timers themselves are seconds.
@@ -312,7 +336,55 @@ impl TransportHandle {
                     }
                     _ = sweep.tick() => {
                         for (assoc, out) in engine.sweep(Instant::now()) {
-                            send_reply(&registry, &assoc, &out).await;
+                            send_sweep_abort(&registry, &router, &tenant, &assoc, &out).await;
+                        }
+                    }
+                }
+            }
+        });
+        self.tasks.push(task);
+    }
+
+    /// A cloneable sender onto the transport's origination seam. A composing
+    /// addon hands this to its script-facing originating helper
+    /// (`gsm_map.begin(...)`), which pushes an [`Origination`] to open a dialogue
+    /// the node initiates. `None`-free: always available once the transport is up.
+    pub fn origin_sender(&self) -> mpsc::UnboundedSender<Origination> {
+        self.origin_tx.clone()
+    }
+
+    /// Attach the origination drain to the running node: spawn a task that pulls
+    /// each [`Origination`], opens the dialogue via [`DialogueEngine::begin`]
+    /// (whose handler stages the opening `Invoke`), and sends the resulting
+    /// `Begin` MSU(s) out on the association its DPC routes to. The peer's
+    /// response arrives inbound and correlates through
+    /// [`serve_dialogues`](Self::serve_dialogues) on the **same** engine, so pass
+    /// the identical [`DialogueEngine`] to both. Takes the origination receiver,
+    /// so call it once.
+    pub fn serve_originations(&mut self, engine: Arc<DialogueEngine>) {
+        let Some(mut rx) = self.origin_rx.take() else {
+            return;
+        };
+        let registry = self.registry.clone();
+        let router = self.router.clone();
+        let tenant = self.tenant.clone();
+        let mut shutdown = self.shutdown_tx.subscribe();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    maybe = rx.recv() => {
+                        let Some(origination) = maybe else { break };
+                        let dpc = origination.req.dpc;
+                        let (_tid, frames) = engine.begin(origination.req, origination.handler);
+                        let Some(via) = resolve_egress(&router, &tenant, dpc) else {
+                            eprintln!(
+                                "siphon-sigtran: originated dialogue to dpc {dpc} has no MTP3 route, dropped"
+                            );
+                            continue;
+                        };
+                        for msu in &frames {
+                            forward::send_via(&via, msu, &registry).await;
                         }
                     }
                 }
@@ -394,6 +466,48 @@ fn bind(addrs: &[SocketAddr], cfg: &SctpConfig) -> Result<SctpListener> {
         SctpListener::bind_multi_with(addrs, cfg)?
     };
     Ok(listener)
+}
+
+/// Resolve the egress [`Destination`] a DPC routes to within a tenant, for the
+/// origination path: an originated `Begin` is addressed by DPC and routed like
+/// any transit MSU. Returns `None` when the DPC has no route (or resolves to
+/// local termination, which an origination never should).
+fn resolve_egress(router: &Router, tenant: &str, dpc: u32) -> Option<Destination> {
+    match router.route_in(
+        tenant,
+        &Inbound {
+            dpc,
+            ..Default::default()
+        },
+    ) {
+        RouteDecision::Route { via } => Some(via),
+        RouteDecision::RouteTo { via: Some(via), .. } => Some(via),
+        _ => None,
+    }
+}
+
+/// Send a swept dialogue's timeout Abort back to the peer, never silently
+/// dropping it. A responder dialogue carries the ingress association it arrived
+/// on, so the Abort egresses there; an **originated** (initiator) dialogue has no
+/// ingress association (it went out by DPC), so its Abort is routed by the
+/// destination point code instead — the peer is always told the transaction died.
+async fn send_sweep_abort(
+    registry: &Registry,
+    router: &Router,
+    tenant: &str,
+    assoc_id: &str,
+    msu: &Msu,
+) {
+    if !assoc_id.is_empty() && registry.slot(assoc_id).is_some() {
+        send_reply(registry, assoc_id, msu).await;
+    } else if let Some(via) = resolve_egress(router, tenant, msu.dpc) {
+        forward::send_via(&via, msu, registry).await;
+    } else {
+        eprintln!(
+            "siphon-sigtran: swept dialogue abort to dpc {} has no egress association, dropped",
+            msu.dpc
+        );
+    }
 }
 
 /// Send one dialogue-engine reply MSU back on the association it should egress

@@ -14,12 +14,10 @@
 //!    SSN we own) terminates here.
 //! 3. **Content routing.** When a decoded MAP/CAP view is available, the
 //!    [content engine](crate::content) can override with a rule action (route,
-//!    rewrite, screen, or defer-to-Python), evaluated first, before GTT, since
-//!    it routes on the richer application layer.
+//!    rewrite, or screen), evaluated first, before GTT, since it routes on the
+//!    richer application layer.
 //!
 //! The router is **synchronous and allocation-light**, the line-rate guarantee.
-//! Anything dynamic (a Python hook) surfaces as [`RouteDecision::Python`] for the
-//! async layer above to resolve.
 
 use crate::content::{Action, MapView};
 use crate::mtp3::route::Destination;
@@ -43,6 +41,9 @@ pub enum RouteDecision {
         ssn: u8,
         /// The egress destination the DPC resolves to (if a route exists).
         via: Option<Destination>,
+        /// New called-party GT digits to stamp before relay, from a content
+        /// rule's `rewrite_cdpa_gt` action. `None` leaves the address untouched.
+        rewrite_cdpa_gt: Option<String>,
     },
     /// Terminate locally (we own the subsystem).
     Local,
@@ -58,11 +59,6 @@ pub enum RouteDecision {
         /// Whether variant conversion applies.
         conversion: bool,
     },
-    /// Defer to a named Python hook (phase-3): the async layer calls it.
-    Python {
-        /// The hook name.
-        hook: String,
-    },
     /// Drop the message, with a reason.
     Drop {
         /// Why it was dropped (no-route, screened, no-translation, …).
@@ -72,7 +68,7 @@ pub enum RouteDecision {
 
 /// An inbound message to route, decoded to the fields the router needs.
 ///
-/// The transport layer (phase-2) fills this in from a real MSU; the integration
+/// The transport layer fills this in from a real MSU; the integration
 /// tests fill it from genuinely-assembled SS7 bytes.
 #[derive(Debug, Clone, Default)]
 pub struct Inbound {
@@ -210,6 +206,16 @@ impl Router {
         self.tenancy.get(tenant).map(|rt| rt.point_code)
     }
 
+    /// The tenant's configured network-indicator value (0-3), stamped on messages
+    /// the node originates (e.g. an SCCP message bridged from a SUA peer).
+    /// Defaults to `0` (international) for an unknown tenant.
+    pub fn node_network_indicator(&self, tenant: &str) -> u8 {
+        self.tenancy
+            .get(tenant)
+            .map(|rt| rt.network_indicator)
+            .unwrap_or(0)
+    }
+
     /// A tenant's compiled ISUP screening engine, or `None` when the tenant has
     /// no `isup_screening` block. The transit path consults this only for an
     /// SI=5 MSU, so a tenant without screening (or any non-ISUP MSU) pays nothing.
@@ -217,6 +223,17 @@ impl Router {
         self.tenancy
             .get(tenant)
             .and_then(|rt| rt.isup_screen.as_ref())
+    }
+
+    /// Whether a tenant has any content rule. The transport decodes a
+    /// [`MapView`](crate::content::MapView) for an inbound SCCP message only when
+    /// this is true, so a node with no `content_routing` block adds no per-message
+    /// application-layer decode to the routing hot path.
+    pub fn tenant_has_content_rules(&self, tenant: &str) -> bool {
+        self.tenancy
+            .get(tenant)
+            .and_then(|rt| rt.content.as_ref())
+            .is_some_and(|c| c.has_rules())
     }
 
     /// Whether a DPC currently resolves to any available egress (used by the
@@ -327,7 +344,12 @@ impl Router {
                 if via.is_none() {
                     metrics::gtt_error(GttError::NoRoute);
                 }
-                RouteDecision::RouteTo { dpc, ssn, via }
+                RouteDecision::RouteTo {
+                    dpc,
+                    ssn,
+                    via,
+                    rewrite_cdpa_gt: None,
+                }
             }
             GttResult::Tenant { tenant, dpc, ssn } => {
                 metrics::gtt_translation(GttResultKind::Tenant);
@@ -356,13 +378,28 @@ impl Router {
             Action::Screen => Some(RouteDecision::Drop {
                 reason: "screened by content rule".into(),
             }),
-            Action::Python { hook } => Some(RouteDecision::Python { hook }),
-            Action::Route { target, .. } => {
+            Action::Route {
+                target,
+                rewrite_cdpa_gt,
+            } => {
                 // A content route target resolves through the same GTT machinery
                 // as a `to:` clause: dpc, group (cost primary / share cursor),
                 // local, or cross-tenant.
                 let result = rt.gtt.resolve_target(&target)?;
-                Some(self.decision_from_gtt(rt, result))
+                let mut decision = self.decision_from_gtt(rt, result);
+                // Carry a `rewrite_cdpa_gt` action onto a concrete-DPC relay; the
+                // transport stamps it on the egress SCCP before forwarding.
+                if let (
+                    RouteDecision::RouteTo {
+                        rewrite_cdpa_gt: slot,
+                        ..
+                    },
+                    Some(gt),
+                ) = (&mut decision, rewrite_cdpa_gt)
+                {
+                    *slot = Some(gt);
+                }
+                Some(decision)
             }
         }
     }
@@ -377,7 +414,6 @@ fn action_label(action: &Action) -> &'static str {
         } => "rewrite",
         Action::Route { .. } => "route",
         Action::Screen => "screen",
-        Action::Python { .. } => "python",
     }
 }
 
@@ -447,7 +483,7 @@ mod tests {
             ..Default::default()
         });
         match d {
-            RouteDecision::RouteTo { dpc, ssn, via } => {
+            RouteDecision::RouteTo { dpc, ssn, via, .. } => {
                 assert_eq!(dpc, 2000);
                 assert_eq!(ssn, 6);
                 assert_eq!(via, Some(Destination::ApplicationServer("hlr".into())));
@@ -478,9 +514,9 @@ mod tests {
     }
 
     #[test]
-    fn content_rule_overrides_with_python() {
+    fn content_rule_routes_sri_sm() {
         let r = router();
-        // Our PC, sri-sm with a non-home cdpa GT and no imsi → sri-sm-np python.
+        // Our PC, sri-sm with a non-home cdpa GT and no imsi → sri-sm-route (2000/6).
         let d = r.route(&Inbound {
             dpc: 1000,
             cdpa: Some(GttSelector::from_digits("15559999")),
@@ -491,18 +527,19 @@ mod tests {
             }),
             ..Default::default()
         });
-        assert_eq!(
-            d,
-            RouteDecision::Python {
-                hook: "on_np_dip".into()
+        match d {
+            RouteDecision::RouteTo { dpc, ssn, .. } => {
+                assert_eq!(dpc, 2000);
+                assert_eq!(ssn, 6);
             }
-        );
+            other => panic!("expected RouteTo, got {other:?}"),
+        }
     }
 
     #[test]
     fn content_rule_routes_to_dpc() {
         let r = router();
-        // updateLocation for buyer-a IMSI → buyer-a-home route dpc 2005 ssn 6.
+        // updateLocation for customer-a IMSI → customer-a-home route dpc 2005 ssn 6.
         let d = r.route(&Inbound {
             dpc: 1000,
             view: Some(MapView {

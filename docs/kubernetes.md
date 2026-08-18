@@ -6,8 +6,8 @@ Kubernetes, and, just as important, **what "scaling" means for SS7**. Read
 
 SS7 fits Kubernetes better than SIP does, because SS7 is itself a routing
 protocol: inter-pod routing is not a hack, it is more SS7 routing. But the
-identity model is strict, so the manifests are a **template** for *your*
-composing siphon binary, not a runnable image; see
+identity model is strict, so the YAML in this guide is a **template** for *your*
+composing siphon binary and your cluster, not a shipped runnable image; see
 [Deployment](deployment.md).
 
 ## HA first, throughput second

@@ -1,15 +1,15 @@
 [package]
 name = "siphon-sigtran"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.80"
-description = "SIGTRAN/SS7 runtime: M3UA/M2PA transport, MTP3 routing, SCCP GTT, content routing, MAP/CAP termination on the published SS7 codec crates"
+description = "SIGTRAN/SS7 runtime: M3UA/M2PA/SUA transport, MTP3 routing, SCCP GTT, content routing, MAP/CAP/INAP termination on the published SS7 codec crates"
 authors = ["SIPhon Contributors"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/siphon-project/siphon-sigtran"
 homepage = "https://github.com/siphon-project/siphon-sigtran"
-keywords = ["sigtran", "ss7", "m3ua", "sccp", "routing"]
+keywords = ["sigtran", "ss7", "sccp", "m3ua", "siphon"]
 categories = ["network-programming"]
 publish = false
 # Operator-facing assets (docs, CI scaffolding, the leak-gate script, the Python
@@ -42,12 +42,12 @@ itu-isup = "1"
 # TCAP (Q.773): transactions + components. Decoded for content routing.
 tcap = "1"
 # GSM MAP (TS 29.002): operation codes + argument types (content routing view).
-gsm_map = "1"
+gsm_map = "1.1"
 # CAMEL CAP (TS 29.078): operation codes (content routing view for SCP).
-gsm_cap = "1"
+gsm_cap = "1.2"
 # INAP CS-1 (ITU-T Q.1218 / ETSI EN 300 374-1): operation codes + argument types
 # for the SSF-SCF dialogue an IN SCP terminates (a TCAP-user peer to CAP).
-inap = "1"
+inap = "1.1"
 # Async SCTP (lksctp wrapper). Pulled in now for the phase-2 transport traits.
 async-sctp = "1"
 # ASN.1 BER. The tcap component/dialogue API exposes `rasn` types directly (an
@@ -65,10 +65,10 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
 
 # ── siphon addon face (feature = "python") ───────────────────────────────────
-# Kept out of the default build so `cargo add siphon-sigtran` and crates.io
-# consumers of the pure-Rust routing brain pull ZERO pyo3 or siphon. Enabling
-# `python` links the crate against siphon-sip and exposes the scriptable
-# `ss7` / `gsm_map` / `gsm_cap` namespaces.
+# Kept out of the default build so the crate's pure-Rust core (the router, GTT,
+# transport, and dialogue engine) compiles and tests with ZERO pyo3 or siphon in
+# the graph. Enabling `python` links the crate against siphon-sip and exposes the
+# scriptable `ss7` / `gsm_map` / `gsm_cap` / `inap` namespaces.
 #
 # Canonical repo URL after the siphon → siphon-sip rename. The URL string must
 # match byte-for-byte across every crate that depends on siphon-sip in one build
@@ -105,3 +105,4 @@ correctness = { level = "deny", priority = -1 }
 
 [package.metadata.docs.rs]
 all-features = true
+

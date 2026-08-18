@@ -60,7 +60,7 @@ application_servers:
   - { name: hlr, traffic_mode: loadshare, routing_context: 100, asps: [hlr-a] }
   - { name: msc, traffic_mode: override,  routing_context: 101, asps: [msc] }
 linksets:
-  - { name: transit, links: [{assoc: xit-1, slc: 0}, {assoc: xit-2, slc: 1}] }
+  - { name: transit, links: [{assoc: xit-1}, {assoc: xit-2}] }
 mtp3_routes:
   - { dpc: 2000, as: hlr,          priority: 1 }
   - { dpc: 2000, linkset: transit, priority: 2 }
@@ -75,24 +75,22 @@ sccp:
   gt_conversion:
     plmn_map:
       - { mcc: "001", mnc: "01", e164_prefix: "15551" }
-    rules:
-      - { name: e214-in, match: {np: e214}, action: {to_e164_via: plmn_map} }
 content_routing:
   protocol: gsm-map
   address_tables:
     - { name: home-subs, addrs: ["15550142", "15550143"] }
   imsi_tables:
-    - { name: buyer-a, prefixes: ["001010", "001011"] }
+    - { name: customer-a, prefixes: ["001010", "001011"] }
   rules:
-    - name: buyer-a-home
-      match:  { operation: [update-location, send-auth-info, cancel-location], imsi_in: buyer-a }
+    - name: customer-a-home
+      match:  { operation: [update-location, send-auth-info, cancel-location], imsi_in: customer-a }
       action: { route: {dpc: 2005, ssn: 6} }
     - name: mt-sms-home-route
       match:  { operation: sri-sm, cdpa_gt_in: home-subs }
       action: { route: {group: ag-router} }
-    - name: sri-sm-np
+    - name: sri-sm-route
       match:  { operation: sri-sm }
-      action: { python: on_np_dip }
+      action: { route: {dpc: 2000, ssn: 6} }
 "#;
 
 fn router() -> Router {
@@ -371,7 +369,7 @@ fn op_from_code(op: i64) -> Option<Operation> {
 // ── Tests: assemble real SS7 and route it ────────────────────────────────────
 
 #[test]
-fn sri_sm_over_m3ua_addressed_to_us_defers_to_np_hook() {
+fn sri_sm_over_m3ua_addressed_to_us_routes_via_content_rule() {
     let r = router();
     // Build a real SRI-SM Begin, SCCP UDT to our PC's GT, over M3UA to DPC 1000.
     let tcap = tcap_begin(
@@ -391,13 +389,14 @@ fn sri_sm_over_m3ua_addressed_to_us_defers_to_np_hook() {
         called_ssn,
         view: Some(view),
     });
-    // Non-home CdPA → falls through mt-sms-home-route to sri-sm-np python.
-    assert_eq!(
-        decision,
-        RouteDecision::Python {
-            hook: "on_np_dip".into()
+    // Non-home CdPA → falls through mt-sms-home-route to sri-sm-route (2000/6).
+    match decision {
+        RouteDecision::RouteTo { dpc, ssn, .. } => {
+            assert_eq!(dpc, 2000);
+            assert_eq!(ssn, 6);
         }
-    );
+        other => panic!("expected RouteTo, got {other:?}"),
+    }
 }
 
 #[test]
@@ -431,7 +430,7 @@ fn sri_sm_for_home_sub_routes_to_group() {
 }
 
 #[test]
-fn update_location_buyer_a_routes_to_home_over_m2pa() {
+fn update_location_customer_a_routes_to_home_over_m2pa() {
     let r = router();
     let tcap = tcap_begin(
         gsm_map::types::op_codes::UPDATE_LOCATION,
@@ -444,7 +443,7 @@ fn update_location_buyer_a_routes_to_home_over_m2pa() {
     let (dpc, udt) = parse_m2pa(&payload);
     let (called_ssn, cdpa, mut view) = view_from_udt(&udt);
     assert_eq!(view.operation, Some(Operation::UpdateLocation));
-    // The IMSI lives in the MAP arg; thread the synthetic buyer-a IMSI in.
+    // The IMSI lives in the MAP arg; thread the synthetic customer-a IMSI in.
     view.imsi = Some("001010000000042".into());
 
     let decision = r.route(&Inbound {
@@ -454,7 +453,7 @@ fn update_location_buyer_a_routes_to_home_over_m2pa() {
         view: Some(view),
     });
     match decision {
-        RouteDecision::RouteTo { dpc, ssn, via } => {
+        RouteDecision::RouteTo { dpc, ssn, via, .. } => {
             assert_eq!(dpc, 2005);
             assert_eq!(ssn, 6);
             // 2005 has no route in this node → destination unresolved (drop-worthy
@@ -466,7 +465,7 @@ fn update_location_buyer_a_routes_to_home_over_m2pa() {
 }
 
 #[test]
-fn send_auth_info_buyer_a_routes_to_home() {
+fn send_auth_info_customer_a_routes_to_home() {
     let r = router();
     let tcap = tcap_begin(
         gsm_map::types::op_codes::SEND_AUTHENTICATION_INFO,
@@ -496,7 +495,7 @@ fn send_auth_info_buyer_a_routes_to_home() {
 }
 
 #[test]
-fn cancel_location_buyer_a_routes_to_home() {
+fn cancel_location_customer_a_routes_to_home() {
     let r = router();
     let tcap = tcap_begin(
         gsm_map::types::op_codes::CANCEL_LOCATION,
@@ -637,7 +636,7 @@ fn gtt_route_on_gt_to_hlr() {
         view: None,
     });
     match decision {
-        RouteDecision::RouteTo { dpc, ssn, via } => {
+        RouteDecision::RouteTo { dpc, ssn, via, .. } => {
             assert_eq!(dpc, 2000);
             assert_eq!(ssn, 6);
             assert_eq!(via, Some(Destination::ApplicationServer("hlr".into())));

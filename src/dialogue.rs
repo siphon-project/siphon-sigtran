@@ -129,8 +129,8 @@ pub struct PeerTurn {
 
 /// A termination host: registered per (SSN, operation), it drives a dialogue.
 ///
-/// The phase-4 Python layer implements this over the `gsm_map` / `gsm_cap`
-/// decorators; phase-3 exercises it with small in-Rust handlers.
+/// The Python addon layer implements this over the `gsm_map` / `gsm_cap`
+/// decorators; the crate's tests exercise it with small in-Rust handlers.
 pub trait TerminationHandler: Send + Sync {
     /// A `Begin` opened a responder dialogue with this first operation. Drive the
     /// answer: `reply` + `end` for a single response, or `invoke` + `send` to
@@ -445,6 +445,10 @@ struct Inner {
 pub struct DialogueEngine {
     config: Tcap,
     handlers: HashMap<(u8, i64), Arc<dyn TerminationHandler>>,
+    /// Lower-priority handlers consulted only when no specific `handlers` entry
+    /// matches (a catch-all registered across a whole namespace). A specific
+    /// handler always wins over one of these, whichever registered first.
+    fallback_handlers: HashMap<(u8, i64), Arc<dyn TerminationHandler>>,
     inner: Mutex<Inner>,
 }
 
@@ -454,14 +458,30 @@ impl DialogueEngine {
         Self {
             config,
             handlers: HashMap::new(),
+            fallback_handlers: HashMap::new(),
             inner: Mutex::new(Inner::default()),
         }
     }
 
     /// Register a handler for one (SSN, operation) pair. Later registrations for
-    /// the same key win.
+    /// the same key win, and a specific handler always takes precedence over a
+    /// [`register_fallback`](Self::register_fallback) catch-all for the same key.
     pub fn register(&mut self, ssn: u8, operation_code: i64, handler: Arc<dyn TerminationHandler>) {
         self.handlers.insert((ssn, operation_code), handler);
+    }
+
+    /// Register a lower-priority catch-all handler for one (SSN, operation) pair.
+    /// It fires only when no specific [`register`](Self::register) handler matches
+    /// that key, so a bare `@ns.on_operation` never shadows an explicit
+    /// `on_operation("<name>")`, regardless of the order they registered in.
+    pub fn register_fallback(
+        &mut self,
+        ssn: u8,
+        operation_code: i64,
+        handler: Arc<dyn TerminationHandler>,
+    ) {
+        self.fallback_handlers
+            .insert((ssn, operation_code), handler);
     }
 
     /// The number of currently-open dialogues (deterministic per engine; the
@@ -550,7 +570,12 @@ impl DialogueEngine {
             );
         };
 
-        let Some(handler) = self.handlers.get(&(called_ssn, op)).cloned() else {
+        let handler = self
+            .handlers
+            .get(&(called_ssn, op))
+            .or_else(|| self.fallback_handlers.get(&(called_ssn, op)))
+            .cloned();
+        let Some(handler) = handler else {
             // No termination host for this subsystem/operation: refuse cleanly.
             metrics::abort(AbortSource::Local);
             return abort_now(

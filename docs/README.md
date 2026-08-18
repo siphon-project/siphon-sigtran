@@ -7,36 +7,35 @@ the SS7 codecs and every per-message routing decision in Rust.**
 `siphon-sigtran` turns a declarative `sigtran.yaml` into a running signalling
 node: SCTP transport (M3UA / M2PA), MTP3 routing, SCCP Global Title Translation
 with E.214/E.164 conversion, **content routing** on the decoded MAP/CAP layer,
-and MAP/CAP dialogue termination. The addon mounts `ss7`, `gsm_map` and
-`gsm_cap` namespaces into a SIPhon binary so your scripts program that node:
+and MAP/CAP dialogue termination. The addon mounts `ss7`, `gsm_map`, `gsm_cap`
+and `inap` namespaces into a SIPhon binary. The binary configures the node from
+your `sigtran.yaml` (`extensions.sigtran`); your script programs it:
 
 ```python
-import siphon
 from siphon import ss7, gsm_map
-
-siphon.configure("sigtran.yaml")   # a path, inline YAML, or a dict
 
 # 1. Program the Rust routing tables live (routing stays in Rust at line rate).
 ss7.routes.add(dpc=2000, linkset="transit", priority=3)
 ss7.gtt.add(match={"gt_prefix": "155502"}, to={"dpc": 2006, "ssn": 6})
 ss7.content.address_table("home-subs").add("15550199")
+ss7.content.add_rule(
+    name="steer-home-sri-sm",
+    match={"operation": "sri-sm", "cgpa_gt_in": "home-subs"},
+    action={"route": {"group": "ag-router"}},
+)
 
-# 2. Defer a config rule (action `{python: on_np_dip}`) to a hook.
-@ss7.content.on("on_np_dip")
-async def np_dip(msg):
-    return ss7.route(dpc=2006, ssn=6) if ported(msg.msisdn) else ss7.route_default()
-
-# 3. Terminate a MAP dialogue.
-@gsm_map.on_mo_forward_sm
+# 2. Terminate a MAP dialogue (name the operation; several take a pipe).
+@gsm_map.on_operation("mo-forward-sm")
 async def on_mo(dlg, arg):
     await forward_somewhere(arg.sm_rp_oa, arg.sm_rp_da, arg.sm_rp_ui)
     dlg.reply(gsm_map.mo_forward_sm_res())
     dlg.end()
 ```
 
-That is a scriptable SS7 node: static routing in config, live overrides and
-termination in Python. The worked recipes (a thin STP, an HLR, a
-store-and-forward SMSC, a CAMEL SCP) are in the [Cookbook](cookbook/index.md).
+That is a scriptable SS7 node: routing in config or programmed live from Python
+(the decision stays in Rust), termination in Python. The worked recipes (a thin
+STP, an HLR, a store-and-forward SMSC, a CAMEL SCP) are in the
+[Cookbook](cookbook/index.md).
 
 ## The boundary
 

@@ -29,6 +29,9 @@ pub struct TenantRuntime {
     pub variant: Variant,
     /// The tenant's own point code value (decimal).
     pub point_code: u32,
+    /// The Q.704 network-indicator value (0-3) the node stamps on messages it
+    /// originates (e.g. an SCCP message bridged in from a SUA peer).
+    pub network_indicator: u8,
     /// MTP3 route resolver.
     pub routes: RouteResolver,
     /// Live MTP3 availability state. Interior-mutable so the async transport can
@@ -113,6 +116,7 @@ impl Tenancy {
                     id: id.clone(),
                     variant: tenant.variant,
                     point_code,
+                    network_indicator: tenant.network_indicator.bits(),
                     routes,
                     route_state: RwLock::new(route_state),
                     gtt,

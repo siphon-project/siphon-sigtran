@@ -65,9 +65,9 @@ bytes.
 import tpdu
 from siphon import ss7, gsm_map
 
-OUR_GT = b"\x91\x15\x55\x01\x00"          # our E.164 address, TBCD
+OUR_GT = "15550100"                       # our E.164 address (+1 555 0100)
 
-@gsm_map.on_mo_forward_sm
+@gsm_map.on_operation("mo-forward-sm")
 async def on_mo(dlg, arg):
     # arg.sm_rp_ui is the opaque RP-DATA carrying an SMS-SUBMIT. tpdu decodes it.
     rp = tpdu.parse_rp_data(arg.sm_rp_ui)
@@ -85,82 +85,24 @@ TPDU that arrives without the RP wrapper (an SMPP `submit_sm`, or a bare
 `sm-RP-UI`) parses just as well with `tpdu.parse_sms_submit(...)` /
 `tpdu.destination_from_tpdu(...)`.
 
-## Originate multi-segment MT delivery
+## Mobile-terminated delivery
 
-Delivering a mobile-terminated message is two dialogues. First an **SRI-SM** to
-the HLR to learn the subscriber's IMSI and serving MSC; then **one** MT dialogue
-to that MSC, held open across the segments of a concatenated message, with
-`moreMessagesToSend` set on all but the last.
+Terminating mobile-originated SMS (above) runs on the wire today. Delivering a
+mobile-**terminated** message is the other half of a store-and-forward SMSC, and
+it **originates** dialogues: an SRI-SM to the HLR to learn the subscriber's IMSI
+and serving MSC, then one MT-ForwardSM dialogue to that MSC held open across the
+segments of a concatenated message. The node opens a dialogue it initiates and
+awaits the peer's response over SCTP with `gsm_map.begin(...)` for a single
+request/response, or `node.originate(...)` with an `on_reply(dlg, peer)` callback
+for a multi-leg delivery (segment 1 with `moreMessagesToSend`, the ack, segment
+2, the closing End). A terminate-only SMSC front end (decode, screen, spool, ack
+the MO leg) works equally well.
 
 The SMS-DELIVER TPDUs, including the User-Data-Header that ties the segments
-together, are built with `tpdu`. moreMessagesToSend and the dialogue lifetime
-are siphon-sigtran's job.
-
-The SMS-DELIVER segments are built by a small helper that calls `tpdu`. It packs
-the body (`pack_gsm7`), builds each SMS-DELIVER, writes the concatenation
-User-Data-Header for a multi-segment message, and wraps each in an RP-DATA
-Network->MS, all TS 23.040 / TS 23.038 / TS 24.011 work that belongs to `tpdu`:
-
-```python
-def sms_deliver_segments(sender_msisdn, text):
-    """Return one or more RP-DATA(SMS-DELIVER) byte strings for `text`."""
-    oa = tpdu.Address(sender_msisdn, ton=1, npi=1)
-
-    # Short message: one SMS-DELIVER, no UDH. The builder packs the body and
-    # sets the septet TP-UDL for you.
-    if len(text) <= 160:
-        deliver = tpdu.SmsDeliver.builder(oa).gsm7_text(text).dcs(0x00).build()
-        return [tpdu.RpDataNetworkToMs(deliver).encode()]
-
-    # Concatenated: split into segments, each carrying the 8-bit concat IE
-    # (05 00 03 <ref> <total> <seq>). The full split is in examples/smsc.py.
-    return _concat_segments(oa, text)
-```
-
-The `RpDataNetworkToMs(...).encode()` is what MAP calls the `sm-RP-UI`: the RPDU
-that carries the SMS-DELIVER. The delivery itself is one MAP dialogue held open
-across those segments:
-
-```python
-async def deliver_mt(recipient_msisdn, sender_msisdn, text):
-    # 1. Ask the HLR where the subscriber is (routed by GTT to the HLR).
-    res = await gsm_map.send_routing_info_for_sm(msisdn=recipient_msisdn, sc_addr=OUR_GT)
-    imsi, msc = res.imsi, res.network_node_number
-
-    # 2. Build the RP-DATA(SMS-DELIVER) segments with tpdu.
-    segments = sms_deliver_segments(sender_msisdn, text)
-
-    # 3. ONE MT dialogue to the serving MSC, held open across segments.
-    dlg = gsm_map.begin(to=ss7.gt(msc), ssn=8, ac=gsm_map.AC.short_msg_mt_relay)
-    last = len(segments) - 1
-    for i, seg in enumerate(segments):
-        dlg.invoke(gsm_map.mt_forward_sm(
-            imsi=imsi,
-            sc_addr=OUR_GT,
-            tpdu=seg,                                # RP-DATA(SMS-DELIVER) bytes from tpdu
-            more_messages_to_send=(i != last),
-        ))
-        dlg.send() if i != last else dlg.end()       # Continue while more, End on the last
-        await dlg.result()                           # await this segment's returnResultLast
-```
-
-Two things are worth calling out:
-
-- **One dialogue, many segments.** `gsm_map.begin` opens the MT dialogue once;
-  the loop stages an MT-ForwardSM invoke per segment and flushes with `send`
-  (keep it open) or `end` (close on the last). `moreMessagesToSend` is a flag on
-  the invoke builder, so the serving MSC knows more is coming and keeps the
-  radio connection up.
-- **`tpdu` owns the concatenation.** Splitting the message into segments and
-  writing the UDH concatenation IE is `tpdu`'s work (TS 23.040). siphon-sigtran
-  never inspects the bytes; it carries them and sequences the dialogue.
-
-!!! note "Awaitables need the live node"
-    `await gsm_map.send_routing_info_for_sm(...)` and `await dlg.result()`
-    drive the SCTP transport the composing siphon binary owns. In-process
-    termination (the MO handler above) needs no transport and can be exercised
-    with [`node.deliver`](../script-api.md#node); origination needs the running
-    node. See [Script API](../script-api.md#dialogue).
+together, are built with `tpdu` (TS 23.040 / TS 23.038 / TS 24.011);
+`moreMessagesToSend` and the dialogue lifetime are siphon-sigtran's job.
+siphon-sigtran never inspects the SMS bytes; it carries them and sequences the
+dialogue.
 
 ## From here to production
 

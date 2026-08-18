@@ -3,8 +3,8 @@
 A SIGTRAN/SS7 runtime that turns a declarative `sigtran.yaml` into a running
 signalling node. It does not reimplement the SS7 codecs; it composes the
 published ones and adds the parts a node needs on top of them: a config model, a
-routing brain, an SCTP transport (M3UA / M2PA), and (in a later phase) MAP/CAP
-dialogue termination.
+routing brain, an SCTP transport (M3UA / M2PA), and MAP/CAP dialogue
+termination.
 
 ## The stack
 
@@ -13,7 +13,7 @@ dialogue termination.
    │  content routing        routes/screens on the decoded MAP/CAP    │  src/content.rs
    │                         application layer                        │
    ├────────────────────────────────────────────────────────────────┤
-   │  MAP / CAP termination  dialogue SAP (phase-4)                   │  src/dialogue.rs
+   │  MAP / CAP termination  dialogue SAP                             │  src/dialogue.rs
    │      gsm_map · gsm_cap  operation arguments (BER)                │
    ├────────────────────────────────────────────────────────────────┤
    │  TCAP                   transactions + components (Q.773)         │  tcap
@@ -36,10 +36,10 @@ dialogue termination.
 | M3UA / M2PA | `m3ua`, `m2pa` | the transport serving loop, handshake/alignment, and linkset state |
 | SCTP | `async-sctp` | the association binding + demux |
 | SCCP addresses/GTT/UDT | `sccp` | the GTT rule engine + E.214/E.164 converter |
-| TCAP | `tcap` | (phase-4) the dialogue coordinator |
+| TCAP | `tcap` | the dialogue coordinator |
 | MAP / CAMEL operations | `gsm_map`, `gsm_cap` | the decoded view content routing matches on |
 
-## The routing brain (phase 1)
+## The routing brain
 
 Everything the node decides per message lives in Rust and runs synchronously with
 no I/O. That is the throughput guarantee. The flow for an inbound message:
@@ -49,13 +49,13 @@ no I/O. That is the throughput guarantee. The flow for an inbound message:
    (implicit adjacent route, then explicit routes by priority), or the message is
    dropped when there is no route.
 2. **Content routing.** When the MAP/CAP layer has been decoded, an ordered
-   first-match rule set can route, rewrite, screen, or defer to a hook. It runs
+   first-match rule set can route, rewrite the called-party GT, or screen. It runs
    before GTT because it decides on the richer application layer.
 3. **SCCP GTT.** Otherwise the called-party global title is translated (after an
    E.214 to E.164 pre-step) to a concrete destination, a group member, or local
    termination.
 
-## The transport (phase 2)
+## The transport
 
 `TransportHandle::start` turns the config into a running node over real kernel
 SCTP: it binds/connects each association, runs the M3UA ASPSM/ASPTM handshake or
@@ -66,9 +66,13 @@ route as ASPs/links come and go. Transfer is Service-Indicator-agnostic (any
 non-SCCP MSU transits by DPC), and two loop guards (own-opc, route-reflect)
 drop-and-count a looping MSU into `sigtran_loops_detected_total`.
 
-## What is deferred
+## MAP/CAP termination
 
-The MAP/CAP dialogue-termination SAP (`src/dialogue`) is a trait skeleton
-(phase-4); local-termination decisions are already handed to it over the
-transport's local-delivery channel. The Python bindings are phase-3. The `sua`
-adaptation stays reserved (parsed, but refused at start).
+Messages addressed to a subsystem the node owns terminate in the dialogue SAP
+(`src/dialogue`): a synchronous TCAP transaction engine that decodes the MAP
+(TS 29.002) / CAP (TS 29.078) operation, drives the dialogue, and dispatches it
+to a registered handler. It composes with the async transport the same way the
+routing brain does. The Python addon face (`src/python`) exposes the whole
+surface, routing brain and termination alike, to a siphon script.
+
+The `sua` adaptation stays reserved: parsed from config, refused at start.

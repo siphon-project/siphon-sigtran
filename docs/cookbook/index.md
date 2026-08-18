@@ -43,12 +43,11 @@ These show up across the recipes:
 
 - **Program tables at load, not per message.** `ss7.routes.add`,
   `ss7.gtt.add`, `ss7.content.add_rule` and `ss7.content.address_table(...).add`
-  run when the script loads and keep the decision in Rust afterward. This is the
-  preferred override style; it costs nothing per MSU.
-- **Defer only what the tables can't answer.** A hook (`@ss7.content.on`) puts
-  Python on the hot path for the messages its rule matches. Use it for live
-  dips (number portability, per-subscriber steering), and write the answer back
-  with `ss7.routes.cache(...)` so the next MSU routes in Rust.
+  run when the script loads and keep the decision in Rust afterward; they cost
+  nothing per MSU.
+- **Cache an external answer once.** When routing needs a live source (number
+  portability, per-subscriber steering), dip it and write the answer back with
+  `ss7.routes.cache(...)`, so the next MSU for that GT routes in Rust.
 - **Stage then flush.** A termination handler stages components on the
   [`Dialogue`](../script-api.md#dialogue) (`reply` / `invoke` / `error`) and
   flushes with `send` (continue) or `end` (close). The engine builds the wire

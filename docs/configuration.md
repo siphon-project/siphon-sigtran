@@ -2,12 +2,11 @@
 
 One file, `sigtran.yaml`, describes the node: its point code, the SCTP
 transport plane, the MTP3 route table, the SCCP/GTT tables, and the
-content-routing rules. The addon loads it with
-[`siphon.configure(...)`](script-api.md#configure) (a path, an inline YAML
-string, or a dict); a pure-Rust embedding loads the same file with
-`Config::load`. Parsing **validates** the whole file: dangling references,
-duplicate names, point codes out of range for the variant, and unknown
-operation names are rejected at load, not at 3 am.
+content-routing rules. The composing siphon binary loads it at startup (you
+point `extensions.sigtran` at it; see
+[Using it in a SIPhon build](integration.md)). Parsing **validates** the whole
+file: dangling references, duplicate names, point codes out of range for the
+variant, and unknown operation names are rejected at load, not at 3 am.
 
 A complete annotated example (every value synthetic: test PLMN 001/01,
 `+1-555-01xx` global titles, decimal point codes):
@@ -34,7 +33,7 @@ application_servers:
 # M2PA linksets (RFC 4165): links grouped toward an adjacent PC. SLS spreads
 # traffic across the links, so there is no traffic mode here.
 linksets:
-  - { name: transit, links: [{assoc: xit-1, slc: 0}] }
+  - { name: transit, links: [{assoc: xit-1}] }
 
 # MTP3 routes: dpc -> an AS or a linkset, priority (1 = primary, higher =
 # alternate). The adjacent PC of an m2pa link (3000) is an implicit route.
@@ -55,8 +54,6 @@ sccp:
   gt_conversion:
     plmn_map:
       - { mcc: "001", mnc: "01", e164_prefix: "15551" }
-    rules:
-      - { name: e214-in, match: {np: e214}, action: {to_e164_via: plmn_map} }
 
 # Content routing: routes/screens on the decoded MAP layer.
 content_routing:
@@ -69,9 +66,9 @@ content_routing:
     - name: customer-a-home
       match:  { operation: [update-location, send-auth-info, cancel-location], imsi_in: customer-a }
       action: { route: {dpc: 2005, ssn: 6} }
-    - name: sri-sm-np
+    - name: sri-sm-route
       match:  { operation: sri-sm }
-      action: { python: on_np_dip }
+      action: { route: {dpc: 2000, ssn: 6} }
 ```
 
 ## `node` { #node }
@@ -100,9 +97,9 @@ The SCTP transport plane: one entry per association.
 | `port` | *(required)* | SCTP port. Convention: 2905 for M3UA, 3565 for M2PA. |
 | `adjacent_pc` | *(m2pa only)* | The adjacent point code reached directly over this link. An adjacent PC is an **implicit route**; it needs no `mtp3_routes` entry. |
 
-The value `sua` is accepted by the parser as a reserved adaptation so a plan
-can name it, but no SUA transport exists in this release; starting a node with
-a `sua` association returns a clear "not implemented".
+The value `sua` selects SUA (RFC 3868) for connectionless SCCP-user traffic:
+like `m3ua` it terminates SCTP and feeds the SCCP messages this node routes and
+terminates onto the same path. (SUA connection-oriented service is out of scope.)
 
 ## `application_servers` { #application-servers }
 
@@ -127,7 +124,7 @@ here.
 | Field | Meaning |
 |---|---|
 | `name` | Linkset name, referenced by `mtp3_routes` (`linkset:`). |
-| `links` | The member links: `{assoc, slc}`. Each `assoc` must be an `m2pa` association; its adjacent PC comes from the association's `adjacent_pc`. |
+| `links` | The member links, each `{assoc}`. Each `assoc` must be an `m2pa` association; its adjacent PC comes from the association's `adjacent_pc`. |
 
 ## `mtp3_routes` { #mtp3-routes }
 
@@ -174,17 +171,14 @@ The ordered translation rules. First match wins.
 
 ### `gt_conversion` { #gt-conversion }
 
-E.214 (mobile global title) to E.164 conversion and back. Roaming MAP
-addresses an HLR with an E.214 called party: the home network's E.164 prefix
-(mapped from the IMSI's MCC+MNC) plus the MSIN. The converter runs **before**
-GTT inbound, and can build the E.214 form outbound.
+E.214 (mobile global title) to E.164 conversion. Roaming MAP addresses an HLR
+with an E.214 called party: the home network's E.164 prefix (mapped from the
+IMSI's MCC+MNC) plus the MSIN. The converter runs the E.214→E.164 pre-step
+**before** GTT on an inbound called party whose numbering plan marks it E.214.
 
 - **`plmn_map`**: the network numbering map, `{mcc, mnc, e164_prefix}` entries.
-- **`rules`**: ordered, each `{name, match, action}`:
-    - `match.np`: `e214` or `e164`;
-    - `match.addressing`: optional hint, e.g. `imsi` for the outbound
-      E.164-to-E.214 case;
-    - `action`: `to_e164_via` or `to_e214_via`, naming the map (`plmn_map`).
+  An E.214 called party matched to a `plmn_map` prefix is rewritten to its E.164
+  form, then translated by GTT.
 
 ## `tcap` { #tcap }
 
@@ -233,9 +227,34 @@ The `action` is one of:
 | Action | Meaning |
 |---|---|
 | `route` | To `{dpc, ssn}` or `{group: ...}`. |
-| `rewrite_cdpa_gt` | Rewrite the called-party GT digits before forwarding (may be combined with `route`; alone, the rewrite applies and the message falls through to GTT). |
+| `rewrite_cdpa_gt` | Rewrite the called-party GT digits on the egress SCCP before relay (combined with `route`). |
 | `screen` | `true` drops the message (counted per rule). |
-| `python` | Defer to a named script hook registered with [`@ss7.content.on(name)`](script-api.md#hooks). |
+
+## `isup_screening` { #isup-screening }
+
+Optional ISUP-aware screening on the SI=5 transit path. When the block is absent
+the transit path is byte-for-byte unchanged; when present, each transiting ISUP
+message is decoded and evaluated against the ordered rules (first match wins). A
+`block` drops the message and counts it under `sigtran_isup_screened_total`.
+
+```yaml
+sccp: { local_ssns: [] }
+isup_screening:
+  default: allow                    # action when no rule matches (default: allow)
+  rules:
+    - { name: block-premium, match: { message_type: iam, called_prefix: "1999" }, action: block }
+```
+
+| Field | Meaning |
+|---|---|
+| `default` | Action for a message no rule matches: `allow` (default) or `block`. |
+| `rules` | Ordered `{name, match, action}`; first match wins. |
+| `match.message_type` | ISUP message by its lower-case Q.763 acronym (`iam`, `rel`, `acm`, …). |
+| `match.called_prefix` / `calling_prefix` | Leading-digit prefix of the called / calling party number. |
+| `action` | `block` (drop) or `allow` (explicitly pass). |
+
+All present `match` fields must hold (AND); absent fields are wildcards. A
+message that will not decode as ISUP takes the `default` action.
 
 ## How the pieces connect
 

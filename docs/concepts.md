@@ -1,7 +1,7 @@
 # Concepts & architecture
 
 siphon-sigtran is a **library** that adds an SS7 runtime and the `ss7` /
-`gsm_map` / `gsm_cap` namespaces to a [SIPhon](https://siphon-sip.org/) binary.
+`gsm_map` / `gsm_cap` / `inap` namespaces to a [SIPhon](https://siphon-sip.org/) binary.
 This page explains the model you program against: the stack, the routing cost
 ladder, where Rust ends and Python begins, and how a message travels through
 the node.
@@ -67,12 +67,12 @@ Two consequences worth internalising:
   subscriber's MCC+MNC is the leading digits of the E.214 called party, so
   "everything for network X goes to Y" is a GTT prefix rule. Save content
   rules for decisions that genuinely need the decoded IMSI or operation.
-- **A hook is a scalpel.** A deferred rule (`action: {python: ...}`) puts
-  Python on the hot path *for the messages that rule matches* and nothing
-  else. The general override `@ss7.on_route(when=...)` is gated by its
-  selector for the same reason. Drop the selector and every routing decision
-  waits on your coroutine; fine for a low-volume HLR, ruinous for a transit
-  STP.
+- **Program routing from Python, but keep the decision in Rust.** A script
+  programs the routing tables live (`ss7.routes` / `ss7.gtt` / `ss7.content`) at
+  load time, or caches a translation with `ss7.routes.cache(...)`, so every
+  per-MSU decision then runs in Rust at line rate with no coroutine on the hot
+  path. Save content rules for decisions that genuinely need the decoded IMSI or
+  operation; steer whole networks with a GTT prefix instead.
 
 Hooks that dip an external database should write the answer back with
 `ss7.routes.cache(...)`, so the next message for that GT routes in Rust

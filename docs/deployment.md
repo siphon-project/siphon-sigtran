@@ -2,7 +2,7 @@
 
 !!! warning "A library, not a runnable product"
     siphon-sigtran is a Rust **library** that plugs the `ss7` / `gsm_map` /
-    `gsm_cap` namespaces and an SS7 runtime into a
+    `gsm_cap` / `inap` namespaces and an SS7 runtime into a
     [SIPhon](https://siphon-sip.org/) binary **you** build and compose. There is
     no siphon-sigtran server to run on its own. Everything here is parameterised
     on *your* image and *your* binary crate; see
@@ -12,7 +12,7 @@
 
 A signalling node built on siphon-sigtran needs, in the runtime image:
 
-- **Your composing siphon binary** (the one that calls `register` at startup).
+- **Your composing siphon binary** (the one that calls `configure_from` + `register` at startup).
 - **libpython** for the embedded interpreter pyo3 runs, present in the runtime
   image.
 - **Your script** (`ss7.py` or whatever you name it) mounted at runtime so
@@ -50,13 +50,15 @@ consequences for any deployment:
 
 ## Wiring config
 
-Two ways, combinable, both covered in [Configuration](configuration.md):
+The composing siphon binary loads `sigtran.yaml` at startup: point
+`extensions.sigtran` at it in your main `siphon.yaml` (see
+[Configuration](configuration.md) and [Using it in a SIPhon build](integration.md)).
 
-1. **File**: `sigtran.yaml`, passed to
-   [`siphon.configure(...)`](script-api.md#configure) as a path.
-2. **Inline / dict**: build the config in the script (a dict or an inline YAML
-   string) and pass it to `configure`, for a node whose topology is computed at
-   startup.
+```yaml
+# siphon.yaml
+extensions:
+  sigtran: /etc/siphon/sigtran.yaml
+```
 
 The associations, routes, GTT, and content rules all reload with the script, so
 editing the config and letting SIPhon reload takes effect without a restart.

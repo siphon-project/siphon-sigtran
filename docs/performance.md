@@ -42,23 +42,23 @@ Three layers, in rising cost, and where each runs:
 | MTP3 transit (route by DPC) | ~28 ns | Rust |
 | SCCP GTT / E.214 conversion | ~40 ns | Rust |
 | content-rule match on the decoded view | ~50 ns | Rust |
-| a deferred Python hook | microseconds and up | your coroutine |
 
-The first three are the hot path for a transit STP and they are pure Rust. The
-only way to put Python on the per-message path is to **defer a rule to a hook**;
-everything else, including programming the routing tables live from a script,
-keeps the decision in Rust. See [the cost ladder](concepts.md#the-cost-ladder).
+Every per-message routing decision is pure Rust. A script shapes routing from
+Python at load time by programming the tables (`ss7.routes` / `ss7.gtt` /
+`ss7.content`), so no coroutine sits on the per-message path.
 
-## Keeping a hook off the hot path
+## Keeping Python off the hot path
 
-A hook is a scalpel, not a default:
+Program the routing tables once, at script load, and let the decision run in
+Rust:
 
-- A **deferred rule** (`action: {python: ...}`) runs the hook only for the
-  messages that rule matches. Dip an external source once, then write the answer
-  back with `ss7.routes.cache(...)` so later messages for that GT route in Rust.
-- A **general override** (`@ss7.on_route(when=...)`) is gated by its selector.
-  Keep the selector tight. Drop it and the hook sees every decision, which caps
-  a transit node at the interpreter.
+- Add routes, GTT rules, and content rules live with `ss7.routes.add` /
+  `ss7.gtt.add` / `ss7.content.add_rule`; they prepend over the static config.
+- When an answer comes from an external source, dip it once and write it back
+  with `ss7.routes.cache(...)`, so later messages for that GT route in Rust.
+
+Termination handlers (`@gsm_map.on_operation`) do run per dialogue, but they fire
+only for messages addressed to a subsystem the node owns, not on the transit path.
 
 The metric families make this visible: watch `sigtran_content_rule_hits_total`
 by rule and action. If a `python`-action rule's hit rate tracks your MSU rate,

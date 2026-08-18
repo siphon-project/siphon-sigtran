@@ -5,39 +5,41 @@
 //! `siphon-smpp` and `siphon-http` are.
 //!
 //! Compiled only with `--features python`; the default crate build pulls neither
-//! pyo3 nor siphon, so consumers of the pure-Rust routing brain stay lean. The
-//! single seam is [`register`]: a composing siphon binary calls it at startup to
-//! mount the `ss7` / `gsm_map` / `gsm_cap` / `inap` namespaces (plus `configure` /
-//! `metrics` and the shared types) onto the `siphon` package module, so scripts
-//! import them with `from siphon import ss7, gsm_map, gsm_cap, inap`.
+//! pyo3 nor siphon. Two seams a composing siphon binary calls at startup: it
+//! reads its `extensions.sigtran` config and calls [`configure_from`] to build
+//! the process-wide node, and it calls [`register`] to mount the `ss7` /
+//! `gsm_map` / `gsm_cap` / `inap` namespaces (plus `metrics` and the shared
+//! types) onto the `siphon` package module, so scripts import them with
+//! `from siphon import ss7, gsm_map, gsm_cap, inap`.
 //!
 //! # The model
 //!
 //! One process-wide [`node`] holds the routing tables (a [`Router`], live via
-//! `ss7.routes` / `ss7.gtt` / `ss7.content`), the [`DialogueEngine`], and the
-//! Python hook tables. [`configure`] (re)builds it from a `sigtran.yaml`, so a
-//! script configures the node first, then programs it.
+//! `ss7.routes` / `ss7.gtt` / `ss7.content`) and the [`DialogueEngine`]. The
+//! binary configures it ([`configure_from`]); the script then programs it.
+//! [`configure`] is the in-process seam that rebuilds the node from a
+//! `sigtran.yaml` for loopback tests (it returns a [`Node`] round-trip handle),
+//! not a live-script entrypoint.
 //!
-//! * **Routing** stays in Rust at line rate. Python overrides it three ways:
-//!   program the tables live, defer a rule to a named hook
-//!   (`@ss7.content.on(name)`), or take a selector-gated general hook
-//!   (`@ss7.on_route(when=...)`). The decision constructors (`ss7.route`,
-//!   `ss7.drop`, `ss7.route_default`, `ss7.allow`) build a [`Decision`] the
-//!   async override layer resolves.
-//! * **Termination** registers a Python handler per MAP/CAP/INAP operation
-//!   (`@gsm_map.on_mo_forward_sm`, `@gsm_cap.on_initial_dp`,
-//!   `@inap.on_initial_dp`, …). When a dialogue
-//!   terminates, the handler drives a [`PyDialogue`] handle (`invoke` / `reply` /
-//!   `send` / `end`). An `async def` handler runs to completion on an asyncio
-//!   loop, mirroring how a handler runs on siphon's runtime.
+//! * **Routing** stays in Rust at line rate. A script programs the routing tables
+//!   live at load (`ss7.routes` / `ss7.gtt` / `ss7.content`); static content rules
+//!   route, rewrite the called-party GT, or screen on the decoded MAP/CAP layer.
+//! * **Termination** registers a Python handler for one or more MAP/CAP/INAP
+//!   operations, named by their kebab-case operation names on a single
+//!   per-namespace decorator (`@gsm_map.on_operation("mo-forward-sm")`,
+//!   `@gsm_cap.on_operation("initial-dp")`, `@inap.on_operation("initial-dp")`),
+//!   the same `on_<message>("<name>")` shape the sibling addons use
+//!   (`@proxy.on_request`, `@smpp.on_pdu`). When a dialogue terminates, the
+//!   handler drives a [`PyDialogue`] handle (`invoke` / `reply` / `send` /
+//!   `end`). An `async def` handler runs to completion on an asyncio loop,
+//!   mirroring how a handler runs on siphon's runtime.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule, PyModuleMethods};
+use pyo3::types::{PyBytes, PyDict, PyModule, PyModuleMethods, PyString, PyTuple};
 
 use rasn::types::{OctetString, Oid};
 use sccp::{GlobalTitle, SccpAddress, SccpMessage, SubsystemNumber, UnitData};
@@ -47,15 +49,20 @@ use tcap::{
     ReturnResultValue, TcapMessage,
 };
 
+use tokio::sync::{mpsc, oneshot};
+
+use siphon::script::ScriptHandle;
+
 use crate::config::{Config, ContentRule, GttRule, DEFAULT_TENANT};
-use crate::content::{ContentEngine, MapView as CoreMapView, Operation};
+use crate::content::{ContentEngine, Operation};
 use crate::dialogue::{
-    Dialogue as CoreDialogue, DialogueEngine, IncomingOp as CoreIncomingOp, PeerComponent,
-    PeerTurn, TerminationHandler,
+    Dialogue as CoreDialogue, DialogueEngine, IncomingOp as CoreIncomingOp, OutgoingBegin,
+    PeerComponent, PeerTurn, TerminationHandler,
 };
 use crate::mtp3::route::Destination;
 use crate::routing::Router;
 use crate::transport::framing::{Msu, SI_SCCP};
+use crate::transport::{Origination, TransportHandle};
 
 // ── Error ────────────────────────────────────────────────────────────────────
 create_exception!(
@@ -67,6 +74,40 @@ create_exception!(
 
 fn err(msg: impl std::fmt::Display) -> PyErr {
     SigtranError::new_err(msg.to_string())
+}
+
+// ── Address arguments (digit string or raw bytes) ────────────────────────────
+// The MAP/CAP builders take addresses as a digit string, encoded here with the
+// published codecs (the same convention as `ss7.gt`), or as already-encoded
+// bytes passed straight through (e.g. a value decoded off the wire).
+
+/// An ISDN-AddressString / AddressString: a digit string encoded as an
+/// international E.164 number, or raw bytes.
+fn isdn_addr(v: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(s) = v.cast::<PyString>() {
+        gsm_map::address::international_e164(&s.extract::<String>()?).map_err(err)
+    } else {
+        v.extract::<Vec<u8>>()
+    }
+}
+
+/// An IMSI: a digit string (TBCD-encoded), or raw bytes.
+fn imsi_arg(v: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(s) = v.cast::<PyString>() {
+        gsm_map::address::imsi(&s.extract::<String>()?).map_err(err)
+    } else {
+        v.extract::<Vec<u8>>()
+    }
+}
+
+/// A Q.763 Called Party Number: a digit string encoded as an international E.164
+/// number, or raw bytes.
+fn called_party(v: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(s) = v.cast::<PyString>() {
+        inap::address::international_e164(&s.extract::<String>()?).map_err(err)
+    } else {
+        v.extract::<Vec<u8>>()
+    }
 }
 
 /// Encode a MAP result struct to BER and stage it as a `ReturnResultLast` for
@@ -96,19 +137,15 @@ type Triplet = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 // ── Node state ───────────────────────────────────────────────────────────────
 
-/// Everything a scriptable node owns: the routing tables, the termination
-/// engine, and the Python hook tables. Interior-mutable so the `ss7` /
-/// `gsm_map` / `gsm_cap` namespace singletons can all drive one node.
+/// Everything a scriptable node owns: the routing tables and the termination
+/// engine. Interior-mutable so the `ss7` / `gsm_map` / `gsm_cap` / `inap`
+/// namespace singletons can all drive one node.
 struct NodeState {
     router: Mutex<Router>,
     engine: Mutex<DialogueEngine>,
     tenant: String,
     /// The subsystems we own; a termination decorator registers on each.
     local_ssns: Vec<u8>,
-    /// Deferred content hooks by name (`@ss7.content.on(name)`).
-    content_hooks: Mutex<HashMap<String, Py<PyAny>>>,
-    /// General route hooks (`@ss7.on_route(when=...)`), in registration order.
-    route_hooks: Mutex<Vec<(String, Py<PyAny>)>>,
 }
 
 impl NodeState {
@@ -122,8 +159,6 @@ impl NodeState {
             engine: Mutex::new(DialogueEngine::new(cfg.tcap.clone())),
             tenant: DEFAULT_TENANT.to_string(),
             local_ssns,
-            content_hooks: Mutex::new(HashMap::new()),
-            route_hooks: Mutex::new(Vec::new()),
         }
     }
 
@@ -262,119 +297,6 @@ fn gt_address(digits: &str, ssn: Option<u8>) -> SccpAddress {
     SccpAddress::with_gt(gt, ssn.map(SubsystemNumber::from_u8))
 }
 
-// ── Routing decision ─────────────────────────────────────────────────────────
-
-/// A routing decision a hook returns: route onward, drop, defer to the static
-/// tables (`route_default`), or pass a screen (`allow`).
-#[pyclass(name = "RouteDecision", module = "siphon", skip_from_py_object)]
-#[derive(Clone)]
-pub struct Decision {
-    #[pyo3(get)]
-    kind: String,
-    #[pyo3(get)]
-    dpc: Option<u32>,
-    #[pyo3(get)]
-    ssn: Option<u8>,
-    #[pyo3(get)]
-    linkset: Option<String>,
-    #[pyo3(get)]
-    tenant: Option<String>,
-    #[pyo3(get)]
-    reason: Option<String>,
-}
-
-#[pymethods]
-impl Decision {
-    fn __repr__(&self) -> String {
-        format!(
-            "RouteDecision(kind={}, dpc={:?}, ssn={:?}, linkset={:?}, tenant={:?}, reason={:?})",
-            self.kind, self.dpc, self.ssn, self.linkset, self.tenant, self.reason
-        )
-    }
-}
-
-impl Decision {
-    fn bare(kind: &str) -> Self {
-        Decision {
-            kind: kind.to_string(),
-            dpc: None,
-            ssn: None,
-            linkset: None,
-            tenant: None,
-            reason: None,
-        }
-    }
-}
-
-// ── Decoded MAP/CAP view (content + route hooks) ─────────────────────────────
-
-/// A read-only decoded MAP/CAP view handed to a content / route hook.
-#[pyclass(name = "MapView", module = "siphon", skip_from_py_object)]
-#[derive(Clone, Default)]
-pub struct PyMapView {
-    #[pyo3(get)]
-    operation: Option<String>,
-    #[pyo3(get)]
-    cgpa_gt: Option<String>,
-    #[pyo3(get)]
-    cdpa_gt: Option<String>,
-    #[pyo3(get)]
-    imsi: Option<String>,
-    #[pyo3(get)]
-    msisdn: Option<String>,
-    #[pyo3(get)]
-    opc: Option<u32>,
-    #[pyo3(get)]
-    dpc: Option<u32>,
-}
-
-#[pymethods]
-impl PyMapView {
-    #[new]
-    #[pyo3(signature = (*, operation=None, cgpa_gt=None, cdpa_gt=None, imsi=None, msisdn=None, opc=None, dpc=None))]
-    fn new(
-        operation: Option<String>,
-        cgpa_gt: Option<String>,
-        cdpa_gt: Option<String>,
-        imsi: Option<String>,
-        msisdn: Option<String>,
-        opc: Option<u32>,
-        dpc: Option<u32>,
-    ) -> Self {
-        PyMapView {
-            operation,
-            cgpa_gt,
-            cdpa_gt,
-            imsi,
-            msisdn,
-            opc,
-            dpc,
-        }
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "MapView(operation={:?}, cgpa_gt={:?}, cdpa_gt={:?}, imsi={:?}, msisdn={:?})",
-            self.operation, self.cgpa_gt, self.cdpa_gt, self.imsi, self.msisdn
-        )
-    }
-}
-
-impl PyMapView {
-    /// The content-engine view, used when a hook consults the Rust tables. Kept
-    /// so a future async override layer can evaluate against the same rules.
-    #[allow(dead_code)]
-    fn to_core(&self) -> CoreMapView {
-        CoreMapView {
-            operation: self.operation.as_deref().and_then(Operation::from_kebab),
-            cgpa_gt: self.cgpa_gt.clone(),
-            cdpa_gt: self.cdpa_gt.clone(),
-            imsi: self.imsi.clone(),
-            msisdn: self.msisdn.clone(),
-        }
-    }
-}
-
 // ── Staged components ────────────────────────────────────────────────────────
 
 /// A staged `Invoke` produced by an originating helper (`gsm_map.mt_forward_sm`,
@@ -450,8 +372,8 @@ impl PyIncomingOp {
     }
 
     /// The `serviceKey` of an INAP CS-1 initialDP, if decoded: the IN service
-    /// logic the SSF triggered on (an `@inap.on_initial_dp` handler keys its
-    /// service selection on it).
+    /// logic the SSF triggered on (an `@inap.on_operation("initial-dp")` handler
+    /// keys its service selection on it).
     #[getter]
     fn inap_service_key(&self) -> Option<i64> {
         let bytes = self.argument.as_ref()?;
@@ -797,19 +719,6 @@ impl PyDialogue {
         PyBytes::new(py, &self.dtid)
     }
 
-    /// Await this leg's result. Originating multi-leg flows use it to wait for a
-    /// segment's `returnResultLast`. It returns an awaitable bridged onto tokio
-    /// (the same shape the sibling addons' send helpers use); awaiting it needs a
-    /// running node (a live SCTP transport driven by a siphon binary), so without
-    /// one it resolves to that error.
-    fn result<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Err::<(), PyErr>(err(
-                "dlg.result() needs a running node (a live SCTP transport driven by a siphon binary)",
-            ))
-        })
-    }
-
     fn __repr__(&self) -> String {
         format!(
             "Dialogue(otid={}, dtid={})",
@@ -952,6 +861,184 @@ impl TerminationHandler for PyHandler {
     }
 }
 
+// ── Origination (a dialogue the node initiates) ──────────────────────────────
+
+/// The process-wide origination seam: the sender half of the transport's
+/// [`Origination`] channel, populated by [`task`] once the transport is up. A
+/// script's `begin(...)` helper pushes onto it; before the node is up it is
+/// absent, so `begin` fails fast with a clear error rather than hanging.
+static ORIGIN_TX: OnceLock<mpsc::UnboundedSender<Origination>> = OnceLock::new();
+
+/// Record the transport's origination sender so `begin(...)` can reach it. Called
+/// once by [`task`] after the transport starts; a second call is ignored.
+fn set_origin_tx(tx: mpsc::UnboundedSender<Origination>) {
+    let _ = ORIGIN_TX.set(tx);
+}
+
+/// A [`TerminationHandler`] for an **originated** dialogue. `on_start` stages the
+/// pre-built opening `Invoke` (flushed as the `Begin`); `on_continue` hands the
+/// peer's first response back to the awaiting `begin(...)` caller through a
+/// oneshot and lets the dialogue close. `on_begin` stays defaulted (an initiator
+/// is never a responder).
+struct OriginationHandler {
+    op: i64,
+    arg: Option<Vec<u8>>,
+    responder: Mutex<Option<oneshot::Sender<PeerTurn>>>,
+}
+
+impl TerminationHandler for OriginationHandler {
+    fn on_start(&self, dialogue: &mut CoreDialogue) {
+        dialogue.invoke(self.op, self.arg.clone());
+        dialogue.send();
+    }
+
+    fn on_continue(&self, dialogue: &mut CoreDialogue, peer: &PeerTurn) {
+        if let Some(tx) = self
+            .responder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = tx.send(peer.clone());
+        }
+        // v1 origination is single request/response: we've handed the caller the
+        // peer's first turn. If the peer left the dialogue open (a Continue, not an
+        // End), close it cleanly with an End so it never lingers or draws a
+        // provider Abort it did not earn.
+        if !peer.is_end && !dialogue.is_closed() {
+            dialogue.end();
+        }
+    }
+}
+
+/// Call a Python leg callback `func(dialogue, peer_turn)` and replay the commands
+/// it stages onto the real dialogue. The follow-up-leg counterpart of
+/// [`PyHandler::run`], shared by the script-driven [`OriginationScriptHandler`].
+fn call_python_leg(func: &Py<PyAny>, dlg: &mut CoreDialogue, peer: &PeerTurn) {
+    Python::attach(|py| {
+        let pydlg = match Bound::new(
+            py,
+            PyDialogue::new(dlg.otid().to_vec(), dlg.dtid().to_vec()),
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("siphon-sigtran: building Dialogue failed: {e}");
+                return;
+            }
+        };
+        let turn = match Bound::new(py, PyPeerTurn::from_peer(peer)) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("siphon-sigtran: building PeerTurn failed: {e}");
+                return;
+            }
+        };
+        match func.bind(py).call1((&pydlg, &turn)) {
+            Ok(result) => {
+                if let Err(e) = drive(py, &result) {
+                    eprintln!("siphon-sigtran: origination reply handler raised: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("siphon-sigtran: origination reply handler raised: {e}");
+                return;
+            }
+        }
+        let cmds = pydlg.borrow().take();
+        replay(dlg, cmds);
+    });
+}
+
+/// A [`TerminationHandler`] for a **script-driven multi-leg origination**
+/// ([`Node::originate`]): `on_start` stages the opening `Invoke` and flushes the
+/// `Begin`; each follow-up leg calls the Python `on_reply(dialogue, peer)`
+/// callback, which stages the next segment (`dlg.invoke(...); dlg.send()`) or
+/// lets the dialogue close.
+struct OriginationScriptHandler {
+    op: i64,
+    arg: Option<Vec<u8>>,
+    on_reply: Py<PyAny>,
+}
+
+impl TerminationHandler for OriginationScriptHandler {
+    fn on_start(&self, dlg: &mut CoreDialogue) {
+        dlg.invoke(self.op, self.arg.clone());
+        dlg.send();
+    }
+
+    fn on_continue(&self, dlg: &mut CoreDialogue, peer: &PeerTurn) {
+        call_python_leg(&self.on_reply, dlg, peer);
+    }
+}
+
+/// Open a dialogue the node initiates and return an awaitable that resolves to
+/// the peer's first response ([`PyPeerTurn`]). Shared by the `gsm_map` /
+/// `gsm_cap` / `inap` `begin(...)` helpers: the operation to invoke is carried by
+/// the staged `invoke`, so the machinery is protocol-agnostic. The calling party
+/// defaults to our own point code / network indicator and the `called_gt`
+/// digits; the peer's response arrives inbound and correlates on the transaction
+/// id the engine allocated.
+#[allow(clippy::too_many_arguments)]
+fn origination_begin<'py>(
+    py: Python<'py>,
+    invoke: &StagedInvoke,
+    called_gt: &str,
+    called_ssn: u8,
+    calling_gt: &str,
+    calling_ssn: u8,
+    dpc: u32,
+    ac: &MapAcHandle,
+    opc: Option<u32>,
+    sls: u8,
+) -> PyResult<Bound<'py, PyAny>> {
+    let tx = ORIGIN_TX
+        .get()
+        .ok_or_else(|| err("sigtran node not started: no transport to originate over"))?
+        .clone();
+
+    let n = node();
+    let (opc_default, ni) = {
+        let router = lock_router(&n);
+        (
+            router.node_point_code(&n.tenant).unwrap_or(0),
+            router.node_network_indicator(&n.tenant),
+        )
+    };
+    // OPC defaults to our own point code; the calling party is always the
+    // script-supplied node address (never the callee's — a peer that
+    // return-routes on the calling-party GT must reach us, not the HLR).
+    let opc = opc.unwrap_or(opc_default);
+    let calling = gt_address(calling_gt, Some(calling_ssn));
+    let called = gt_address(called_gt, Some(called_ssn));
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let handler: Arc<dyn TerminationHandler> = Arc::new(OriginationHandler {
+        op: invoke.op,
+        arg: invoke.arg.clone(),
+        responder: Mutex::new(Some(resp_tx)),
+    });
+    let req = OutgoingBegin {
+        application_context: ac.arcs.clone(),
+        called,
+        calling,
+        opc,
+        dpc,
+        ni,
+        sls,
+        ingress_assoc: String::new(),
+    };
+
+    tx.send(Origination { req, handler })
+        .map_err(|_| err("sigtran node stopped: origination channel closed"))?;
+
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let peer = resp_rx
+            .await
+            .map_err(|_| err("originated dialogue closed with no response"))?;
+        Ok(PyPeerTurn::from_peer(&peer))
+    })
+}
+
 /// Drive a possibly-async result to completion. A plain return value is done; a
 /// coroutine is run on a fresh asyncio event loop (mirroring how an `async def`
 /// handler runs on siphon's runtime).
@@ -1010,55 +1097,6 @@ impl Ss7 {
         Address {
             inner: gt_address(digits, ssn),
         }
-    }
-
-    /// A general routing override, gated by a `when=` selector expression (kept
-    /// off the hot path for everything else). Used as a decorator.
-    #[pyo3(signature = (when=None))]
-    fn on_route(&self, when: Option<String>) -> HookRegistrar {
-        HookRegistrar {
-            kind: HookKind::Route,
-            key: when.unwrap_or_default(),
-        }
-    }
-
-    /// Build a "route onward" decision. Name one of dpc / linkset / tenant (with
-    /// an optional ssn).
-    #[pyo3(signature = (*, dpc=None, ssn=None, linkset=None, tenant=None))]
-    fn route(
-        &self,
-        dpc: Option<u32>,
-        ssn: Option<u8>,
-        linkset: Option<String>,
-        tenant: Option<String>,
-    ) -> Decision {
-        Decision {
-            kind: "route".to_string(),
-            dpc,
-            ssn,
-            linkset,
-            tenant,
-            reason: None,
-        }
-    }
-
-    /// Build a "drop / screen" decision with a reason.
-    #[pyo3(signature = (reason=None))]
-    fn drop(&self, reason: Option<String>) -> Decision {
-        Decision {
-            reason,
-            ..Decision::bare("drop")
-        }
-    }
-
-    /// Build a "let the Rust tables / config decide" decision.
-    fn route_default(&self) -> Decision {
-        Decision::bare("default")
-    }
-
-    /// Build an "allow / pass the screen" decision.
-    fn allow(&self) -> Decision {
-        Decision::bare("allow")
     }
 
     fn __repr__(&self) -> String {
@@ -1191,15 +1229,6 @@ impl Content {
         }
     }
 
-    /// Register a deferred hook for a rule whose action is `{python: <name>}`.
-    /// Used as a decorator: `@ss7.content.on("on_np_dip")`.
-    fn on(&self, name: &str) -> HookRegistrar {
-        HookRegistrar {
-            kind: HookKind::Content,
-            key: name.to_string(),
-        }
-    }
-
     fn __repr__(&self) -> String {
         "ss7.content".to_string()
     }
@@ -1235,49 +1264,8 @@ fn with_content(f: impl FnOnce(&mut ContentEngine)) -> PyResult<()> {
         .tenancy_mut()
         .get_mut(&tenant)
         .ok_or_else(|| err("no default tenant"))?;
-    if rt.content.is_none() {
-        rt.content = Some(ContentEngine::empty());
-    }
-    f(rt.content.as_mut().expect("content engine present"));
+    f(rt.content.get_or_insert_with(ContentEngine::empty));
     Ok(())
-}
-
-// ── Hook registrars (decorators) ─────────────────────────────────────────────
-
-#[derive(Clone, Copy)]
-enum HookKind {
-    Content,
-    Route,
-}
-
-/// A callable returned by `@ss7.content.on(name)` / `@ss7.on_route(when=...)`;
-/// applying it to a function records the hook.
-#[pyclass(name = "HookRegistrar", module = "siphon")]
-pub struct HookRegistrar {
-    kind: HookKind,
-    key: String,
-}
-
-#[pymethods]
-impl HookRegistrar {
-    fn __call__(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        let n = node();
-        match self.kind {
-            HookKind::Content => {
-                n.content_hooks
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(self.key.clone(), func.clone_ref(py));
-            }
-            HookKind::Route => {
-                n.route_hooks
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((self.key.clone(), func.clone_ref(py)));
-            }
-        }
-        func
-    }
 }
 
 // ── The `gsm_map` / `gsm_cap` namespaces ─────────────────────────────────────
@@ -1295,68 +1283,63 @@ impl GsmMap {
         MapAc
     }
 
-    /// Terminate mobile-originated ForwardSM (`@gsm_map.on_mo_forward_sm`).
-    fn on_mo_forward_sm(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, Operation::MoForwardSm.op_code(), &func);
-        func
+    /// Terminate one or more MAP operations, named by their kebab-case operation
+    /// names. The same `on_<message>("<name>")` shape the sibling addons use
+    /// (`@proxy.on_request`, `@smpp.on_pdu`):
+    ///
+    /// ```python,ignore
+    /// @gsm_map.on_operation("mo-forward-sm")               # one operation
+    /// @gsm_map.on_operation("mo-forward-sm|mt-forward-sm") # several, pipe-separated
+    /// @gsm_map.on_operation                                # bare: every MAP operation
+    /// ```
+    ///
+    /// Known names: `mo-forward-sm`, `mt-forward-sm`, `sri-sm`,
+    /// `report-sm-delivery-status`, `ready-for-sm`, `update-location`,
+    /// `cancel-location`, `purge-ms`, `send-auth-info`, `provide-subscriber-info`.
+    /// An unknown name raises `SigtranError` at decoration time.
+    #[pyo3(signature = (arg=None))]
+    fn on_operation<'py>(
+        &self,
+        py: Python<'py>,
+        arg: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        on_operation_impl(py, arg, map_op_table())
     }
 
-    /// Terminate mobile-terminated ForwardSM (`@gsm_map.on_mt_forward_sm`).
-    fn on_mt_forward_sm(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, Operation::MtForwardSm.op_code(), &func);
-        func
-    }
-
-    /// Terminate SendRoutingInfoForSM (`@gsm_map.on_send_routing_info_for_sm`).
-    fn on_send_routing_info_for_sm(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, Operation::SriSm.op_code(), &func);
-        func
-    }
-
-    /// Terminate updateLocation (`@gsm_map.on_update_location`).
-    fn on_update_location(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, Operation::UpdateLocation.op_code(), &func);
-        func
-    }
-
-    /// Terminate sendAuthenticationInfo (`@gsm_map.on_send_authentication_info`).
-    fn on_send_authentication_info(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, gsm_map::op_codes::SEND_AUTHENTICATION_INFO, &func);
-        func
-    }
-
-    /// Terminate cancelLocation (`@gsm_map.on_cancel_location`).
-    fn on_cancel_location(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, gsm_map::op_codes::CANCEL_LOCATION, &func);
-        func
-    }
-
-    /// Terminate purgeMS (`@gsm_map.on_purge_ms`).
-    fn on_purge_ms(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, gsm_map::op_codes::PURGE_MS, &func);
-        func
-    }
-
-    /// Terminate readyForSM (`@gsm_map.on_ready_for_sm`).
-    fn on_ready_for_sm(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, gsm_map::op_codes::READY_FOR_SM, &func);
-        func
-    }
-
-    /// Terminate reportSM-DeliveryStatus (`@gsm_map.on_report_sm_delivery_status`).
-    fn on_report_sm_delivery_status(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, gsm_map::op_codes::REPORT_SM_DELIVERY_STATUS, &func);
-        func
-    }
-
-    /// Terminate provideSubscriberInfo (`@gsm_map.on_provide_subscriber_info`).
-    fn on_provide_subscriber_info(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(
+    /// Open a MAP dialogue the node initiates (an SMSC MT delivery, an SMS-GMSC
+    /// SRI-SM). Stages `invoke` — an [`Invoke`](StagedInvoke) from a builder such
+    /// as `gsm_map.mt_forward_sm(...)` — as the opening operation of a `Begin`
+    /// toward `called_gt`/`called_ssn` at point code `dpc` under application
+    /// context `ac`, and `await`s the peer's first response as a
+    /// [`PeerTurn`](PyPeerTurn). The calling party defaults to our own point code
+    /// and network indicator with the `called_gt` digits unless overridden.
+    #[pyo3(signature = (invoke, *, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn begin<'py>(
+        &self,
+        py: Python<'py>,
+        invoke: &StagedInvoke,
+        called_gt: &str,
+        called_ssn: u8,
+        calling_gt: &str,
+        calling_ssn: u8,
+        dpc: u32,
+        ac: PyRef<'_, MapAcHandle>,
+        opc: Option<u32>,
+        sls: u8,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        origination_begin(
             py,
-            gsm_map::operations::subscriber_info::op_codes::PROVIDE_SUBSCRIBER_INFO,
-            &func,
-        );
-        func
+            invoke,
+            called_gt,
+            called_ssn,
+            calling_gt,
+            calling_ssn,
+            dpc,
+            &ac,
+            opc,
+            sls,
+        )
     }
 
     /// Build a MO-ForwardSM result to reply with (`dlg.reply(...)`).
@@ -1381,16 +1364,16 @@ impl GsmMap {
     #[pyo3(signature = (*, imsi, network_node_number, lmsi=None))]
     fn send_routing_info_for_sm_res(
         &self,
-        imsi: Vec<u8>,
-        network_node_number: Vec<u8>,
+        imsi: &Bound<'_, PyAny>,
+        network_node_number: &Bound<'_, PyAny>,
         lmsi: Option<Vec<u8>>,
     ) -> PyResult<StagedResult> {
         use gsm_map::operations::sri_sm::RoutingInfoForSmRes;
         use gsm_map::types::LocationInfoWithLmsi;
         let res = RoutingInfoForSmRes {
-            imsi: imsi.into(),
+            imsi: imsi_arg(imsi)?.into(),
             location_info_with_lmsi: LocationInfoWithLmsi {
-                network_node_number: network_node_number.into(),
+                network_node_number: isdn_addr(network_node_number)?.into(),
                 lmsi: lmsi.map(Into::into),
                 gprs_node_indicator: None,
                 additional_number: None,
@@ -1402,10 +1385,10 @@ impl GsmMap {
     /// Build an updateLocation result carrying the `hlr_number`: the successful
     /// close of a location update, sent once the VLR has taken the subscriber data.
     #[pyo3(signature = (*, hlr_number))]
-    fn update_location_res(&self, hlr_number: Vec<u8>) -> PyResult<StagedResult> {
+    fn update_location_res(&self, hlr_number: &Bound<'_, PyAny>) -> PyResult<StagedResult> {
         use gsm_map::operations::location::UpdateLocationRes;
         let res = UpdateLocationRes {
-            hlr_number: hlr_number.into(),
+            hlr_number: isdn_addr(hlr_number)?.into(),
         };
         staged_map_res(gsm_map::op_codes::UPDATE_LOCATION, &res)
     }
@@ -1493,13 +1476,13 @@ impl GsmMap {
     #[pyo3(signature = (*, imsi=None, msisdn=None))]
     fn insert_subscriber_data(
         &self,
-        imsi: Option<Vec<u8>>,
-        msisdn: Option<Vec<u8>>,
+        imsi: Option<Bound<'_, PyAny>>,
+        msisdn: Option<Bound<'_, PyAny>>,
     ) -> PyResult<StagedInvoke> {
         use gsm_map::operations::subscriber_data::{op_codes, InsertSubscriberDataArg};
         let arg = InsertSubscriberDataArg {
-            imsi: imsi.map(Into::into),
-            msisdn: msisdn.map(Into::into),
+            imsi: imsi.as_ref().map(imsi_arg).transpose()?.map(Into::into),
+            msisdn: msisdn.as_ref().map(isdn_addr).transpose()?.map(Into::into),
             category: None,
             subscriber_status: None,
             bearer_service_list: None,
@@ -1517,18 +1500,18 @@ impl GsmMap {
     #[pyo3(signature = (*, sc_addr, msisdn, tpdu, imsi=None))]
     fn mo_forward_sm(
         &self,
-        sc_addr: Vec<u8>,
-        msisdn: Vec<u8>,
+        sc_addr: &Bound<'_, PyAny>,
+        msisdn: &Bound<'_, PyAny>,
         tpdu: Vec<u8>,
-        imsi: Option<Vec<u8>>,
+        imsi: Option<Bound<'_, PyAny>>,
     ) -> PyResult<StagedInvoke> {
         use gsm_map::operations::mo_forward_sm::MoForwardSmArg;
         use gsm_map::{SmRpDa, SmRpOa};
         let arg = MoForwardSmArg {
-            sm_rp_da: SmRpDa::ServiceCentreAddressDa(sc_addr.into()),
-            sm_rp_oa: SmRpOa::MsIsdn(msisdn.into()),
+            sm_rp_da: SmRpDa::ServiceCentreAddressDa(isdn_addr(sc_addr)?.into()),
+            sm_rp_oa: SmRpOa::MsIsdn(isdn_addr(msisdn)?.into()),
             sm_rp_ui: tpdu.into(),
-            imsi: imsi.map(Into::into),
+            imsi: imsi.as_ref().map(imsi_arg).transpose()?.map(Into::into),
         };
         staged_map_invoke(gsm_map::op_codes::MO_FORWARD_SM, &arg)
     }
@@ -1538,16 +1521,16 @@ impl GsmMap {
     #[pyo3(signature = (*, imsi, sc_addr, tpdu, more_messages_to_send=false))]
     fn mt_forward_sm(
         &self,
-        imsi: Vec<u8>,
-        sc_addr: Vec<u8>,
+        imsi: &Bound<'_, PyAny>,
+        sc_addr: &Bound<'_, PyAny>,
         tpdu: Vec<u8>,
         more_messages_to_send: bool,
     ) -> PyResult<StagedInvoke> {
         use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
         use gsm_map::{SmRpDa, SmRpOa};
         let arg = MtForwardSmArg {
-            sm_rp_da: SmRpDa::Imsi(imsi.into()),
-            sm_rp_oa: SmRpOa::ServiceCentreAddressOa(sc_addr.into()),
+            sm_rp_da: SmRpDa::Imsi(imsi_arg(imsi)?.into()),
+            sm_rp_oa: SmRpOa::ServiceCentreAddressOa(isdn_addr(sc_addr)?.into()),
             sm_rp_ui: tpdu.into(),
             more_messages_to_send: more_messages_to_send.then_some(()),
         };
@@ -1556,34 +1539,6 @@ impl GsmMap {
             op: Operation::MtForwardSm.op_code(),
             arg: Some(bytes),
         })
-    }
-
-    /// Originate a SendRoutingInfoForSM to the HLR (routed by GTT). Returns an
-    /// awaitable that resolves to the HLR's routing info; awaiting it needs a
-    /// running node (a live SCTP transport driven by a siphon binary), so without
-    /// one it resolves to that error.
-    #[pyo3(signature = (*, msisdn, sc_addr))]
-    fn send_routing_info_for_sm<'py>(
-        &self,
-        py: Python<'py>,
-        msisdn: Vec<u8>,
-        sc_addr: Vec<u8>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let _ = (msisdn, sc_addr);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Err::<(), PyErr>(err(
-                "gsm_map.send_routing_info_for_sm needs a running node (a live SCTP transport)",
-            ))
-        })
-    }
-
-    /// Open an originating dialogue we initiate (an SMSC's MT delivery). Flushing
-    /// it (`send` / `end`) over the wire needs a running node; the composing
-    /// siphon binary drives origination over the transport.
-    #[pyo3(signature = (*, to, ssn=8, ac=None))]
-    fn begin(&self, to: &Address, ssn: u8, ac: Option<PyRef<'_, MapAcHandle>>) -> PyDialogue {
-        let _ = (to, ssn, ac);
-        PyDialogue::new(Vec::new(), Vec::new())
     }
 
     fn __repr__(&self) -> String {
@@ -1628,7 +1583,25 @@ impl MapAc {
     }
 }
 
-/// An application-context OID handle (its arcs), carried into `gsm_map.begin`.
+/// `gsm_cap.AC`, CAMEL CAP application-context helpers.
+#[pyclass(name = "CapAc", module = "siphon")]
+pub struct CapAc;
+
+#[pymethods]
+impl CapAc {
+    /// gsmSSF-to-gsmSCF generic (call-control) application context, version 3
+    /// (`gsmSSF-scfGenericAC`). Binds the CAP dissector on the wire.
+    #[getter]
+    fn gsm_ssf_scf(&self) -> MapAcHandle {
+        // {itu-t(0) identified-organization(4) etsi(0) mobileDomain(0)
+        //  gsm-Network(1) applicationContext(21) gsmSSF-scfGenericAC(3) version3(4)}
+        MapAcHandle {
+            arcs: vec![0, 4, 0, 0, 1, 21, 3, 4],
+        }
+    }
+}
+
+/// An application-context OID handle (its arcs), e.g. for `node.assemble_begin`.
 #[pyclass(name = "AppContext", module = "siphon", skip_from_py_object)]
 #[derive(Clone)]
 pub struct MapAcHandle {
@@ -1653,30 +1626,81 @@ pub struct GsmCap;
 
 #[pymethods]
 impl GsmCap {
-    /// Terminate a CAMEL initialDP (`@gsm_cap.on_initial_dp`).
-    fn on_initial_dp(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, gsm_cap::op_codes::INITIAL_DP, &func);
-        func
+    /// The CAMEL CAP application-context helpers (`gsm_cap.AC.gsm_ssf_scf`).
+    #[getter]
+    #[allow(non_snake_case)]
+    fn AC(&self) -> CapAc {
+        CapAc
     }
 
-    /// Terminate a CAMEL EventReportBCSM (`@gsm_cap.on_event_report_bcsm`): the
-    /// gsmSSF reporting an armed detection point back to the SCP inside an open
-    /// dialogue.
-    fn on_event_report_bcsm(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, gsm_cap::op_codes::EVENT_REPORT_BCSM, &func);
-        func
+    /// Terminate one or more CAMEL CAP operations, named by their kebab-case
+    /// operation names, the same shape as `@gsm_map.on_operation`:
+    ///
+    /// ```python,ignore
+    /// @gsm_cap.on_operation("initial-dp")        # a CAMEL initialDP
+    /// @gsm_cap.on_operation("event-report-bcsm") # a gsmSSF EventReportBCSM
+    /// ```
+    ///
+    /// Known names: `initial-dp`, `event-report-bcsm`. An unknown name raises
+    /// `SigtranError` at decoration time.
+    #[pyo3(signature = (arg=None))]
+    fn on_operation<'py>(
+        &self,
+        py: Python<'py>,
+        arg: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        on_operation_impl(py, arg, cap_op_table())
+    }
+
+    /// Open a CAP dialogue the node initiates (an SCP arming a call). Stages
+    /// `invoke` as the opening operation of a `Begin` toward `called_gt` /
+    /// `called_ssn` at point code `dpc` under application context `ac`, and
+    /// `await`s the peer's first response as a [`PeerTurn`](PyPeerTurn). Same shape
+    /// as `gsm_map.begin(...)`; the operation is carried by the staged invoke.
+    #[pyo3(signature = (invoke, *, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn begin<'py>(
+        &self,
+        py: Python<'py>,
+        invoke: &StagedInvoke,
+        called_gt: &str,
+        called_ssn: u8,
+        calling_gt: &str,
+        calling_ssn: u8,
+        dpc: u32,
+        ac: PyRef<'_, MapAcHandle>,
+        opc: Option<u32>,
+        sls: u8,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        origination_begin(
+            py,
+            invoke,
+            called_gt,
+            called_ssn,
+            calling_gt,
+            calling_ssn,
+            dpc,
+            &ac,
+            opc,
+            sls,
+        )
     }
 
     /// Stage a CAP Connect invoke: reroute the call to
-    /// `destination_routing_address` (a list of called-party-number byte strings).
+    /// `destination_routing_address` (a list of called-party numbers, each a digit
+    /// string or raw bytes).
     #[pyo3(signature = (*, destination_routing_address))]
-    fn connect(&self, destination_routing_address: Vec<Vec<u8>>) -> PyResult<StagedInvoke> {
+    fn connect(
+        &self,
+        destination_routing_address: Vec<Bound<'_, PyAny>>,
+    ) -> PyResult<StagedInvoke> {
         use gsm_cap::operations::ConnectArg;
+        let dra = destination_routing_address
+            .iter()
+            .map(called_party)
+            .collect::<PyResult<Vec<_>>>()?;
         let arg = ConnectArg {
-            destination_routing_address: destination_routing_address
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            destination_routing_address: dra.into_iter().map(Into::into).collect(),
             original_called_party_id: None,
             calling_partys_category: None,
             redirecting_party_id: None,
@@ -1693,9 +1717,9 @@ impl GsmCap {
     #[pyo3(signature = (*, cause))]
     fn release_call(&self, cause: Vec<u8>) -> PyResult<StagedInvoke> {
         use gsm_cap::operations::ReleaseCallArg;
-        let arg = ReleaseCallArg {
-            cause: cause.into(),
-        };
+        // gsm_cap 1.2 encodes the CAP releaseCall argument as a bare `Cause` OCTET
+        // STRING (a delegate newtype), not a SEQUENCE.
+        let arg = ReleaseCallArg(cause.into());
         let bytes = gsm_cap::encode(&arg).map_err(err)?;
         Ok(StagedInvoke {
             op: gsm_cap::op_codes::RELEASE_CALL,
@@ -1748,6 +1772,15 @@ impl GsmCap {
             op: gsm_cap::op_codes::APPLY_CHARGING,
             arg: Some(bytes),
         })
+    }
+
+    /// Stage a CAP Continue invoke: let the gsmSSF resume normal call processing
+    /// at the detection point. It carries no argument.
+    fn continue_(&self) -> StagedInvoke {
+        StagedInvoke {
+            op: gsm_cap::op_codes::CONTINUE,
+            arg: None,
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -1812,51 +1845,61 @@ impl Inap {
 
     // ── Termination decorators (SSF -> SCF, the SCP terminates) ──
 
-    /// Terminate an INAP initialDP (`@inap.on_initial_dp`): the SSF reports a
-    /// triggered call to the SCP. The handler reads the decoded argument off the
-    /// [`IncomingOp`](PyIncomingOp) `inap_*` getters
-    /// (`inap_service_key` / `inap_called_party_number` / …).
-    fn on_initial_dp(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, inap::op_codes::INITIAL_DP, &func);
-        func
+    /// Terminate one or more INAP CS-1 operations, named by their kebab-case
+    /// operation names, the same shape as `@gsm_map.on_operation`:
+    ///
+    /// ```python,ignore
+    /// @inap.on_operation("initial-dp")            # the SSF reports a triggered call
+    /// @inap.on_operation("event-report-bcsm")     # an armed detection point fired
+    /// ```
+    ///
+    /// An `initial-dp` handler reads the decoded argument off the
+    /// [`IncomingOp`](PyIncomingOp) `inap_*` getters (`inap_service_key` /
+    /// `inap_called_party_number` / …). Known names: `initial-dp`,
+    /// `event-report-bcsm`, `apply-charging-report`, `assist-request-instructions`,
+    /// `call-information-report`, `specialized-resource-report`. An unknown name
+    /// raises `SigtranError` at decoration time.
+    #[pyo3(signature = (arg=None))]
+    fn on_operation<'py>(
+        &self,
+        py: Python<'py>,
+        arg: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        on_operation_impl(py, arg, inap_op_table())
     }
 
-    /// Terminate an INAP eventReportBCSM (`@inap.on_event_report_bcsm`): the SSF
-    /// reports an armed detection point back to the SCP inside an open dialogue.
-    fn on_event_report_bcsm(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, inap::op_codes::EVENT_REPORT_BCSM, &func);
-        func
-    }
-
-    /// Terminate an INAP applyChargingReport (`@inap.on_apply_charging_report`):
-    /// the SSF returns the metered call result to the SCP.
-    fn on_apply_charging_report(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, inap::op_codes::APPLY_CHARGING_REPORT, &func);
-        func
-    }
-
-    /// Terminate an INAP assistRequestInstructions
-    /// (`@inap.on_assist_request_instructions`): an assisting SSF asks the SCP
-    /// for instructions, keyed by the correlationID.
-    fn on_assist_request_instructions(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, inap::op_codes::ASSIST_REQUEST_INSTRUCTIONS, &func);
-        func
-    }
-
-    /// Terminate an INAP callInformationReport
-    /// (`@inap.on_call_information_report`): the SSF returns the previously
-    /// requested call-information (metering) items.
-    fn on_call_information_report(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, inap::op_codes::CALL_INFORMATION_REPORT, &func);
-        func
-    }
-
-    /// Terminate an INAP specializedResourceReport
-    /// (`@inap.on_specialized_resource_report`): the SRF signals that a played
-    /// announcement completed.
-    fn on_specialized_resource_report(&self, py: Python<'_>, func: Py<PyAny>) -> Py<PyAny> {
-        register_termination(py, inap::op_codes::SPECIALIZED_RESOURCE_REPORT, &func);
-        func
+    /// Open an INAP CS-1 dialogue the node initiates (an SCP toward the SSF).
+    /// Stages `invoke` as the opening operation of a `Begin` toward `called_gt` /
+    /// `called_ssn` at point code `dpc` under application context `ac`, and
+    /// `await`s the peer's first response as a [`PeerTurn`](PyPeerTurn). Same shape
+    /// as `gsm_map.begin(...)`; the operation is carried by the staged invoke.
+    #[pyo3(signature = (invoke, *, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn begin<'py>(
+        &self,
+        py: Python<'py>,
+        invoke: &StagedInvoke,
+        called_gt: &str,
+        called_ssn: u8,
+        calling_gt: &str,
+        calling_ssn: u8,
+        dpc: u32,
+        ac: PyRef<'_, MapAcHandle>,
+        opc: Option<u32>,
+        sls: u8,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        origination_begin(
+            py,
+            invoke,
+            called_gt,
+            called_ssn,
+            calling_gt,
+            calling_ssn,
+            dpc,
+            &ac,
+            opc,
+            sls,
+        )
     }
 
     // ── Originating builders (SCF -> SSF, the SCP instructs) ──
@@ -1884,23 +1927,28 @@ impl Inap {
     }
 
     /// Stage an INAP Connect invoke: instruct the SSF to route the call to
-    /// `destination_routing_address` (a list of called-party-number byte strings).
-    /// `original_called_party_id`, when given, preserves the originally dialled
-    /// number across the reroute.
+    /// `destination_routing_address` (a list of called-party numbers, each a digit
+    /// string or raw bytes). `original_called_party_id`, when given, preserves the
+    /// originally dialled number across the reroute.
     #[pyo3(signature = (*, destination_routing_address, original_called_party_id=None))]
     fn connect(
         &self,
-        destination_routing_address: Vec<Vec<u8>>,
-        original_called_party_id: Option<Vec<u8>>,
+        destination_routing_address: Vec<Bound<'_, PyAny>>,
+        original_called_party_id: Option<Bound<'_, PyAny>>,
     ) -> PyResult<StagedInvoke> {
         use inap::operations::ConnectArg;
+        let dra = destination_routing_address
+            .iter()
+            .map(called_party)
+            .collect::<PyResult<Vec<_>>>()?;
         let arg = ConnectArg {
-            destination_routing_address: destination_routing_address
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            destination_routing_address: dra.into_iter().map(Into::into).collect(),
             correlation_id: None,
-            original_called_party_id: original_called_party_id.map(Into::into),
+            original_called_party_id: original_called_party_id
+                .as_ref()
+                .map(called_party)
+                .transpose()?
+                .map(Into::into),
             scf_id: None,
         };
         staged_inap_invoke(inap::op_codes::CONNECT, &arg)
@@ -2065,7 +2113,19 @@ fn inap_monitor_mode(v: i64) -> PyResult<inap::types::MonitorMode> {
 
 /// Register a Python termination handler for `op` on every owned subsystem (so
 /// the handler fires whichever local SSN the message was addressed to).
-fn register_termination(py: Python<'_>, op: i64, func: &Py<PyAny>) {
+fn register_termination(op: i64, func: &Bound<'_, PyAny>) {
+    register_termination_inner(op, func, false);
+}
+
+/// Register a Python catch-all handler for `op` on every owned subsystem. It is
+/// lower priority than a specific [`register_termination`], so a bare
+/// `@ns.on_operation` never shadows an explicit `on_operation("<name>")`,
+/// whichever registered first.
+fn register_catch_all(op: i64, func: &Bound<'_, PyAny>) {
+    register_termination_inner(op, func, true);
+}
+
+fn register_termination_inner(op: i64, func: &Bound<'_, PyAny>, catch_all: bool) {
     let n = node();
     let mut engine = n.engine.lock().unwrap_or_else(|e| e.into_inner());
     let ssns: Vec<u8> = if n.local_ssns.is_empty() {
@@ -2077,10 +2137,193 @@ fn register_termination(py: Python<'_>, op: i64, func: &Py<PyAny>) {
     };
     for ssn in ssns {
         let handler: Arc<dyn TerminationHandler> = Arc::new(PyHandler {
-            func: func.clone_ref(py),
+            func: func.clone().unbind(),
         });
-        engine.register(ssn, op, handler);
+        if catch_all {
+            engine.register_fallback(ssn, op, handler);
+        } else {
+            engine.register(ssn, op, handler);
+        }
     }
+}
+
+/// A namespace's terminatable operations as `(kebab-name, local operation code)`.
+/// The names are the same tokens the content-rule `operation:` selector and
+/// `node.assemble_begin(op=...)` use, so one vocabulary spans the whole surface.
+type OpTable = &'static [(&'static str, i64)];
+
+/// The polymorphic `on_operation` decorator shared by the `gsm_map` / `gsm_cap` /
+/// `inap` namespaces. It mirrors the sibling `@smpp.on_pdu` and the SIP proxy's
+/// `@proxy.on_request`:
+///
+/// * bare `@ns.on_operation` — a catch-all over every operation in `table`
+/// * `@ns.on_operation("mo-forward-sm")` — one operation
+/// * `@ns.on_operation("mo-forward-sm|mt-forward-sm")` — several, pipe-separated
+/// * `@ns.on_operation()` — the catch-all in decorator-call form
+///
+/// Names are validated against `table` at decoration time, so a typo raises a
+/// `SigtranError` instead of registering a handler that never fires.
+fn on_operation_impl<'py>(
+    py: Python<'py>,
+    arg: Option<Bound<'py, PyAny>>,
+    table: OpTable,
+) -> PyResult<Bound<'py, PyAny>> {
+    match arg {
+        // Bare decorator `@ns.on_operation` — the argument is the handler itself;
+        // register it as a catch-all over every operation now and return it.
+        Some(value) if value.is_callable() => {
+            for (_, op) in table {
+                register_catch_all(*op, &value);
+            }
+            Ok(value)
+        }
+        // `@ns.on_operation("a|b")` — a filter string; return a specific decorator.
+        Some(value) => {
+            let filter: String = value.extract().map_err(|_| {
+                err("on_operation expects a handler function or an operation-name string")
+            })?;
+            let ops = resolve_op_filter(&filter, table)?;
+            make_on_operation_decorator(py, ops, false)
+        }
+        // `@ns.on_operation()` — empty parens; a catch-all decorator, matching the
+        // sibling addons' `@proxy.on_request()`.
+        None => {
+            let ops = table.iter().map(|(_, op)| *op).collect();
+            make_on_operation_decorator(py, ops, true)
+        }
+    }
+}
+
+/// Resolve an `on_operation` filter (`"a"` or `"a|b|c"`) to op codes, validating
+/// each name against `table`.
+fn resolve_op_filter(filter: &str, table: OpTable) -> PyResult<Vec<i64>> {
+    let mut ops = Vec::new();
+    for name in filter.split('|') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        match table.iter().find(|(n, _)| *n == name) {
+            Some((_, op)) => ops.push(*op),
+            None => {
+                let known = table.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ");
+                return Err(err(format!(
+                    "unknown operation {name:?} in on_operation filter; known: {known}"
+                )));
+            }
+        }
+    }
+    if ops.is_empty() {
+        return Err(err("empty on_operation filter"));
+    }
+    Ok(ops)
+}
+
+/// Build the decorator closure `on_operation(...)` returns: it registers its
+/// argument (the handler) for each resolved op code and returns it unchanged.
+/// `catch_all` picks the lower-priority [`register_catch_all`] path (the bare /
+/// empty-parens form) over the specific [`register_termination`] one.
+fn make_on_operation_decorator(
+    py: Python<'_>,
+    ops: Vec<i64>,
+    catch_all: bool,
+) -> PyResult<Bound<'_, PyAny>> {
+    let closure = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, PyTuple>,
+              _kwargs: Option<&Bound<'_, PyDict>>|
+              -> PyResult<Py<PyAny>> {
+            let func = args.get_item(0)?;
+            for op in &ops {
+                if catch_all {
+                    register_catch_all(*op, &func);
+                } else {
+                    register_termination(*op, &func);
+                }
+            }
+            Ok(func.unbind())
+        },
+    )?;
+    Ok(closure.into_any())
+}
+
+/// The MAP (TS 29.002) operations a `@gsm_map.on_operation(...)` handler can
+/// terminate. Codes come from the published `gsm_map` codec.
+fn map_op_table() -> OpTable {
+    &[
+        ("mo-forward-sm", gsm_map::op_codes::MO_FORWARD_SM),
+        ("mt-forward-sm", gsm_map::op_codes::MT_FORWARD_SM),
+        ("sri-sm", gsm_map::op_codes::SEND_ROUTING_INFO_FOR_SM),
+        (
+            "report-sm-delivery-status",
+            gsm_map::op_codes::REPORT_SM_DELIVERY_STATUS,
+        ),
+        ("ready-for-sm", gsm_map::op_codes::READY_FOR_SM),
+        ("update-location", gsm_map::op_codes::UPDATE_LOCATION),
+        ("cancel-location", gsm_map::op_codes::CANCEL_LOCATION),
+        ("purge-ms", gsm_map::op_codes::PURGE_MS),
+        (
+            "send-auth-info",
+            gsm_map::op_codes::SEND_AUTHENTICATION_INFO,
+        ),
+        (
+            "provide-subscriber-info",
+            gsm_map::operations::subscriber_info::op_codes::PROVIDE_SUBSCRIBER_INFO,
+        ),
+    ]
+}
+
+/// The CAMEL CAP (TS 29.078) operations a `@gsm_cap.on_operation(...)` handler
+/// can terminate.
+fn cap_op_table() -> OpTable {
+    &[
+        ("initial-dp", gsm_cap::op_codes::INITIAL_DP),
+        ("event-report-bcsm", gsm_cap::op_codes::EVENT_REPORT_BCSM),
+    ]
+}
+
+/// The INAP CS-1 (ITU-T Q.1218) operations an `@inap.on_operation(...)` handler
+/// can terminate.
+fn inap_op_table() -> OpTable {
+    &[
+        ("initial-dp", inap::op_codes::INITIAL_DP),
+        ("event-report-bcsm", inap::op_codes::EVENT_REPORT_BCSM),
+        (
+            "apply-charging-report",
+            inap::op_codes::APPLY_CHARGING_REPORT,
+        ),
+        (
+            "assist-request-instructions",
+            inap::op_codes::ASSIST_REQUEST_INSTRUCTIONS,
+        ),
+        (
+            "call-information-report",
+            inap::op_codes::CALL_INFORMATION_REPORT,
+        ),
+        (
+            "specialized-resource-report",
+            inap::op_codes::SPECIALIZED_RESOURCE_REPORT,
+        ),
+    ]
+}
+
+/// Resolve a kebab-case operation name to its local op code across the MAP, CAP
+/// and INAP termination vocabularies (every name an `on_operation` accepts), so
+/// the loopback [`Node::assemble_begin`] shares one vocabulary with the
+/// decorators. Falls back to the content-router operation set for the invoke-only
+/// names (`connect`, `insert-subscriber-data`). Overlapping names (`initial-dp`,
+/// `event-report-bcsm`) carry the same code in every table, so the merge is
+/// unambiguous; the application context tells CAP and INAP apart on the wire.
+fn operation_op_code(name: &str) -> Option<i64> {
+    map_op_table()
+        .iter()
+        .chain(cap_op_table())
+        .chain(inap_op_table())
+        .find(|(n, _)| *n == name)
+        .map(|(_, op)| *op)
+        .or_else(|| Operation::from_kebab(name).map(Operation::op_code))
 }
 
 // ── A decoded outbound message (loopback / test seam) ────────────────────────
@@ -2329,9 +2572,8 @@ impl Node {
         arg: Option<Vec<u8>>,
         ac: Option<PyRef<'_, MapAcHandle>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let op_code = Operation::from_kebab(op)
-            .map(Operation::op_code)
-            .ok_or_else(|| err(format!("unknown operation `{op}`")))?;
+        let op_code =
+            operation_op_code(op).ok_or_else(|| err(format!("unknown operation `{op}`")))?;
 
         let dialogue_portion = ac.and_then(|h| Oid::new(&h.arcs).map(DialoguePortion::aarq));
 
@@ -2410,6 +2652,110 @@ impl Node {
         Ok(PyBytes::new(py, &sccp))
     }
 
+    /// Assemble an inbound TCAP `End` SCCP payload for loopback / tests: the peer
+    /// closes an open dialogue addressed to `dtid`, optionally carrying one final
+    /// component (`staged` = a [`Result`](StagedResult) or [`Invoke`](StagedInvoke),
+    /// or `None` for a bare End). Returns the SCCP payload bytes.
+    #[pyo3(signature = (*, dtid, staged=None, invoke_id=1))]
+    fn assemble_end<'py>(
+        &self,
+        py: Python<'py>,
+        dtid: Vec<u8>,
+        staged: Option<&Bound<'_, PyAny>>,
+        invoke_id: i64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let components = match staged {
+            None => None,
+            Some(s) => {
+                let component = if let Ok(res) = s.cast::<StagedResult>() {
+                    let res = res.borrow();
+                    Component::ReturnResultLast(ReturnResult {
+                        invoke_id,
+                        result: Some(ReturnResultValue {
+                            operation_code: OperationCode::Local(res.op),
+                            parameter: res.param.clone().map(rasn::types::Any::new),
+                        }),
+                    })
+                } else if let Ok(inv) = s.cast::<StagedInvoke>() {
+                    let inv = inv.borrow();
+                    Component::Invoke(Invoke {
+                        invoke_id,
+                        linked_id: None,
+                        operation_code: OperationCode::Local(inv.op),
+                        parameter: inv.arg.clone().map(rasn::types::Any::new),
+                    })
+                } else {
+                    return Err(err("assemble_end: `staged` must be a Result or an Invoke"));
+                };
+                Some(vec![component])
+            }
+        };
+        let end = TcapMessage::End(tcap::End {
+            dtid: dtid.into(),
+            dialogue_portion: None,
+            components,
+        });
+        let tcap_bytes = tcap::encode(&end).map_err(err)?;
+        let called = gt_address("15550100", Some(6));
+        let calling = gt_address("15550170", Some(6));
+        let udt = UnitData::new(called, calling, tcap_bytes);
+        let sccp = SccpMessage::Udt(udt).encode().map_err(err)?;
+        Ok(PyBytes::new(py, &sccp))
+    }
+
+    /// Open an **originating** MAP dialogue in-process for loopback / tests: stage
+    /// `invoke` as the opening `Begin` toward `called_gt` / `called_ssn` at point
+    /// code `dpc`, register an `on_reply(dialogue, peer)` callback the engine calls
+    /// on each peer response (to stage the next segment `dlg.invoke(...);
+    /// dlg.send()` or let it close), and return the outbound SCCP payload(s) — the
+    /// `Begin`. Deliver the peer's response with [`deliver`](Self::deliver) to drive
+    /// the follow-up leg. The live-transport analogue is `gsm_map.begin(...)`.
+    #[pyo3(signature = (*, invoke, on_reply, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn originate<'py>(
+        &self,
+        py: Python<'py>,
+        invoke: &StagedInvoke,
+        on_reply: Py<PyAny>,
+        called_gt: &str,
+        called_ssn: u8,
+        calling_gt: &str,
+        calling_ssn: u8,
+        dpc: u32,
+        ac: PyRef<'_, MapAcHandle>,
+        opc: Option<u32>,
+        sls: u8,
+    ) -> Vec<Bound<'py, PyBytes>> {
+        let (opc_default, ni) = {
+            let router = lock_router(&self.state);
+            (
+                router.node_point_code(&self.state.tenant).unwrap_or(0),
+                router.node_network_indicator(&self.state.tenant),
+            )
+        };
+        let req = OutgoingBegin {
+            application_context: ac.arcs.clone(),
+            called: gt_address(called_gt, Some(called_ssn)),
+            calling: gt_address(calling_gt, Some(calling_ssn)),
+            opc: opc.unwrap_or(opc_default),
+            dpc,
+            ni,
+            sls,
+            ingress_assoc: String::new(),
+        };
+        let handler: Arc<dyn TerminationHandler> = Arc::new(OriginationScriptHandler {
+            op: invoke.op,
+            arg: invoke.arg.clone(),
+            on_reply,
+        });
+        let engine = self.state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let (_tid, frames) = engine.begin(req, handler);
+        frames
+            .into_iter()
+            .map(|msu| PyBytes::new(py, &msu.payload))
+            .collect()
+    }
+
     /// Decode one outbound SCCP payload (a UDT carrying TCAP) into a read-only
     /// [`Decoded`](PyDecoded) view for loopback / tests: the message kind, the
     /// transaction ids, the AARQ/AARE application context, and the first invoke /
@@ -2423,27 +2769,6 @@ impl Node {
         Ok(PyDecoded::from_tcap(&msg))
     }
 
-    /// Run a registered content hook against a decoded view and return its
-    /// decision (drives the `async def` hook to completion). Raises if no hook of
-    /// that name is registered.
-    fn dispatch_content(
-        &self,
-        py: Python<'_>,
-        name: &str,
-        view: &PyMapView,
-    ) -> PyResult<Py<PyAny>> {
-        let handler = self
-            .state
-            .content_hooks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .map(|h| h.clone_ref(py))
-            .ok_or_else(|| err(format!("no content hook `{name}` registered")))?;
-        let result = handler.bind(py).call1((view.clone(),))?;
-        finish(py, result)
-    }
-
     fn __repr__(&self) -> String {
         format!(
             "Node(tenant={}, ssns={:?})",
@@ -2452,32 +2777,82 @@ impl Node {
     }
 }
 
-/// Resolve a hook's return value, driving a coroutine to completion first.
-fn finish(py: Python<'_>, result: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-    let asyncio = py.import("asyncio")?;
-    if asyncio
-        .call_method1("iscoroutine", (&result,))?
-        .is_truthy()?
-    {
-        let event_loop = asyncio.call_method0("new_event_loop")?;
-        let outcome = event_loop.call_method1("run_until_complete", (&result,));
-        let _ = event_loop.call_method0("close");
-        return Ok(outcome?.unbind());
-    }
-    Ok(result.unbind())
-}
-
 // ── Module-level functions ───────────────────────────────────────────────────
 
-/// Configure the process-wide node from a `sigtran.yaml` (a path, an inline YAML
-/// string, or a dict). Returns a [`Node`] handle; the `ss7` / `gsm_map` /
-/// `gsm_cap` namespaces then program that node.
+/// Rebuild the process-wide node from a `sigtran.yaml` (a path, an inline YAML
+/// string, or a dict) and return a [`Node`] round-trip handle. This is the
+/// in-process **loopback / test** seam (the analogue of the sibling addons'
+/// test harness): it lets a test assemble genuine inbound MSUs and drive them
+/// through the dialogue engine with no live transport. A composing siphon binary
+/// configures the live node from its own config with [`configure_from`], not
+/// this; a handler script never calls it.
 #[pyfunction]
 fn configure(source: &Bound<'_, PyAny>) -> PyResult<Node> {
     let cfg = config_from_source(source)?;
     let state = Arc::new(NodeState::from_config(&cfg));
     set_node(state.clone());
     Ok(Node { state })
+}
+
+/// Configure the process-wide node from an already-parsed [`Config`]. This is the
+/// startup seam a composing siphon binary calls once, after reading its
+/// `extensions.sigtran` config and before loading the handler script, the
+/// analogue of the sibling addons' `namespace(cfg)`. The `ss7` / `gsm_map` /
+/// `gsm_cap` / `inap` namespaces then program this node.
+pub fn configure_from(cfg: &Config) {
+    set_node(Arc::new(NodeState::from_config(cfg)));
+}
+
+/// The siphon addon **runtime task**: the closure a composing siphon binary hands
+/// to `SiphonServer::register_task`. It boots the live SIGTRAN transport for the
+/// process-wide node on siphon's tokio runtime, attaches the dialogue engine
+/// (inbound MAP/CAP/INAP termination) and the origination drain (outbound
+/// `gsm_map.begin(...)`), and keeps the transport alive for the process lifetime.
+///
+/// Ordering contract: call [`configure_from`] first (at builder time, before the
+/// script loads) so the script's decorators register into the very node this task
+/// then drives. The task runs after the script has loaded, so by the time it
+/// snapshots the node the routing tables and termination handlers are in place.
+pub fn task(cfg: Config) -> impl FnOnce(ScriptHandle) + Send + 'static {
+    move |script| {
+        // Move the router + engine the script just programmed out of the node's
+        // load-time mutexes into the Arcs the transport shares. After this the
+        // live wire owns them: routing and handlers are fixed at load, so the
+        // router stays lock-free on the hot path (the line-rate guarantee). The
+        // throwaway replacements keep the node type intact and are never used.
+        let node = node();
+        let router = {
+            let mut guard = node.router.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::new(std::mem::replace(&mut *guard, Router::new(&cfg)))
+        };
+        let engine = {
+            let mut guard = node.engine.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::new(std::mem::replace(
+                &mut *guard,
+                DialogueEngine::new(cfg.tcap.clone()),
+            ))
+        };
+
+        let handle = script.tokio_handle().clone();
+        handle.spawn(async move {
+            let mut transport =
+                match TransportHandle::start_tenant(&cfg, DEFAULT_TENANT, router).await {
+                    Ok(transport) => transport,
+                    Err(error) => {
+                        eprintln!("siphon-sigtran: transport failed to start: {error}");
+                        return;
+                    }
+                };
+            // Inbound termination and outbound origination share one engine so a
+            // response to an originated Begin correlates on its dialogue.
+            transport.serve_dialogues(engine.clone());
+            transport.serve_originations(engine);
+            set_origin_tx(transport.origin_sender());
+            // Hold the transport (and every association task it spawned) for the
+            // life of the process; dropping it would abort them all.
+            std::future::pending::<()>().await;
+        });
+    }
 }
 
 /// Render the Prometheus metrics text-exposition for the whole node.
@@ -2499,8 +2874,6 @@ fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Types a script imports for typing / construction.
     m.add_class::<Node>()?;
-    m.add_class::<Decision>()?;
-    m.add_class::<PyMapView>()?;
     m.add_class::<PyIncomingOp>()?;
     m.add_class::<PyPeerTurn>()?;
     m.add_class::<PyDecoded>()?;
@@ -2516,13 +2889,15 @@ fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// The siphon integration seam. A composing siphon binary calls this once at
+/// The siphon namespace-mount seam. A composing siphon binary calls this once at
 /// startup with the `siphon` package module as `parent`; it mounts the `ss7` /
-/// `gsm_map` / `gsm_cap` / `inap` namespace singletons, the `configure` /
-/// `metrics` functions, the `SigtranError` exception, and the shared types onto
-/// it. A hot-reloaded script then reaches them with
-/// `from siphon import ss7, gsm_map, gsm_cap, inap`, programs the Rust routing
-/// tables live, and registers MAP/CAP/INAP termination handlers.
+/// `gsm_map` / `gsm_cap` / `inap` namespace singletons, the `metrics` function,
+/// the `SigtranError` exception, and the shared types onto it. A hot-reloaded
+/// script then reaches them with `from siphon import ss7, gsm_map, gsm_cap, inap`,
+/// programs the Rust routing tables live, and registers MAP/CAP/INAP termination
+/// handlers. The binary builds the live node those namespaces drive with
+/// [`configure_from`] (from its `extensions.sigtran` config) before loading the
+/// script.
 ///
 /// The namespace singletons drive one process-wide [`node`]. A composing binary
 /// that prefers per-namespace mounting can instead register [`Ss7`] / [`GsmMap`]

@@ -1021,22 +1021,24 @@ dependencies = [
 
 [[package]]
 name = "gsm_cap"
-version = "1.0.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c0ed3d5427a52f29771cc6bcef3d653c6211e68de91c15c8e15b16cf0dd21d7"
+checksum = "41f20d4ebad4f25dec4e9bc7b61f660a8124541cbea73b4dee3b081c16ea7c66"
 dependencies = [
+ "inap",
  "rasn",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "gsm_map"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0004270250acf7ca9872e660178397e855d61f8b56b966a84603f81bf0016af9"
+checksum = "525404d2ad1965e5b64b4548ac8f63b138a0fdd805a889b49fa3ef6e4b5ab9fc"
 dependencies = [
  "hex",
  "rasn",
+ "sccp",
  "tcap",
  "thiserror 2.0.18",
 ]
@@ -1389,9 +1391,9 @@ dependencies = [
 
 [[package]]
 name = "inap"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4972df8ea3964ab2b5f274b47487984a04deb3eab92e4e768dbe3dd76b5f61d1"
+checksum = "d377252b44d8202a736736b49896653055903646d14c33bec33824af01476729"
 dependencies = [
  "rasn",
  "thiserror 2.0.18",
@@ -2986,7 +2988,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "siphon-sigtran"
-version = "0.6.0"
+version = "1.0.0"
 dependencies = [
  "async-sctp",
  "criterion",

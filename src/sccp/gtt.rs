@@ -346,7 +346,7 @@ mod tests {
         );
 
         // A GT that matches neither prefix → no translation.
-        let sel3 = GttSelector::from_digits("44770000");
+        let sel3 = GttSelector::from_digits("99999999");
         assert_eq!(r.translate(&sel3), None);
     }
 

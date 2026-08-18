@@ -62,16 +62,10 @@ assert callable(siphon.metrics)
 assert issubclass(siphon.SigtranError, Exception)
 assert "sigtran_active_dialogues" in siphon.metrics()
 
-# ── configure builds the node; the decision constructors round-trip ───────────
+# ── configure builds the node ─────────────────────────────────────────────────
 node = siphon.configure(CONFIG)
 assert "default" in ss7.tenants
 assert node.open_dialogues() == 0
-
-d = ss7.route(dpc=2000, ssn=6)
-assert d.kind == "route" and d.dpc == 2000 and d.ssn == 6
-assert ss7.drop(reason="untrusted").kind == "drop"
-assert ss7.route_default().kind == "default"
-assert ss7.allow().kind == "allow"
 
 # ── Program the Rust routing tables live ──────────────────────────────────────
 ss7.routes.add(dpc=2000, linkset="transit", priority=3)
@@ -97,23 +91,10 @@ try:
 except siphon.SigtranError:
     pass
 
-# ── A content hook decorator registers an async hook the engine runs ──────────
-seen = {}
-
-@ss7.content.on("on_np_dip")
-async def np_dip(msg):
-    seen["msisdn"] = msg.msisdn
-    return ss7.route(dpc=2005, ssn=6)
-
-view = siphon.MapView(operation="sri-sm", msisdn="15550142")
-decision = node.dispatch_content("on_np_dip", view)
-assert decision.kind == "route" and decision.dpc == 2005
-assert seen["msisdn"] == "15550142"
-
 # ── A MO-ForwardSM Begin driven through the engine reaches the handler ────────
 replied = {}
 
-@gsm_map.on_mo_forward_sm
+@gsm_map.on_operation("mo-forward-sm")
 async def on_mo(dlg, arg):
     replied["op"] = arg.operation_code
     dlg.reply(gsm_map.mo_forward_sm_res())
@@ -136,11 +117,11 @@ assert node.open_dialogues() == 0   # the End closed it
 # VLR (a Continue that holds the dialogue open), then closes with the
 # updateLocation result once the VLR acks the ISD. One Python handler drives both
 # legs, branching on `event.is_peer_turn`.
-HLR_GT = b"\x91\x15\x55\x01\x90"
+HLR_GT = "15550190"   # an E.164 digit string; the builder TBCD-encodes it
 UL_IMSI = b"\x00\x11\x10\x00\x00\x00\x00\x14"
 UL_MSISDN = b"\x91\x15\x55\x01\x70"
 
-@gsm_map.on_update_location
+@gsm_map.on_operation("update-location")
 async def on_ul(dlg, event):
     if event.is_peer_turn:
         # The VLR acked the insertSubscriberData; finish with the UL result.
@@ -176,10 +157,13 @@ assert d2.dtid == b"\x11\x22\x33\x44"   # echoes the VLR's original OTID (assemb
 ul_op, ul_param = d2.result
 assert ul_op == 2                       # updateLocation
 assert ul_param                         # carries the HLR number
+# The hlr_number digit string "15550190" rode the wire as a TBCD ISDN-AddressString
+# (0x91 international/E.164 + swapped-nibble digits): the builder encoded it.
+assert bytes([0x91, 0x51, 0x55, 0x10, 0x09]) in ul_param
 assert node.open_dialogues() == 0       # dialogue closed on the result
 
 # ── sendAuthenticationInfo answered with a quintuplet vector, single shot ─────
-@gsm_map.on_send_authentication_info
+@gsm_map.on_operation("send-auth-info")
 async def on_sai(dlg, arg):
     dlg.reply(gsm_map.send_authentication_info_res(
         quintuplets=[(b"\x00" * 16, b"\x11" * 8, b"\x22" * 16, b"\x33" * 16, b"\x44" * 16)]
@@ -199,15 +183,15 @@ assert sai_param                        # the auth vectors
 assert node.open_dialogues() == 0
 
 # ── A fuller CAMEL SCP: initialDP answered with RequestReportBCSMEvent + Connect
-@gsm_cap.on_initial_dp
+@gsm_cap.on_operation("initial-dp")
 async def on_idp(dlg, idp):
     # Arm the answer / disconnect detection points, then connect the call onward.
     dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 0), (9, 1)]))
-    dlg.invoke(gsm_cap.connect(destination_routing_address=[b"\x00\x11\x22"]))
+    dlg.invoke(gsm_cap.connect(destination_routing_address=["15550199"]))
     dlg.end()
 
 # An SCP that also receives EventReportBCSM registers a handler for it.
-@gsm_cap.on_event_report_bcsm
+@gsm_cap.on_operation("event-report-bcsm")
 async def on_erb(dlg, arg):
     dlg.end()
 
@@ -224,6 +208,10 @@ di = node.decode(idp_out[0])
 assert di.kind == "end"                 # both invokes ride the closing End
 idp_ops = [op for (op, _) in di.invokes]
 assert 23 in idp_ops and 20 in idp_ops  # RequestReportBCSMEvent + Connect
+# The connect destination "15550199" rode the wire as a Q.763 Called Party Number
+# (0x04 international + 0x10 ISDN plan + swapped-nibble digits): the builder encoded it.
+connect_arg = next(arg for (op, arg) in di.invokes if op == 20)
+assert bytes([0x04, 0x10, 0x51, 0x55, 0x10, 0x99]) in connect_arg
 assert node.open_dialogues() == 0
 
 # ── An INAP CS-1 SCP: initialDP answered with RequestReportBCSMEvent + Connect ─
@@ -234,7 +222,7 @@ INAP_IDP = b"\x30\x11\x80\x01\x64\x82\x05\x91\x51\x55\x10\x24\x83\x05\x91\x51\x5
 INAP_CALLED = b"\x91\x51\x55\x10\x24"
 inap_seen = {}
 
-@inap.on_initial_dp
+@inap.on_operation("initial-dp")
 async def on_inap_idp(dlg, idp):
     inap_seen["service_key"] = idp.inap_service_key
     inap_seen["called"] = idp.inap_called_party_number
@@ -244,11 +232,11 @@ async def on_inap_idp(dlg, idp):
     dlg.end()
 
 # An SCP that also fields the follow-up reports registers those handlers too.
-@inap.on_event_report_bcsm
+@inap.on_operation("event-report-bcsm")
 async def on_inap_erb(dlg, arg):
     dlg.end()
 
-@inap.on_apply_charging_report
+@inap.on_operation("apply-charging-report")
 async def on_inap_acr(dlg, arg):
     dlg.end()
 
@@ -282,23 +270,69 @@ assert inap_seen["service_key"] == 100                # the decoded INAP service
 assert inap_seen["called"] == INAP_CALLED             # the decoded INAP calledPartyNumber
 assert node.open_dialogues() == 0
 
-# ── The originating helper returns an awaitable bridged onto tokio ────────────
-# Awaiting it needs a live SCTP transport (a running node); without one it
-# resolves to a clear error. This exercises the pyo3-async-runtimes bridge.
-async def _probe():
-    aw = gsm_map.send_routing_info_for_sm(
-        msisdn=b"\x15\x55\x01\x42", sc_addr=b"\x15\x55\x01\x00"
-    )
-    assert inspect.isawaitable(aw)
-    try:
-        await asyncio.wait_for(aw, timeout=5)
-    except siphon.SigtranError:
-        return "raised"
-    except asyncio.TimeoutError:
-        return "timeout"
-    return "no-raise"
+# ── on_operation: alternation, catch-all precedence, and typo-raises ──────────
+# The siphon-family decorator shape: one handler over several operations
+# (pipe-separated, like @proxy.on_request("INVITE|SUBSCRIBE")), a bare catch-all
+# (like a bare @proxy.on_request), and a typo that raises at decoration time. A
+# specific handler always beats a catch-all, whichever registered first.
+def drive(op_name):
+    begin = node.assemble_begin(op=op_name, called_gt="15550100", called_ssn=6,
+                                calling_gt="15550180")
+    return node.deliver(begin, opc=2000, dpc=1000)
 
-assert asyncio.run(_probe()) == "raised"
+specific_ops = []
+
+@gsm_map.on_operation("purge-ms|ready-for-sm")     # one handler, two operations
+async def on_specific(dlg, arg):
+    specific_ops.append(arg.operation_code)
+    dlg.reply(gsm_map.purge_ms_res() if arg.operation_code == 67
+              else gsm_map.ready_for_sm_res())
+    dlg.end()
+
+for op_name in ("purge-ms", "ready-for-sm"):        # both assemble via the shared vocabulary
+    out = drive(op_name)
+    assert len(out) == 1 and node.decode(out[0]).kind == "end"
+assert set(specific_ops) == {67, 66}                # one handler fired for both (purgeMS=67, readyForSM=66)
+
+# A bare catch-all fires only where no specific handler is registered. It is
+# registered AFTER the specific handler above, yet must not shadow it.
+catchall_ops = []
+
+@gsm_map.on_operation
+async def on_any(dlg, arg):
+    catchall_ops.append(arg.operation_code)
+    dlg.abort()
+
+drive("report-sm-delivery-status")                  # no specific handler -> catch-all fires
+assert catchall_ops == [47]
+specific_ops.clear()
+drive("ready-for-sm")                               # specific still wins over the later catch-all
+assert specific_ops == [66] and 66 not in catchall_ops
+
+# A specific handler registered AFTER the catch-all still wins for its op.
+late_ops = []
+
+@gsm_map.on_operation("report-sm-delivery-status")
+async def on_late(dlg, arg):
+    late_ops.append(arg.operation_code)
+    dlg.abort()
+
+catchall_ops.clear()
+drive("report-sm-delivery-status")
+assert late_ops == [47] and catchall_ops == []      # specific beats the earlier catch-all
+
+# An unknown operation name raises at decoration time, before any dialogue runs.
+try:
+    gsm_map.on_operation("bogus-op")
+    raise AssertionError("expected SigtranError for an unknown operation name")
+except siphon.SigtranError:
+    pass
+# A typo inside an alternation raises the same way.
+try:
+    gsm_map.on_operation("mo-forward-sm|bogus")
+    raise AssertionError("expected SigtranError for an unknown operation in an alternation")
+except siphon.SigtranError:
+    pass
 "#;
 
 /// Mount the addon and drive every namespace end to end through the Rust engine.

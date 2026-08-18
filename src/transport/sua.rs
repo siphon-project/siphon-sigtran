@@ -235,7 +235,8 @@ pub async fn run_asp(
 /// logged, never silently dropped.
 async fn deliver(data: &[u8], ctx: &TaskCtx, slot: &Arc<AssocSlot>) {
     let node_pc = ctx.router.node_point_code(&ctx.tenant).unwrap_or(0);
-    match framing::extract_sua(data, node_pc) {
+    let node_ni = ctx.router.node_network_indicator(&ctx.tenant);
+    match framing::extract_sua(data, node_pc, node_ni) {
         Ok(msu) => dispatch(msu, ctx, &slot.id).await,
         Err(e) => {
             eprintln!(

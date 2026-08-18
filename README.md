@@ -5,6 +5,9 @@
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![SIGTRAN](https://img.shields.io/badge/SIGTRAN-M3UA%20%7C%20M2PA-blue)](https://www.rfc-editor.org/rfc/rfc4666)
 
+**Documentation: [sigtran.siphon-sip.org](https://sigtran.siphon-sip.org)** — concepts,
+quickstart, configuration, the STP/HLR/SMSC/SCP cookbook, and the script API.
+
 A **SIGTRAN/SS7 runtime**. It turns a declarative `sigtran.yaml` into a running
 signalling node: SCTP transport (M3UA / M2PA), MTP3 routing, SCCP Global Title
 Translation with E.214/E.164 conversion, **content routing** on the decoded
@@ -15,33 +18,33 @@ It is built on the published SS7 codec crates (`mtp3`, `m3ua`, `m2pa`, `sccp`,
 top of them. The per-message routing decision always runs in Rust, synchronously
 and without I/O, so the node holds line rate.
 
-> **Status: phase 4.** The routing brain (phase 1) sits under a working SIGTRAN
-> transport over real kernel SCTP (phase 2): M3UA (ASPSM/ASPTM) and M2PA (link
-> alignment), SSNM folded into route state, and inbound DATA routed and forwarded
-> to the resolved egress. Phase 3 added the MAP/CAP dialogue-termination SAP, a
-> synchronous TCAP transaction engine that terminates the messages addressed to a
-> subsystem we own (SRI-SM, updateLocation with an ISD leg, multi-segment
-> MT-ForwardSM, CAMEL initialDP to connect), plus the full Prometheus metric
-> family set. This release adds the **siphon addon face**: a `register(py,
-> parent)` seam, built and tested against siphon-sip the way the sibling addons
-> `siphon-smpp` and `siphon-http` are, that makes siphon-sigtran a scriptable
-> siphon node. See [the siphon addon](#the-siphon-addon) and the
-> [changelog](CHANGELOG.md).
+> The routing brain sits under a working SIGTRAN transport over real kernel SCTP:
+> M3UA (ASPSM/ASPTM) and M2PA (link alignment), SSNM folded into route state,
+> inbound DATA routed and forwarded to the resolved egress. Messages addressed to
+> a subsystem the node owns terminate in a synchronous TCAP transaction engine
+> (SRI-SM, updateLocation with an ISD leg, multi-segment MT-ForwardSM, CAMEL
+> initialDP to connect), and the full Prometheus metric family set is exposed. The
+> **siphon addon face**, a `configure_from(cfg)` + `register(py, parent)` startup
+> seam built and tested against siphon-sip the way the sibling addons
+> `siphon-smpp` and `siphon-http` are, makes siphon-sigtran a scriptable siphon
+> node. See [the siphon addon](#the-siphon-addon) and the [changelog](CHANGELOG.md).
 
 ## Quickstart
 
-```rust
-use siphon_sigtran::{Config, Router};
-use siphon_sigtran::routing::{Inbound, RouteDecision};
+siphon-sigtran is a **library that runs inside a siphon binary**, not a standalone
+server. The binary reads a `sigtran.yaml` (below), configures the node, and runs
+your handler script. Policy is a few decorators; every socket, timer and codec
+byte stays in Rust:
 
-let config = Config::parse(YAML)?;
-let router = Router::new(&config);
+```python
+from siphon import gsm_map
 
-// A message addressed to a point code the node doesn't own transits: the route
-// resolver picks the egress linkset.
-let decision = router.route(&Inbound { dpc: 2000, ..Default::default() });
-assert!(matches!(decision, RouteDecision::Route { .. }));
-# Ok::<(), siphon_sigtran::Error>(())
+# Terminate mobile-originated SMS. `arg.sm_rp_*` are the raw address + TPDU bytes.
+@gsm_map.on_operation("mo-forward-sm")
+async def on_mo(dlg, arg):
+    await forward(sender=arg.sm_rp_oa, dest=arg.sm_rp_da, tpdu=arg.sm_rp_ui)
+    dlg.reply(gsm_map.mo_forward_sm_res())   # returnResultLast, in a closing End
+    dlg.end()
 ```
 
 ## The config, `sigtran.yaml`
@@ -71,7 +74,7 @@ application_servers:
 # M2PA linksets (RFC 4165): links grouped toward an adjacent PC. SLS spreads
 # traffic across the links, so there is no traffic mode here.
 linksets:
-  - { name: transit, links: [{assoc: xit-1, slc: 0}] }
+  - { name: transit, links: [{assoc: xit-1}] }
 
 # MTP3 routes: dpc -> an AS or a linkset, priority (1 = primary, higher = alternate).
 # The adjacent PC of an m2pa link (3000) is an implicit route; no entry needed.
@@ -92,8 +95,6 @@ sccp:
   gt_conversion:
     plmn_map:
       - { mcc: "001", mnc: "01", e164_prefix: "15551" }
-    rules:
-      - { name: e214-in, match: {np: e214}, action: {to_e164_via: plmn_map} }
 
 # Content routing: routes/screens on the decoded MAP layer.
 content_routing:
@@ -106,9 +107,9 @@ content_routing:
     - name: customer-a-home
       match:  { operation: [update-location, send-auth-info, cancel-location], imsi_in: customer-a }
       action: { route: {dpc: 2005, ssn: 6} }
-    - name: sri-sm-np
+    - name: sri-sm-route
       match:  { operation: sri-sm }
-      action: { python: on_np_dip }
+      action: { route: {dpc: 2000, ssn: 6} }
 ```
 
 ### Config reference
@@ -118,12 +119,12 @@ content_routing:
 | `node` | `point_code` (decimal), `variant` (`itu`/`ansi`/`china`), `network_indicator` |
 | `associations` | `id`, `adaptation` (`m3ua`/`m2pa`), `role` (`server`/`client`), `addrs`, `port`, `adjacent_pc` (m2pa) |
 | `application_servers` | `name`, `traffic_mode` (`loadshare`/`override`/`broadcast`), `routing_context`, `asps` (m3ua association ids) |
-| `linksets` | `name`, `links` (`assoc` + `slc`); M2PA only, adjacent PC comes from the association |
+| `linksets` | `name`, `links` (`assoc`); M2PA only, adjacent PC comes from the association |
 | `mtp3_routes` | `dpc`, `as` or `linkset`, `priority` (1 = primary) |
 | `sccp.local_ssns` | the subsystems the node owns |
 | `sccp.gtt_groups` | `name`, `mode` (`cost`/`share`), `members` (`dpc` + `ssn` + `cost`/`weight`) |
 | `sccp.gtt` | ordered rules: `match` (`gt_prefix`, `gti`, `tt`, `np`, `nai`) to a `dpc`+`ssn`, a `group`, or `local` |
-| `sccp.gt_conversion` | `plmn_map` (MCC+MNC to E.164 prefix) + `rules` (E.214 <-> E.164) |
+| `sccp.gt_conversion` | `plmn_map` (MCC+MNC to E.164 prefix), driving the inbound E.214 to E.164 pre-step before GTT |
 | `content_routing` | `protocol`, `address_tables`, `imsi_tables`, ordered `rules` |
 
 A content rule `match` combines `operation` (a name or a list), `imsi_in`,
@@ -133,40 +134,40 @@ A content rule `match` combines `operation` (a name or a list), `imsi_in`,
 
 ## The siphon addon
 
-The `python` feature turns siphon-sigtran into a scriptable siphon node. It is a
-siphon addon, not a package. There is no wheel and no PyPI. It builds and is
-tested against siphon-sip, the way the sibling addons `siphon-smpp` and
-`siphon-http` are. A composing siphon binary calls the one seam at startup:
+siphon-sigtran is a siphon addon, not a package. There is no wheel and no PyPI. It
+builds and is tested against siphon-sip, the way the sibling addons `siphon-smpp`
+and `siphon-http` are, behind the `python` feature. A composing siphon binary
+wires it in at startup with two seams: it reads its `extensions.sigtran` config
+and calls `configure_from(cfg)` to build the node, and it mounts the namespaces:
 
 ```rust
-// once, with the siphon package module as `parent`
+// at startup: build the node from the addon config, then mount the namespaces
+siphon_sigtran::python::configure_from(&cfg);
 siphon_sigtran::python::register(py, parent)?;
 ```
 
-That mounts the `ss7` / `gsm_map` / `gsm_cap` namespaces (plus `configure` /
+`register` mounts the `ss7` / `gsm_map` / `gsm_cap` / `inap` namespaces (plus
 `metrics` and the shared types) onto `siphon`, so scripts import them with
-`from siphon import ...`. The default crate build pulls neither pyo3 nor siphon,
-so `cargo add siphon-sigtran` for the pure-Rust routing brain stays lean.
-Configure the node from a `sigtran.yaml`, then program it:
+`from siphon import ...`. The script never configures the node; it just programs
+it:
 
 ```python
-import siphon
 from siphon import ss7, gsm_map
-
-siphon.configure("sigtran.yaml")   # a path, inline YAML, or a dict
 
 # 1. Program the Rust routing tables live (routing stays in Rust at line rate).
 ss7.routes.add(dpc=2000, linkset="transit", priority=3)
 ss7.gtt.add(match={"gt_prefix": "155502"}, to={"dpc": 2006, "ssn": 6})
 ss7.content.address_table("home-subs").add("15550199")
 
-# 2. Defer a config rule (action `{python: on_np_dip}`) to a hook.
-@ss7.content.on("on_np_dip")
-async def np_dip(msg):
-    return ss7.route(dpc=2006, ssn=6) if ported(msg.msisdn) else ss7.route_default()
+# 2. A content rule on the decoded MAP layer (route / rewrite / screen, in Rust).
+ss7.content.add_rule(
+    name="steer-home-sri-sm",
+    match={"operation": "sri-sm", "cgpa_gt_in": "home-subs"},
+    action={"route": {"group": "ag-router"}},
+)
 
-# 3. Terminate a MAP/CAP dialogue.
-@gsm_map.on_mo_forward_sm
+# 3. Terminate a MAP/CAP dialogue (one or more operations, pipe-separated).
+@gsm_map.on_operation("mo-forward-sm")
 async def on_mo(dlg, arg):
     await forward_to_smpp(sender=arg.sm_rp_oa, dest=arg.sm_rp_da, tpdu=arg.sm_rp_ui)
     dlg.reply(gsm_map.mo_forward_sm_res())
@@ -175,22 +176,19 @@ async def on_mo(dlg, arg):
 
 The termination decorators, result builders and invoke builders cover a full HLR
 (updateLocation held open for an insertSubscriberData leg, then the result;
-sendAuthenticationInfo), SMSC (MO / MT ForwardSM, SRI-SM) and CAMEL SCP (initialDP
-to connect or releaseCall, with RequestReportBCSMEvent and applyCharging). On a
-held-open dialogue's follow-up leg the handler is re-entered with a decoded
-`PeerTurn`, so it can observe the peer's reply (the insertSubscriberData
-`returnResultLast`, say) before it closes.
+sendAuthenticationInfo), a terminating SMSC front end (MO-ForwardSM), and a CAMEL
+SCP (initialDP to connect or releaseCall, with RequestReportBCSMEvent and
+applyCharging). On a held-open dialogue's follow-up leg the handler is re-entered
+with a decoded `PeerTurn`, so it can observe the peer's reply (the
+insertSubscriberData `returnResultLast`, say) before it closes.
 
-Routing decisions (`ss7.route` / `ss7.drop` / `ss7.route_default` / `ss7.allow`)
-and the general override `@ss7.on_route(when=...)` round out the three override
-styles. The runnable tutorial lives under [`examples/`](examples): `stp.py`
-(a thin STP), `smsc.py` (MAP termination + multi-segment MT), and `scp.py`
-(a CAMEL SCP). An `async def` handler runs on siphon's runtime; an originating
-helper (`gsm_map.send_routing_info_for_sm`, `dlg.result()`) returns an awaitable
-bridged onto tokio, and the SCTP transport that fulfils it is driven by the
-composing siphon binary.
+The runnable tutorials live under [`examples/`](examples): `stp.py` (a thin STP),
+`hlr.py` (an HLR), `smsc.py` (MO-SMS termination), and `scp.py` (a CAMEL SCP).
+Routing is Rust: the static `sigtran.yaml`, plus live table programming from a
+script (`ss7.routes` / `ss7.gtt` / `ss7.content`), so every per-message decision
+stays in Rust at line rate.
 
-## What it covers (phase 4)
+## What it covers
 
 | Area | Covered |
 |---|---|
@@ -198,11 +196,20 @@ composing siphon binary.
 | MTP3 routing | implicit adjacent routes, explicit routes by priority, availability from Pause/Resume/Status + linkset up/down, failover |
 | SCCP GTT | ordered prefix + gti/tt/np/nai matching, cost + weighted-share groups, local termination |
 | GT conversion | E.214 to/from E.164 via the PLMN map |
-| Content routing | first-match over operation / GT / IMSI-table membership; route, rewrite, screen, hook-deferral |
+| Content routing | first-match over operation / GT / IMSI-table membership; route, rewrite the called-party GT, or screen, on the live wire |
 | Transport (M3UA/M2PA/SCTP) | real kernel SCTP; M3UA ASPSM/ASPTM handshake + traffic modes, M2PA link alignment, SSNM to route state, load-share + failover, SI-agnostic transfer, own-opc + route-reflect loop guards |
-| Dialogue termination | TCAP transaction engine: Begin/Continue/End + AARQ/AARE, per-(SSN, operation) handlers, single response, held-open multi-leg, originating dialogues, invoke / dialogue timers + ceiling, aborts |
+| Dialogue termination | TCAP transaction engine: Begin/Continue/End + AARQ/AARE, per-(SSN, operation) handlers, single response, held-open multi-leg, invoke / dialogue timers + ceiling, aborts |
 | Metrics | full Prometheus family set (association / ASP / linkset state, route availability, MSU rate, GTT + content + MTP3-management counters, active dialogues, dialogue / invoke timeouts, aborts, loop guards) with a text renderer |
-| siphon addon | `register(py, parent)` seam (built + tested against siphon-sip, no wheel/PyPI); live table programming (`ss7.routes` / `ss7.gtt` / `ss7.content`), deferred + general routing hooks; MAP/CAP termination decorators for the full HLR / SMSC / SCP set, MAP result + invoke builders (`update_location_res`, `send_authentication_info_res`, `insert_subscriber_data`, ...) and CAP `connect` / `release_call` / `request_report_bcsm_event` / `apply_charging`, driving a `Dialogue` handle with a decoded `PeerTurn` on held-open follow-up legs |
+| siphon addon | `configure_from` + `register(py, parent)` startup seams (built + tested against siphon-sip, no wheel/PyPI); live table programming (`ss7.routes` / `ss7.gtt` / `ss7.content`); MAP/CAP/INAP termination decorators (`@ns.on_operation`) for the full HLR / terminating-SMSC / SCP set, MAP result + invoke builders (`update_location_res`, `send_authentication_info_res`, `insert_subscriber_data`, ...) and CAP `connect` / `release_call` / `request_report_bcsm_event` / `apply_charging`, driving a `Dialogue` handle with a decoded `PeerTurn` on held-open follow-up legs |
+
+> **Scope (1.0).** The 1.0 API is exactly what works, tested over real SCTP: SS7
+> transit + routing, GTT, static + live-programmed content routing, and MAP/CAP/INAP
+> dialogue **termination**. Two capabilities are deliberately **not** in the 1.0
+> surface and are the post-1.0 roadmap: **per-message Python routing overrides**
+> (dispatching a routing decision into a script hook on the wire) and **dialogue
+> origination** (an SMSC's MT delivery, an SMS-GMSC), both of which need the async
+> Python override / originating bridge. Routing is programmed from Python at load
+> time (the decision stays in Rust); termination is scripted per dialogue.
 
 The transport is proven end-to-end in `tests/wire.rs`: genuinely-assembled SS7
 MSUs (SRI-SM, updateLocation, MO/MT-ForwardSM, initialDP) driven over real SCTP
