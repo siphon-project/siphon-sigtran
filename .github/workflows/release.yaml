@@ -1,20 +1,15 @@
-# .github/workflows/release.yaml, publish to crates.io + GitHub Release on tag.
+# .github/workflows/release.yaml, cut a GitHub Release on tag.
 #
-#   * verify-version, the git tag is the single source of truth; refuse to
-#     publish if Cargo.toml's version doesn't match the tag.
-#   * crates-io     , publish the `siphon-sigtran` crate via OIDC Trusted
-#     Publishing. Idempotent: skips if the tag's version is already on crates.io.
-#   * sbom          , SPDX + CycloneDX, attached to the release.
-#   * github-release, notes + SBOMs.
+# siphon-sigtran is a siphon *extension*, consumed from git by the composing
+# binary — it is deliberately NOT published to crates.io (and the `siphon-sip`
+# git dependency is permanent, which is also why `publish = false` stays in
+# Cargo.toml as a hard guard). A `vX.Y.Z` tag therefore just cuts a GitHub
+# Release with SBOMs; there is no crate publish.
 #
-# There is no PyPI job: siphon-sigtran is a siphon addon, consumed as a git/path
-# dependency by a composing siphon binary, not a wheel.
-#
-# NOTE: while `Cargo.toml` has `publish = false`, the crates-io job's
-# `cargo publish` will refuse to run, the machinery is here so a later release
-# just flips `publish` and configures Trusted Publishing. The first publish of a
-# brand-new crate needs a one-shot `publish-new` token (Trusted Publishing can't
-# bootstrap a crate that doesn't exist yet).
+#   * verify-version — the git tag is the single source of truth; refuse if
+#     Cargo.toml's version or the CHANGELOG section don't match.
+#   * sbom           — SPDX + CycloneDX, attached to the release.
+#   * github-release — notes + SBOMs.
 name: Release
 
 on:
@@ -32,51 +27,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Cargo version must equal the tag
+      - name: Cargo.toml version + CHANGELOG must match the tag
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
           cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
           echo "tag=$tag_version cargo=$cargo_version"
           if [ "$tag_version" != "$cargo_version" ]; then
-            echo "::error::Cargo.toml version ($cargo_version) does not match tag ($tag_version), bump version in the release commit."
+            echo "::error::Cargo.toml version ($cargo_version) does not match tag ($tag_version)."
             exit 1
           fi
-
-  crates-io:
-    needs: verify-version
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write # mint a short-lived crates.io token via GitHub OIDC, no stored secret
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install libsctp
-        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
-      # Idempotent: if this tag's version is already on crates.io, skip, so
-      # re-running a tag, or tagging the bootstrap release, stays green.
-      - name: Already on crates.io?
-        id: check
-        # crates.io returns 403 to requests without a descriptive User-Agent, so
-        # the -A header is mandatory (a bare curl would 403 and look "unpublished").
-        run: |
-          ver="${GITHUB_REF_NAME#v}"
-          ua="siphon-sigtran-release-ci (github.com/siphon-project/siphon-sigtran)"
-          if curl -sf -A "$ua" "https://crates.io/api/v1/crates/siphon-sigtran/${ver}" -o /dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::siphon-sigtran ${ver} already on crates.io, skipping publish."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          ver_re="$(printf '%s' "$tag_version" | sed 's/\./\\./g')"
+          if ! grep -qE "^## \[$ver_re\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$tag_version]' section."
+            exit 1
           fi
-      - name: Authenticate to crates.io (OIDC Trusted Publishing)
-        if: steps.check.outputs.exists == 'false'
-        uses: rust-lang/crates-io-auth-action@v1
-        id: auth
-      - name: Publish
-        if: steps.check.outputs.exists == 'false'
-        run: cargo publish --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   sbom:
     needs: verify-version
@@ -85,6 +49,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # async-sctp links against libsctp; cargo-sbom resolves the graph, so the
+      # headers need to be present for the metadata resolve to succeed.
+      - name: Install libsctp
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
       - name: Install cargo-sbom
         run: cargo install cargo-sbom
       - name: Generate SPDX + CycloneDX SBOMs
@@ -94,12 +62,10 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: sbom
-          path: |
-            siphon-sigtran-*.spdx.json
-            siphon-sigtran-*.cdx.json
+          path: siphon-sigtran-*.json
 
   github-release:
-    needs: [crates-io, sbom]
+    needs: [verify-version, sbom]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload assets
@@ -108,12 +74,10 @@ jobs:
       - name: Download SBOMs
         uses: actions/download-artifact@v8
         with:
+          name: sbom
           path: artifacts
-          merge-multiple: true
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
-          files: |
-            artifacts/*.spdx.json
-            artifacts/*.cdx.json
+          files: artifacts/*.json
