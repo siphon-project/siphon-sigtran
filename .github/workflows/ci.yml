@@ -46,7 +46,7 @@ jobs:
 
       # libpython for the `--features python` build/link and the addon tests
       # that boot the interpreter.
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
