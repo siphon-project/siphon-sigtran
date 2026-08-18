@@ -1717,9 +1717,9 @@ impl GsmCap {
     #[pyo3(signature = (*, cause))]
     fn release_call(&self, cause: Vec<u8>) -> PyResult<StagedInvoke> {
         use gsm_cap::operations::ReleaseCallArg;
-        let arg = ReleaseCallArg {
-            cause: cause.into(),
-        };
+        // gsm_cap 1.2 encodes the CAP releaseCall argument as a bare `Cause` OCTET
+        // STRING (a delegate newtype), not a SEQUENCE.
+        let arg = ReleaseCallArg(cause.into());
         let bytes = gsm_cap::encode(&arg).map_err(err)?;
         Ok(StagedInvoke {
             op: gsm_cap::op_codes::RELEASE_CALL,

@@ -403,9 +403,7 @@ fn rrbe_arg() -> Vec<u8> {
 }
 
 fn release_call_arg() -> Vec<u8> {
-    let arg = ReleaseCallArg {
-        cause: vec![0x90, 0x03].into(), // Q.850 normal, unspecified
-    };
+    let arg = ReleaseCallArg(vec![0x90, 0x03].into()); // Q.850 normal, unspecified
     gsm_cap::encode(&arg).expect("encode release")
 }
 
