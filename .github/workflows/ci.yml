@@ -11,10 +11,12 @@
 # auto-initialize). There is no wheel, no maturin, and no `extension-module`
 # feature, so `--all-features` is safe.
 #
-# Runner split: the repository is public, so GitHub-hosted runners are free and
-# unmetered and carry everything that only needs a toolchain. The on-the-wire
-# SCTP suites stay on the self-hosted runner, which is the only one that can be
-# relied on for the sctp kernel module and tshark. See the `wire` job.
+# Everything runs on GitHub-hosted runners: the repository is public, so they are
+# free and unmetered, and the org's self-hosted pool is off-limits to public
+# repositories anyway (its runner group sets allows_public_repositories=false,
+# and opening that would let fork PRs execute on self-hosted infrastructure).
+# The wire job therefore has to get kernel SCTP from the hosted image, which its
+# preflight asserts rather than assumes. See the `wire` job.
 name: CI
 
 on:
@@ -87,16 +89,20 @@ jobs:
   # preflight below turns that into a hard failure instead, so this job either
   # exercises the wire or goes red; it never passes by skipping.
   wire:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install libsctp + tshark
+      # linux-modules-extra carries the sctp module on the hosted images; without
+      # it modprobe has nothing to load.
+      - name: Install libsctp + tshark + kernel modules
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libsctp-dev tshark
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libsctp-dev tshark "linux-modules-extra-$(uname -r)" || \
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libsctp-dev tshark
 
       - uses: actions/setup-python@v7
         with:
