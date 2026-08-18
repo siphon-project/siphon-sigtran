@@ -262,7 +262,8 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo bench --no-run                        # keep the benches compiling
 cargo run --release --example leak_check    # counting-allocator leak gate -> PASS
-cargo deny check
+cargo deny --locked check bans licenses sources   # dep policy, gates every PR
+cargo deny --locked check advisories              # RustSec, weekly + on main
 ```
 
 The integration tests in `tests/routing.rs` assemble real SS7 (a MAP/CAP argument

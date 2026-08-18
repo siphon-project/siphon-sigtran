@@ -72,3 +72,30 @@ jobs:
 
       - name: Memory-leak check
         run: cargo run --release --example leak_check
+
+  # ── Deterministic dependency-graph policy: the PR gate ──────────────────────
+  # bans / licenses / sources are a pure function of the checked-in tree, so
+  # their verdict only changes when the dependency set does. That makes them
+  # safe to block a PR on: a PR that pulls in a copyleft crate, a new git
+  # source, or a duplicate-crate blowup fails right here, on the change that
+  # introduced it, instead of surfacing weeks later.
+  #
+  # Time-varying RustSec advisories are deliberately NOT here. A new advisory
+  # (or a yank) can land against an unchanged Cargo.lock and would turn an
+  # unrelated feature PR red, so `check advisories` runs weekly + on main in
+  # .github/workflows/audit.yml.
+  #
+  # `--locked` keeps the gate honest: deny.toml resolves with all-features, so
+  # the graph includes the `python` feature's siphon-sip git dependency, and
+  # without --locked cargo would re-resolve branch=main and the check would
+  # drift with a repo this PR never touched.
+  deny:
+    name: cargo-deny (bans/licenses/sources)
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --all-features --locked
+          command: check
+          command-arguments: bans licenses sources

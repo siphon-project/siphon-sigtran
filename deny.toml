@@ -1,6 +1,16 @@
 # cargo-deny: dependency-graph security / license / source policy.
-# Local: `cargo deny check`  ·  CI: .github/workflows/audit.yml
-# Docs: https://embarkstudios.github.io/cargo-deny/
+#
+# The checks are split across two workflows by whether their verdict is a
+# function of the tree alone:
+#   * bans / licenses / sources are deterministic (they only change when the
+#     dependency set changes), so .github/workflows/ci.yml gates every PR on
+#     them: adding a copyleft dep, a new git source, or a duplicate-crate
+#     blowup fails right there, on the PR that introduced it.
+#   * advisories are time-varying (a new RustSec advisory or a yank can land
+#     against an unchanged Cargo.lock), so .github/workflows/audit.yml runs
+#     them weekly + on main, where a fresh finding is surfaced instead of
+#     turning an unrelated feature PR red.
+# Local: `cargo deny check`  ·  Docs: https://embarkstudios.github.io/cargo-deny/
 
 [graph]
 targets = [
@@ -13,7 +23,13 @@ all-features = true
 # A yanked crate or an open RustSec advisory fails the audit.
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # paste is unmaintained (author archived it), not a vulnerability. It is a
+    # build-time proc-macro pulled in transitively (rasn / pyo3 graph), with no
+    # drop-in replacement the upstreams have adopted yet. Revisit when they move
+    # off it; there is nothing to fix in this tree.
+    "RUSTSEC-2024-0436",
+]
 
 [bans]
 multiple-versions = "warn"
@@ -37,6 +53,15 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
     "MPL-2.0",
+    # Permissive licenses reached only through the `python` feature's
+    # siphon-sip graph (deny.toml resolves with all-features):
+    #   BSL-1.0            Boost, OSI-approved  (xxhash-rust <- redis)
+    #   CC0-1.0            public-domain dedication, FSF-free  (notify)
+    #   CDLA-Permissive-2.0  data licence on the Mozilla CA root store, not
+    #                        code  (webpki-roots <- reqwest/hyper-rustls)
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
@@ -44,3 +69,7 @@ confidence-threshold = 0.9
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The one deliberate git dependency: the `python` feature links siphon-sip from
+# its canonical repo (it is not published on crates.io). Everything else must
+# come from crates.io, so a new git source fails the PR gate.
+allow-git = ["https://github.com/siphon-project/siphon-sip"]
