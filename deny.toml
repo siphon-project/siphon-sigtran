@@ -24,10 +24,12 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # paste is unmaintained (author archived it), not a vulnerability. It is a
-    # build-time proc-macro pulled in transitively (rasn / pyo3 graph), with no
-    # drop-in replacement the upstreams have adopted yet. Revisit when they move
-    # off it; there is nothing to fix in this tree.
+    # paste is unmaintained (the author archived the repo), not a vulnerability:
+    # it is a build-time proc-macro, so it has no runtime surface. The sole path
+    # into the graph is tikv-jemalloc-ctl <- siphon-sip, which means it is
+    # reachable only through the `python` feature; the default routing-brain
+    # build never pulls it. Nothing to fix in this tree, so revisit when
+    # tikv-jemalloc-ctl drops it.
     "RUSTSEC-2024-0436",
 ]
 
