@@ -16,14 +16,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sccp::{GlobalTitle, SccpAddress, SubsystemNumber};
 use tcap::{AbortReason, Component, Reject, TcapMessage};
 
 use siphon_sigtran::config::Tcap;
 use siphon_sigtran::dialogue::{
     CloseReason, DialogueEngine, DialogueError, GeneralProblem, InvokeProblem, InvokeTimeout,
-    OperationClass, OutgoingBegin, PAbortCause, PeerAbort, PeerComponent, Problem,
-    ReturnErrorProblem, ReturnResultProblem, UserAbort,
+    OperationClass, PAbortCause, PeerAbort, PeerComponent, Problem, ReturnErrorProblem,
+    ReturnResultProblem, UserAbort,
 };
 
 mod common;
@@ -1487,31 +1486,6 @@ fn an_encode_failure_is_returned_to_the_handler_and_counted() {
     assert_eq!(out.len(), 1, "the peer gets an abort, not silence");
     assert!(matches!(decode(&out[0]), TcapMessage::Abort(_)));
     assert_eq!(probe.reasons(), vec![CloseReason::NoAnswer]);
-}
-
-fn outgoing() -> OutgoingBegin {
-    let party = |digits: &str, ssn| {
-        SccpAddress::with_gt(
-            GlobalTitle::Gt0100 {
-                translation_type: 0,
-                numbering_plan: 1,
-                encoding_scheme: 1,
-                nature_of_address: 4,
-                digits: digits.to_string(),
-            },
-            Some(ssn),
-        )
-    };
-    OutgoingBegin {
-        application_context: AC_ARCS.to_vec(),
-        called: party(PEER_GT, SubsystemNumber::Hlr),
-        calling: party(OUR_GT, SubsystemNumber::Msc),
-        opc: OUR_PC,
-        dpc: PEER_PC,
-        ni: 0,
-        sls: 0,
-        ingress_assoc: String::new(),
-    }
 }
 
 /// An originated dialogue whose Begin cannot be encoded is an error to the

@@ -74,6 +74,21 @@ create_exception!(
     "siphon-sigtran configuration / SS7 protocol error."
 );
 
+create_exception!(
+    siphon_sigtran,
+    MistypedParameter,
+    SigtranError,
+    "The argument of an Invoke, or the parameter of a result or an error, does not \
+     decode as the type its operation defines. A handler that lets it propagate \
+     has the component rejected (Reject, mistyped parameter) and the dialogue \
+     ended; one that catches it decides itself, with `dlg.reject(...)`."
+);
+
+/// A parameter that does not decode as the type its operation defines.
+fn mistyped(what: &str, error: impl std::fmt::Display) -> PyErr {
+    MistypedParameter::new_err(format!("{what} does not decode: {error}"))
+}
+
 fn err(msg: impl std::fmt::Display) -> PyErr {
     SigtranError::new_err(msg.to_string())
 }
@@ -115,7 +130,7 @@ fn called_party(v: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 /// Encode a MAP result struct to BER and stage it as a `ReturnResultLast` for
 /// `dlg.reply(...)`, carrying the operation code.
 fn staged_map_res<T: rasn::Encode>(op: i64, res: &T) -> PyResult<StagedResult> {
-    let param = rasn::ber::encode(res).map_err(err)?;
+    let param = gsm_map::encode(res).map_err(err)?;
     Ok(StagedResult {
         op,
         param: Some(param),
@@ -125,7 +140,7 @@ fn staged_map_res<T: rasn::Encode>(op: i64, res: &T) -> PyResult<StagedResult> {
 /// Encode a MAP argument struct to BER and stage it as an `Invoke` for
 /// `dlg.invoke(...)`, carrying the operation code.
 fn staged_map_invoke<T: rasn::Encode>(op: i64, arg: &T) -> PyResult<StagedInvoke> {
-    let bytes = rasn::ber::encode(arg).map_err(err)?;
+    let bytes = gsm_map::encode(arg).map_err(err)?;
     // Every MAP operation this namespace builds reports both its result and its
     // errors (TS 29.002 clause 7 and following: class 1).
     Ok(StagedInvoke::new(op, Some(bytes), OperationClass::One))
@@ -389,21 +404,24 @@ impl PyIncomingOp {
         self.argument.as_ref().map(|a| PyBytes::new(py, a))
     }
 
-    /// The originating SMS address (`SM-RP-OA`) of a MO/MT-ForwardSM, if decoded.
+    /// The originating SMS address (`SM-RP-OA`) of a MO/MT-ForwardSM. `None`
+    /// for another operation, or when the argument says there is none. Raises
+    /// `MistypedParameter` when the argument does not decode.
     #[getter]
-    fn sm_rp_oa<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+    fn sm_rp_oa<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
         self.decode_mo_field(py, MoField::Oa)
     }
 
-    /// The destination SMS address (`SM-RP-DA`) of a MO/MT-ForwardSM, if decoded.
+    /// The destination SMS address (`SM-RP-DA`) of a MO/MT-ForwardSM. As
+    /// `sm_rp_oa`.
     #[getter]
-    fn sm_rp_da<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+    fn sm_rp_da<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
         self.decode_mo_field(py, MoField::Da)
     }
 
-    /// The SMS TPDU (`SM-RP-UI`) of a MO/MT-ForwardSM, if decoded.
+    /// The SMS TPDU (`SM-RP-UI`) of a MO/MT-ForwardSM. As `sm_rp_oa`.
     #[getter]
-    fn sm_rp_ui<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+    fn sm_rp_ui<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
         self.decode_mo_field(py, MoField::Ui)
     }
 
@@ -765,6 +783,9 @@ pub struct PyPeerTurn {
     is_end: bool,
     comps: Vec<PeerComp>,
     event: TurnEvent,
+    /// What to reject if the script finds a parameter of this turn mistyped:
+    /// its first component that has one.
+    rejection: Option<(Option<i8>, Problem)>,
 }
 
 impl PyPeerTurn {
@@ -773,6 +794,10 @@ impl PyPeerTurn {
             is_end: peer.is_end,
             comps: peer.components.iter().map(PeerComp::from_core).collect(),
             event: TurnEvent::default(),
+            rejection: peer
+                .components
+                .iter()
+                .find_map(PeerComponent::mistyped_parameter),
         }
     }
 
@@ -782,6 +807,7 @@ impl PyPeerTurn {
             is_end: event.closed.is_some(),
             comps: Vec::new(),
             event,
+            rejection: None,
         }
     }
 
@@ -1008,26 +1034,43 @@ enum MoField {
 }
 
 impl PyIncomingOp {
-    /// Best-effort decode of a MO/MT-ForwardSM argument field. Returns `None`
-    /// when the argument is absent or is not a forward-SM (the getter is
-    /// meaningful only for the SMS relay operations).
-    fn decode_mo_field<'py>(&self, py: Python<'py>, field: MoField) -> Option<Bound<'py, PyBytes>> {
+    /// One field of a MO-ForwardSM (46) or MT-ForwardSM (44) argument. `None`
+    /// for any other operation. The decode is `gsm_map::decode`: an argument
+    /// with a member that cannot be read, or with octets after it, is a
+    /// mistyped parameter and raises, where it used to read as "no such field";
+    /// a member a later release added after the extension marker is skipped
+    /// (TS 29.002 17.1.4).
+    fn decode_mo_field<'py>(
+        &self,
+        py: Python<'py>,
+        field: MoField,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         use gsm_map::operations::{mo_forward_sm::MoForwardSmArg, mt_forward_sm::MtForwardSmArg};
         use gsm_map::{SmRpDa, SmRpOa};
 
-        let bytes = self.argument.as_ref()?;
+        let mt = match self.operation_code {
+            c if c == gsm_map::op_codes::MO_FORWARD_SM => false,
+            c if c == gsm_map::op_codes::MT_FORWARD_SM => true,
+            _ => return Ok(None),
+        };
+        let what = if mt {
+            "the mt-forwardSM argument"
+        } else {
+            "the mo-forwardSM argument"
+        };
+        let bytes = self
+            .argument
+            .as_ref()
+            .ok_or_else(|| mistyped(what, "the Invoke carries no argument"))?;
+        let (da, oa, ui): (SmRpDa, SmRpOa, OctetString) = if mt {
+            let a: MtForwardSmArg = gsm_map::decode(bytes).map_err(|e| mistyped(what, e))?;
+            (a.sm_rp_da, a.sm_rp_oa, a.sm_rp_ui)
+        } else {
+            let a: MoForwardSmArg = gsm_map::decode(bytes).map_err(|e| mistyped(what, e))?;
+            (a.sm_rp_da, a.sm_rp_oa, a.sm_rp_ui)
+        };
 
-        // Both MO and MT forward-SM carry the same three fields; try MO then MT.
-        let (da, oa, ui): (SmRpDa, SmRpOa, OctetString) =
-            if let Ok(a) = rasn::ber::decode::<MoForwardSmArg>(bytes) {
-                (a.sm_rp_da, a.sm_rp_oa, a.sm_rp_ui)
-            } else if let Ok(a) = rasn::ber::decode::<MtForwardSmArg>(bytes) {
-                (a.sm_rp_da, a.sm_rp_oa, a.sm_rp_ui)
-            } else {
-                return None;
-            };
-
-        match field {
+        Ok(match field {
             MoField::Ui => Some(PyBytes::new(py, ui.as_ref())),
             MoField::Da => match da {
                 SmRpDa::Imsi(b) | SmRpDa::Lmsi(b) | SmRpDa::ServiceCentreAddressDa(b) => {
@@ -1041,7 +1084,7 @@ impl PyIncomingOp {
                 }
                 SmRpOa::NoSmRpOa(()) => None,
             },
-        }
+        })
     }
 }
 
@@ -1353,6 +1396,15 @@ impl PyHandler {
 
     /// Call the script for one leg and return the commands it staged.
     fn call(&self, otid: &[u8], dtid: &[u8], leg: Leg<'_>) -> Vec<DlgCmd> {
+        // What to reject if the script finds the parameter of this leg mistyped.
+        let rejection = match &leg {
+            Leg::Begin(op) => Some(op.mistyped_parameter()),
+            Leg::Continue(peer) => peer
+                .components
+                .iter()
+                .find_map(PeerComponent::mistyped_parameter),
+            Leg::Start | Leg::Event(_) => None,
+        };
         Python::attach(|py| {
             let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec())) {
                 Ok(d) => d,
@@ -1397,20 +1449,45 @@ impl PyHandler {
                 Leg::Start => self.func.bind(py).call1((&pydlg,)),
             };
 
-            match call {
-                Ok(result) => {
-                    if let Err(e) = drive(py, &result) {
-                        eprintln!("siphon-sigtran: termination handler raised: {e}");
-                    }
+            let raised = match call {
+                Ok(result) => drive(py, &result).err(),
+                Err(e) => Some(e),
+            };
+            match raised {
+                None => {
+                    let cmds = pydlg.borrow().take();
+                    cmds
                 }
-                Err(e) => {
-                    eprintln!("siphon-sigtran: termination handler raised: {e}");
-                    return Vec::new();
-                }
+                Some(e) => handler_raised(py, &e, rejection, otid, dtid),
             }
-            let cmds = pydlg.borrow().take();
-            cmds
         })
+    }
+}
+
+/// A handler raised. Whatever it staged before is discarded: half an answer is
+/// not sent. An uncaught `MistypedParameter` is the handler saying the peer's
+/// component is a protocol error, and is answered as one: a Reject, mistyped
+/// parameter, in an End (Q.774 3.2.2.2: the Reject leaves with the next dialogue
+/// handling primitive, here a basic end). Anything else is the script's own
+/// failure: nothing is staged, and a Begin left unanswered is aborted by the
+/// engine.
+fn handler_raised(
+    py: Python<'_>,
+    error: &PyErr,
+    rejection: Option<(Option<i8>, Problem)>,
+    otid: &[u8],
+    dtid: &[u8],
+) -> Vec<DlgCmd> {
+    let ids = format!("otid={} dtid={}", hex(otid), hex(dtid));
+    match rejection {
+        Some((id, problem)) if error.is_instance_of::<MistypedParameter>(py) => {
+            eprintln!("siphon-sigtran: dialogue {ids}: rejecting the component: {error}");
+            vec![DlgCmd::Reject { id, problem }, DlgCmd::End]
+        }
+        _ => {
+            eprintln!("siphon-sigtran: ERROR: dialogue {ids}: termination handler raised: {error}");
+            Vec::new()
+        }
     }
 }
 
@@ -1551,6 +1628,7 @@ fn call_python_leg(func: &Py<PyAny>, dlg: &mut CoreDialogue, turn: PyPeerTurn) -
 
 /// Call `func(dialogue, turn)` and return the commands it staged.
 fn call_python_turn(func: &Py<PyAny>, otid: &[u8], dtid: &[u8], turn: PyPeerTurn) -> Vec<DlgCmd> {
+    let rejection = turn.rejection;
     Python::attach(|py| {
         let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec())) {
             Ok(d) => d,
@@ -1566,19 +1644,17 @@ fn call_python_turn(func: &Py<PyAny>, otid: &[u8], dtid: &[u8], turn: PyPeerTurn
                 return Vec::new();
             }
         };
-        match func.bind(py).call1((&pydlg, &turn)) {
-            Ok(result) => {
-                if let Err(e) = drive(py, &result) {
-                    eprintln!("siphon-sigtran: origination reply handler raised: {e}");
-                }
+        let raised = match func.bind(py).call1((&pydlg, &turn)) {
+            Ok(result) => drive(py, &result).err(),
+            Err(e) => Some(e),
+        };
+        match raised {
+            None => {
+                let cmds = pydlg.borrow().take();
+                cmds
             }
-            Err(e) => {
-                eprintln!("siphon-sigtran: origination reply handler raised: {e}");
-                return Vec::new();
-            }
+            Some(e) => handler_raised(py, &e, rejection, otid, dtid),
         }
-        let cmds = pydlg.borrow().take();
-        cmds
     })
 }
 
@@ -2023,15 +2099,9 @@ impl GsmMap {
     ) -> PyResult<StagedResult> {
         use gsm_map::operations::sri_sm::RoutingInfoForSmRes;
         use gsm_map::types::LocationInfoWithLmsi;
-        let res = RoutingInfoForSmRes {
-            imsi: imsi_arg(imsi)?.into(),
-            location_info_with_lmsi: LocationInfoWithLmsi {
-                network_node_number: isdn_addr(network_node_number)?.into(),
-                lmsi: lmsi.map(Into::into),
-                gprs_node_indicator: None,
-                additional_number: None,
-            },
-        };
+        let mut location = LocationInfoWithLmsi::new(isdn_addr(network_node_number)?.into());
+        location.lmsi = lmsi.map(Into::into);
+        let res = RoutingInfoForSmRes::new(imsi_arg(imsi)?.into(), location);
         staged_map_res(gsm_map::op_codes::SEND_ROUTING_INFO_FOR_SM, &res)
     }
 
@@ -2040,9 +2110,7 @@ impl GsmMap {
     #[pyo3(signature = (*, hlr_number))]
     fn update_location_res(&self, hlr_number: &Bound<'_, PyAny>) -> PyResult<StagedResult> {
         use gsm_map::operations::location::UpdateLocationRes;
-        let res = UpdateLocationRes {
-            hlr_number: isdn_addr(hlr_number)?.into(),
-        };
+        let res = UpdateLocationRes::new(isdn_addr(hlr_number)?.into());
         staged_map_res(gsm_map::op_codes::UPDATE_LOCATION, &res)
     }
 
@@ -2059,8 +2127,9 @@ impl GsmMap {
             AuthenticationQuintuplet, AuthenticationSetList, AuthenticationTriplet,
             SendAuthenticationInfoRes,
         };
-        let set = match (quintuplets, triplets) {
-            (Some(q), _) => Some(AuthenticationSetList::QuintupletList(
+        let mut res = SendAuthenticationInfoRes::default();
+        match (quintuplets, triplets) {
+            (Some(q), _) => res.set_authentication_set_list(AuthenticationSetList::QuintupletList(
                 q.into_iter()
                     .map(|(rand, xres, ck, ik, autn)| AuthenticationQuintuplet {
                         rand: rand.into(),
@@ -2071,7 +2140,7 @@ impl GsmMap {
                     })
                     .collect(),
             )),
-            (None, Some(t)) => Some(AuthenticationSetList::TripletList(
+            (None, Some(t)) => res.set_authentication_set_list(AuthenticationSetList::TripletList(
                 t.into_iter()
                     .map(|(rand, sres, kc)| AuthenticationTriplet {
                         rand: rand.into(),
@@ -2080,29 +2149,25 @@ impl GsmMap {
                     })
                     .collect(),
             )),
-            (None, None) => None,
-        };
-        let res = SendAuthenticationInfoRes {
-            authentication_set_list: set,
-        };
+            (None, None) => {}
+        }
         staged_map_res(gsm_map::op_codes::SEND_AUTHENTICATION_INFO, &res)
     }
 
     /// Build an insertSubscriberData result: the VLR accepting the pushed data.
     fn insert_subscriber_data_res(&self) -> PyResult<StagedResult> {
         use gsm_map::operations::subscriber_data::{op_codes, InsertSubscriberDataRes};
-        let res = InsertSubscriberDataRes {
-            teleservice_list: None,
-            bearer_service_list: None,
-            odb_general_data: None,
-        };
+        let res = InsertSubscriberDataRes::default();
         staged_map_res(op_codes::INSERT_SUBSCRIBER_DATA, &res)
     }
 
     /// Build a cancelLocation result: the VLR confirming it dropped the record.
     fn cancel_location_res(&self) -> PyResult<StagedResult> {
         use gsm_map::operations::location::CancelLocationRes;
-        staged_map_res(gsm_map::op_codes::CANCEL_LOCATION, &CancelLocationRes {})
+        staged_map_res(
+            gsm_map::op_codes::CANCEL_LOCATION,
+            &CancelLocationRes::default(),
+        )
     }
 
     /// Build a purgeMS result. `freeze_tmsi` / `freeze_p_tmsi` ask the VLR/SGSN
@@ -2113,6 +2178,7 @@ impl GsmMap {
         let res = PurgeMsRes {
             freeze_tmsi: freeze_tmsi.then_some(()),
             freeze_p_tmsi: freeze_p_tmsi.then_some(()),
+            ..PurgeMsRes::default()
         };
         staged_map_res(gsm_map::op_codes::PURGE_MS, &res)
     }
@@ -2120,7 +2186,7 @@ impl GsmMap {
     /// Build a readyForSM result: the HLR acknowledging the alert.
     fn ready_for_sm_res(&self) -> PyResult<StagedResult> {
         use gsm_map::operations::ready_for_sm::ReadyForSmRes;
-        staged_map_res(gsm_map::op_codes::READY_FOR_SM, &ReadyForSmRes {})
+        staged_map_res(gsm_map::op_codes::READY_FOR_SM, &ReadyForSmRes::default())
     }
 
     /// Stage an insertSubscriberData invoke: the HLR pushes subscriber data to
@@ -2136,13 +2202,7 @@ impl GsmMap {
         let arg = InsertSubscriberDataArg {
             imsi: imsi.as_ref().map(imsi_arg).transpose()?.map(Into::into),
             msisdn: msisdn.as_ref().map(isdn_addr).transpose()?.map(Into::into),
-            category: None,
-            subscriber_status: None,
-            bearer_service_list: None,
-            teleservice_list: None,
-            odb_data: None,
-            roaming_restricted_in_sgsn_due_to_unsupported_feature: None,
-            network_access_mode: None,
+            ..InsertSubscriberDataArg::default()
         };
         staged_map_invoke(op_codes::INSERT_SUBSCRIBER_DATA, &arg)
     }
@@ -2160,12 +2220,12 @@ impl GsmMap {
     ) -> PyResult<StagedInvoke> {
         use gsm_map::operations::mo_forward_sm::MoForwardSmArg;
         use gsm_map::{SmRpDa, SmRpOa};
-        let arg = MoForwardSmArg {
-            sm_rp_da: SmRpDa::ServiceCentreAddressDa(isdn_addr(sc_addr)?.into()),
-            sm_rp_oa: SmRpOa::MsIsdn(isdn_addr(msisdn)?.into()),
-            sm_rp_ui: tpdu.into(),
-            imsi: imsi.as_ref().map(imsi_arg).transpose()?.map(Into::into),
-        };
+        let mut arg = MoForwardSmArg::new(
+            SmRpDa::ServiceCentreAddressDa(isdn_addr(sc_addr)?.into()),
+            SmRpOa::MsIsdn(isdn_addr(msisdn)?.into()),
+            tpdu.into(),
+        );
+        arg.imsi = imsi.as_ref().map(imsi_arg).transpose()?.map(Into::into);
         staged_map_invoke(gsm_map::op_codes::MO_FORWARD_SM, &arg)
     }
 
@@ -2181,13 +2241,13 @@ impl GsmMap {
     ) -> PyResult<StagedInvoke> {
         use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
         use gsm_map::{SmRpDa, SmRpOa};
-        let arg = MtForwardSmArg {
-            sm_rp_da: SmRpDa::Imsi(imsi_arg(imsi)?.into()),
-            sm_rp_oa: SmRpOa::ServiceCentreAddressOa(isdn_addr(sc_addr)?.into()),
-            sm_rp_ui: tpdu.into(),
-            more_messages_to_send: more_messages_to_send.then_some(()),
-        };
-        let bytes = rasn::ber::encode(&arg).map_err(err)?;
+        let mut arg = MtForwardSmArg::new(
+            SmRpDa::Imsi(imsi_arg(imsi)?.into()),
+            SmRpOa::ServiceCentreAddressOa(isdn_addr(sc_addr)?.into()),
+            tpdu.into(),
+        );
+        arg.more_messages_to_send = more_messages_to_send.then_some(());
+        let bytes = gsm_map::encode(&arg).map_err(err)?;
         Ok(StagedInvoke::new(
             Operation::MtForwardSm.op_code(),
             Some(bytes),
@@ -3632,6 +3692,7 @@ fn metrics() -> String {
 
 fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SigtranError", py.get_type::<SigtranError>())?;
+    m.add("MistypedParameter", py.get_type::<MistypedParameter>())?;
 
     // Namespace singletons.
     m.add("ss7", Bound::new(py, Ss7)?)?;

@@ -240,6 +240,17 @@ not a way past `screen`. The drop takes the same path as any other, so a sender
 that asked for return on error gets its UDTS. Everything the rules do not look at
 (an `End`, an `Abort`, a payload that is not TCAP) is routed as before.
 
+A rule that tests the IMSI (`imsi_in`, `imsi_prefix`) reads it from the argument
+of the operation, decoded strictly. If the argument of an operation that carries
+an IMSI does not decode, the IMSI is unknown, not absent: the first such rule
+whose other tests hold cannot be evaluated, and the message is **dropped** there
+(counted as `sigtran_content_rule_hits_total{rule=…,action="unevaluable"}`)
+instead of falling through to a later rule or to GTT. The argument types are the
+MAP version 3 ones. The version 1 and 2 arguments of `cancel-location`, `purge-ms`
+and `send-auth-info` are different types and do not decode as them, so an IMSI
+rule on those operations drops version 1 and 2 dialogues; leave those operations
+out of IMSI rules in a domain that still carries them.
+
 One segment of a segmented XUDT / LUDT does not hold a whole TCAP message, and the
 node does not reassemble in transit: segments are **not** evaluated against the
 rules and are routed on, counted in

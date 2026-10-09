@@ -43,7 +43,7 @@ itu-isup = "1"
 # with an Abort or a Reject. Drives the dialogue engine and content routing.
 tcap = "2"
 # GSM MAP (TS 29.002): operation codes + argument types (content routing view).
-gsm_map = "1.1"
+gsm_map = "2"
 # CAMEL CAP (TS 29.078): operation codes (content routing view for SCP).
 gsm_cap = "1.2"
 # INAP CS-1 (ITU-T Q.1218 / ETSI EN 300 374-1): operation codes + argument types

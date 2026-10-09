@@ -506,6 +506,65 @@ out = drive("ready-for-sm")
 assert len(_Probe.seen) == 4, _Probe.seen
 assert node.decode(out[0]).kind == "end"
 
+# ── An argument that does not decode is a mistyped parameter ──────────────────
+# MO-ForwardSM-Arg ::= SEQUENCE { sm-RP-DA, sm-RP-OA, sm-RP-UI, ... }, by hand:
+# serviceCentreAddressDA [4] 15550100, msisdn [2] 15550142, a two-octet TPDU.
+MO_DA = tlv(0x84, b"\x91\x51\x55\x10\x00")
+MO_OA = tlv(0x82, b"\x91\x51\x55\x10\x24")
+MO_UI = tlv(0x04, b"\xaa\xbb")
+mo_seen = {}
+
+@gsm_map.on_operation("mo-forward-sm")
+def on_mo_strict(dlg, arg):
+    mo_seen["ui"] = bytes(arg.sm_rp_ui)        # raises MistypedParameter if unreadable
+    dlg.reply(gsm_map.mo_forward_sm_res())
+    dlg.end()
+
+def mo(argument):
+    return node.deliver(node.assemble_begin(
+        op="mo-forward-sm", called_gt="15550100", called_ssn=8, calling_gt="15550142",
+        arg=argument,
+    ), opc=2000, dpc=1000)
+
+assert issubclass(siphon.MistypedParameter, siphon.SigtranError)
+
+# A member this node does not model, after the ones it does, is skipped
+# (TS 29.002 17.1.4): the argument is read.
+out = mo(tlv(0x30, MO_DA + MO_OA + MO_UI + b"\x9d\x01\x2a"))
+assert mo_seen.pop("ui") == b"\xaa\xbb"
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [] and d.result_invoke_id == 1
+
+# Without its sm-RP-UI the argument does not decode. The getter raises instead of
+# answering None, and the uncaught exception becomes the Reject it stands for:
+# invokeProblem, mistypedParameter, in an End.
+out = mo(tlv(0x30, MO_DA + MO_OA))
+assert "ui" not in mo_seen
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [(1, "invoke", 2)] and d.result_invoke_id is None
+assert node.open_dialogues() == 0
+
+# A handler that catches the exception decides for itself.
+@gsm_map.on_operation("mo-forward-sm")
+def on_mo_catching(dlg, arg):
+    try:
+        _ = arg.sm_rp_da
+    except siphon.MistypedParameter:
+        dlg.error(arg.invoke_id, 36)           # unexpectedDataValue, its own choice
+    dlg.end()
+
+d = node.decode(mo(tlv(0x30, MO_DA + MO_OA))[0])
+assert d.rejects == [] and d.error == (1, 36)
+
+# Any other operation has no forward-SM fields: None, not an error.
+@gsm_map.on_operation("purge-ms")
+def on_purge_fields(dlg, arg):
+    assert arg.sm_rp_ui is None and arg.sm_rp_oa is None
+    dlg.reply(gsm_map.purge_ms_res())
+    dlg.end()
+
+assert node.decode(drive("purge-ms")[0]).rejects == []
+
 # The new metric families are exposed.
 text = siphon.metrics()
 assert 'sigtran_tcap_abort_total{dir="rx",kind="p-abort",cause="resource-limitation"}' in text

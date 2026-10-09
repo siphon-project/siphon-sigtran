@@ -265,6 +265,45 @@ pub enum PeerComponent {
     },
 }
 
+impl PeerComponent {
+    /// What a handler rejects this component with when its parameter does not
+    /// decode as the type the operation defines: the invoke id to name and the
+    /// "mistyped parameter" problem of the component's class, for
+    /// [`Dialogue::reject`]. Q.772 3.7.2.3: "mistyped parameter: Signifies that
+    /// the type of parameter in an invoke component is not that agreed by the
+    /// two TC-Users"; 3.7.3.3 and 3.7.4.5 say the same of a return result and a
+    /// return error. `None` for a Reject, which has no parameter and is never
+    /// answered with one.
+    pub fn mistyped_parameter(&self) -> Option<(Option<InvokeId>, Problem)> {
+        match self {
+            Self::Invoke { invoke_id, .. } => Some((
+                Some(*invoke_id),
+                Problem::Invoke(InvokeProblem::MISTYPED_PARAMETER),
+            )),
+            Self::Result { invoke_id, .. } => Some((
+                Some(*invoke_id),
+                Problem::ReturnResult(ReturnResultProblem::MISTYPED_PARAMETER),
+            )),
+            Self::Error { invoke_id, .. } => Some((
+                Some(*invoke_id),
+                Problem::ReturnError(ReturnErrorProblem::MISTYPED_PARAMETER),
+            )),
+            Self::Reject { .. } | Self::LocalReject { .. } => None,
+        }
+    }
+}
+
+impl IncomingOp {
+    /// What a handler rejects the opening Invoke with when its argument does
+    /// not decode: see [`PeerComponent::mistyped_parameter`].
+    pub fn mistyped_parameter(&self) -> (Option<InvokeId>, Problem) {
+        (
+            Some(self.invoke_id),
+            Problem::Invoke(InvokeProblem::MISTYPED_PARAMETER),
+        )
+    }
+}
+
 /// One follow-up turn from the peer on an open dialogue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerTurn {

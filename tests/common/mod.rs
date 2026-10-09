@@ -12,7 +12,7 @@ use tcap::{Abort, AbortReason, TcapMessage};
 use siphon_sigtran::config::Tcap;
 use siphon_sigtran::dialogue::{
     CloseReason, Dialogue, DialogueClosed, DialogueEngine, IncomingOp, InvokeTimeout,
-    OperationClass, PeerTurn, TerminationHandler,
+    OperationClass, OutgoingBegin, PeerTurn, TerminationHandler,
 };
 use siphon_sigtran::transport::framing::wrap_m3ua;
 use siphon_sigtran::transport::Msu;
@@ -456,6 +456,21 @@ pub fn rejects_of(m: &Msu) -> Vec<tcap::Reject> {
             _ => None,
         })
         .collect()
+}
+
+/// The addressing of a dialogue this node opens toward the peer's HLR.
+pub fn outgoing() -> OutgoingBegin {
+    let party = |digits: &str, ssn| SccpAddress::with_gt(gt(digits), Some(ssn));
+    OutgoingBegin {
+        application_context: AC_ARCS.to_vec(),
+        called: party(PEER_GT, SubsystemNumber::Hlr),
+        calling: party(OUR_GT, SubsystemNumber::Msc),
+        opc: OUR_PC,
+        dpc: PEER_PC,
+        ni: 0,
+        sls: 0,
+        ingress_assoc: String::new(),
+    }
 }
 
 // ── The Wireshark dissection gate ────────────────────────────────────────────

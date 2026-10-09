@@ -393,6 +393,10 @@ impl Router {
             Action::Screen => Some(RouteDecision::Drop {
                 reason: "screened by content rule".into(),
             }),
+            Action::Unevaluable => Some(RouteDecision::Drop {
+                reason: "content rule tests the IMSI and the operation argument cannot be decoded"
+                    .into(),
+            }),
             Action::Route {
                 target,
                 rewrite_cdpa_gt,
@@ -429,6 +433,7 @@ fn action_label(action: &Action) -> &'static str {
         } => "rewrite",
         Action::Route { .. } => "route",
         Action::Screen => "screen",
+        Action::Unevaluable => "unevaluable",
     }
 }
 
@@ -576,6 +581,30 @@ mod tests {
             ..inbound
         };
         assert!(!matches!(r.route(&clean), RouteDecision::Drop { .. }));
+    }
+
+    #[test]
+    fn a_rule_that_cannot_be_evaluated_drops_the_message() {
+        let r = router();
+        // An updateLocation whose argument could not be decoded: the IMSI rule
+        // for updateLocation cannot be evaluated, so the message is not handed
+        // to a later rule or to GTT.
+        let d = r.route(&Inbound {
+            dpc: 1000,
+            cdpa: Some(GttSelector::from_digits("15559999")),
+            view: Some(MapView {
+                operation: Some(crate::content::Operation::UpdateLocation),
+                imsi_unreadable: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        match d {
+            RouteDecision::Drop { reason } => {
+                assert!(reason.contains("tests the IMSI"), "{reason}")
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
     }
 
     #[test]

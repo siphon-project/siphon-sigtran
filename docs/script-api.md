@@ -243,7 +243,7 @@ argument (`arg` / `idp`).
 | `calling_gt` / `called_gt` | Calling / called global-title digits, if present. |
 | `argument` | The raw BER argument bytes, if the Invoke carried a parameter. |
 | `further` | Every other component of the `Begin`, in order, as [`Component`](#component) objects. Empty for the usual single Invoke. |
-| `sm_rp_oa` / `sm_rp_da` / `sm_rp_ui` | For MO/MT-ForwardSM: the originating address, destination address, and TPDU bytes, decoded where present. |
+| `sm_rp_oa` / `sm_rp_da` / `sm_rp_ui` | For MO-ForwardSM (46) and MT-ForwardSM (44): the originating address, destination address, and TPDU bytes. `None` for any other operation. Raise [`MistypedParameter`](#mistyped) when the argument does not decode. |
 | `called_party_number` | For a CAMEL initialDP: the dialled number bytes. |
 
 !!! note "`sm_rp_ui` is an opaque SMS TPDU"
@@ -254,6 +254,35 @@ argument (`arg` / `idp`).
     TS 23.038, the User-Data-Header for concatenation, TON/NPI addresses), use
     the sibling [`tpdu`](https://crates.io/crates/tpdu) crate, which also ships
     as a Python wheel. See [Building an SMSC](cookbook/smsc.md).
+
+### An argument that does not decode { #mistyped }
+
+The decoded getters read the argument strictly. A member that is on the wire and
+cannot be read, a list element that cannot be read, or a missing mandatory member
+is an error, never a field that reads as absent; a member a later release of the
+protocol added after an extension marker is skipped, as TS 29.002 17.1.4 requires
+of a receiver. When the argument does not decode the getter raises
+`siphon.MistypedParameter` (a `SigtranError`).
+
+Let it propagate and the node answers for the script: the component is rejected
+(`Reject`, mistyped parameter: `invoke` problem 2 for an Invoke, `return-result`
+problem 2 for a result) in an `End`, and whatever the handler had staged is
+discarded. Catch it to decide otherwise:
+
+```python
+@gsm_map.on_operation("mo-forward-sm")
+async def on_mo(dlg, arg):
+    try:
+        tpdu = arg.sm_rp_ui
+    except siphon.MistypedParameter:
+        dlg.reject(arg.invoke_id, "invoke", 2)   # what the node does by default
+        dlg.end()
+        return
+    ...
+```
+
+A handler that raises anything else has staged nothing, and a `Begin` left
+unanswered that way is aborted.
 
 ### `PeerTurn` { #peerturn }
 

@@ -25,7 +25,7 @@ use async_sctp::{SctpAssociation, SctpConfig};
 
 use gsm_cap::operations::InitialDpArg;
 use gsm_map::operations::auth::SendAuthenticationInfoArg;
-use gsm_map::operations::location::{CancelLocationArg, UpdateLocationArg};
+use gsm_map::operations::location::{CancelLocationArg, Identity, UpdateLocationArg};
 use gsm_map::operations::mo_forward_sm::MoForwardSmArg;
 use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
 use gsm_map::operations::sri_sm::RoutingInfoForSmArg;
@@ -130,63 +130,44 @@ fn imsi_bytes(imsi_digits: &str) -> Vec<u8> {
 // ── MAP/CAP argument bytes (BER) ─────────────────────────────────────────────
 
 fn sri_sm_arg(msisdn: &str) -> Vec<u8> {
-    let arg = RoutingInfoForSmArg {
-        msisdn: isdn(msisdn).into(),
-        sm_rp_pri: true,
-        service_centre_address: isdn(OUR_GT).into(),
-        gprs_support_indicator: None,
-        sm_rp_mti: None,
-        sm_rp_smea: None,
-    };
+    let arg = RoutingInfoForSmArg::new(isdn(msisdn).into(), true, isdn(OUR_GT).into());
     rasn::ber::encode(&arg).expect("encode sri-sm")
 }
 
 fn update_location_arg(imsi: &str) -> Vec<u8> {
-    let arg = UpdateLocationArg {
-        imsi: imsi_bytes(imsi).into(),
-        msc_number: isdn("15550170").into(),
-        vlr_number: isdn("15550171").into(),
-        lmsi: None,
-        vlr_capability: None,
-    };
+    let arg = UpdateLocationArg::new(
+        imsi_bytes(imsi).into(),
+        isdn("15550170").into(),
+        isdn("15550171").into(),
+    );
     rasn::ber::encode(&arg).expect("encode ul")
 }
 
 fn cancel_location_arg(imsi: &str) -> Vec<u8> {
-    let arg = CancelLocationArg {
-        identity: imsi_bytes(imsi).into(),
-        cancellation_type: None,
-    };
+    let arg = CancelLocationArg::new(Identity::Imsi(imsi_bytes(imsi).into()));
     rasn::ber::encode(&arg).expect("encode cl")
 }
 
 fn send_auth_info_arg(imsi: &str) -> Vec<u8> {
-    let arg = SendAuthenticationInfoArg {
-        imsi: imsi_bytes(imsi).into(),
-        number_of_requested_vectors: 5.into(),
-        re_synchronisation_info: None,
-        requesting_node_type: None,
-    };
+    let arg = SendAuthenticationInfoArg::new(imsi_bytes(imsi).into(), 5.into());
     rasn::ber::encode(&arg).expect("encode sai")
 }
 
 fn mo_forward_sm_arg() -> Vec<u8> {
-    let arg = MoForwardSmArg {
-        sm_rp_da: SmRpDa::ServiceCentreAddressDa(isdn(OUR_GT).into()),
-        sm_rp_oa: SmRpOa::MsIsdn(isdn("15550142").into()),
-        sm_rp_ui: vec![0x00, 0x01, 0x02].into(),
-        imsi: None,
-    };
+    let arg = MoForwardSmArg::new(
+        SmRpDa::ServiceCentreAddressDa(isdn(OUR_GT).into()),
+        SmRpOa::MsIsdn(isdn("15550142").into()),
+        vec![0x00, 0x01, 0x02].into(),
+    );
     rasn::ber::encode(&arg).expect("encode mo")
 }
 
 fn mt_forward_sm_arg() -> Vec<u8> {
-    let arg = MtForwardSmArg {
-        sm_rp_da: SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
-        sm_rp_oa: SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
-        sm_rp_ui: vec![0x04, 0x0B, 0x91].into(),
-        more_messages_to_send: None,
-    };
+    let arg = MtForwardSmArg::new(
+        SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
+        SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
+        vec![0x04, 0x0B, 0x91].into(),
+    );
     rasn::ber::encode(&arg).expect("encode mt")
 }
 

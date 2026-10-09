@@ -126,45 +126,34 @@ fn imsi_bytes(digits: &str) -> Vec<u8> {
 // ── MAP/CAP argument bytes (BER) ─────────────────────────────────────────────
 
 fn sri_sm_arg(msisdn: &str) -> Vec<u8> {
-    let arg = RoutingInfoForSmArg {
-        msisdn: isdn(msisdn).into(),
-        sm_rp_pri: true,
-        service_centre_address: isdn(OUR_GT).into(),
-        gprs_support_indicator: None,
-        sm_rp_mti: None,
-        sm_rp_smea: None,
-    };
+    let arg = RoutingInfoForSmArg::new(isdn(msisdn).into(), true, isdn(OUR_GT).into());
     rasn::ber::encode(&arg).expect("encode sri-sm")
 }
 
 fn update_location_arg(imsi: &str) -> Vec<u8> {
-    let arg = UpdateLocationArg {
-        imsi: imsi_bytes(imsi).into(),
-        msc_number: isdn("15550170").into(),
-        vlr_number: isdn("15550171").into(),
-        lmsi: None,
-        vlr_capability: None,
-    };
+    let arg = UpdateLocationArg::new(
+        imsi_bytes(imsi).into(),
+        isdn("15550170").into(),
+        isdn("15550171").into(),
+    );
     rasn::ber::encode(&arg).expect("encode ul")
 }
 
 fn mo_forward_sm_arg() -> Vec<u8> {
-    let arg = MoForwardSmArg {
-        sm_rp_da: SmRpDa::ServiceCentreAddressDa(isdn(OUR_GT).into()),
-        sm_rp_oa: SmRpOa::MsIsdn(isdn("15550142").into()),
-        sm_rp_ui: vec![0x00, 0x01, 0x02].into(),
-        imsi: None,
-    };
+    let arg = MoForwardSmArg::new(
+        SmRpDa::ServiceCentreAddressDa(isdn(OUR_GT).into()),
+        SmRpOa::MsIsdn(isdn("15550142").into()),
+        vec![0x00, 0x01, 0x02].into(),
+    );
     rasn::ber::encode(&arg).expect("encode mo")
 }
 
 fn mt_forward_sm_arg() -> Vec<u8> {
-    let arg = MtForwardSmArg {
-        sm_rp_da: SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
-        sm_rp_oa: SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
-        sm_rp_ui: vec![0x04, 0x0B, 0x91].into(),
-        more_messages_to_send: None,
-    };
+    let arg = MtForwardSmArg::new(
+        SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
+        SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
+        vec![0x04, 0x0B, 0x91].into(),
+    );
     rasn::ber::encode(&arg).expect("encode mt")
 }
 
@@ -1425,15 +1414,10 @@ const SERVING_MSC: &str = "15550180";
 struct WireHlr;
 impl TerminationHandler for WireHlr {
     fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
-        let res = RoutingInfoForSmRes {
-            imsi: imsi_bytes(HLR_IMSI).into(),
-            location_info_with_lmsi: LocationInfoWithLmsi {
-                network_node_number: isdn(SERVING_MSC).into(),
-                lmsi: None,
-                gprs_node_indicator: None,
-                additional_number: None,
-            },
-        };
+        let res = RoutingInfoForSmRes::new(
+            imsi_bytes(HLR_IMSI).into(),
+            LocationInfoWithLmsi::new(isdn(SERVING_MSC).into()),
+        );
         dlg.reply(op.operation_code, Some(rasn::ber::encode(&res).unwrap()));
         dlg.end().expect("end");
     }
@@ -1486,7 +1470,7 @@ fn decode_sri_sm_reply(payload: &[u8]) -> Option<(i64, Vec<u8>, Vec<u8>)> {
                 }),
             ..
         }) => {
-            let res: RoutingInfoForSmRes = rasn::ber::decode(param.as_bytes()).ok()?;
+            let res: RoutingInfoForSmRes = gsm_map::decode(param.as_bytes()).ok()?;
             Some((
                 op,
                 res.imsi.to_vec(),
@@ -1611,15 +1595,10 @@ fn otid_of_begin(payload: &[u8]) -> Option<Vec<u8>> {
 /// answering invoke id 1, addressed dtid = the node's OTID, over SCCP
 /// route-on-SSN 6 back to the node (→ Local termination in the engine).
 fn sri_sm_reply_end(node_otid: &[u8]) -> Vec<u8> {
-    let res = RoutingInfoForSmRes {
-        imsi: imsi_bytes(HLR_IMSI).into(),
-        location_info_with_lmsi: LocationInfoWithLmsi {
-            network_node_number: isdn(SERVING_MSC).into(),
-            lmsi: None,
-            gprs_node_indicator: None,
-            additional_number: None,
-        },
-    };
+    let res = RoutingInfoForSmRes::new(
+        imsi_bytes(HLR_IMSI).into(),
+        LocationInfoWithLmsi::new(isdn(SERVING_MSC).into()),
+    );
     let end = End {
         dtid: node_otid.to_vec().into(),
         dialogue_portion: None,
@@ -1735,7 +1714,7 @@ async fn wire_originates_sri_sm_and_correlates_the_response() {
                 ..
             } => {
                 let res: RoutingInfoForSmRes =
-                    rasn::ber::decode(parameter.as_ref()?.as_slice()).ok()?;
+                    gsm_map::decode(parameter.as_ref()?.as_slice()).ok()?;
                 Some((
                     *operation_code,
                     res.imsi.to_vec(),
@@ -1943,10 +1922,12 @@ fn sms_deliver_udh(part: u8) -> Vec<u8> {
 /// `moreMessagesToSend` (present on every segment but the last).
 fn mt_fwd_arg(part: u8, more: bool) -> Vec<u8> {
     let arg = MtForwardSmArg {
-        sm_rp_da: SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
-        sm_rp_oa: SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
-        sm_rp_ui: sms_deliver_udh(part).into(),
         more_messages_to_send: more.then_some(()),
+        ..MtForwardSmArg::new(
+            SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
+            SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
+            sms_deliver_udh(part).into(),
+        )
     };
     rasn::ber::encode(&arg).expect("encode mt-forwardSM")
 }

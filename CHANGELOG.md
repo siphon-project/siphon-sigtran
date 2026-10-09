@@ -87,6 +87,27 @@ doing three things that were wrong on the wire.
 - **Nothing is sent after the peer's `End`.** A handler that staged components on
   the turn that carried the `End` had them sent to a transaction that no longer
   existed.
+- **A MAP argument that does not decode is a mistyped parameter, not a missing
+  field.** On `gsm_map` 2 every MAP decode goes through its strict decoder. The
+  forward-SM getters (`arg.sm_rp_oa` / `sm_rp_da` / `sm_rp_ui`) returned `None`
+  for an argument with a member that could not be read; they raise
+  `siphon.MistypedParameter`, and a handler that lets it propagate has the Invoke
+  rejected (Reject, invokeProblem mistypedParameter) in an End. The opposite
+  defect is gone too: an argument carrying a member of a later release after an
+  extension marker used to fail as a whole, and is now read (TS 29.002 17.1.4).
+- **An IMSI rule is not skipped because the IMSI could not be read.** The content
+  layer took a failed decode of the operation argument for "no IMSI", so the rule
+  did not match and the message went on to the next rule or to GTT. The IMSI is
+  now unknown rather than absent, the rule cannot be evaluated, and the message is
+  dropped (`Action::Unevaluable`, counted as a hit of that rule with
+  `action="unevaluable"`). `gsm_map` models the version 3 arguments only: the
+  version 1 and 2 forms of cancelLocation, purgeMS and sendAuthenticationInfo do
+  not decode, so an IMSI rule on those operations now drops them where it used to
+  miss them.
+- **The MAP results and arguments the builders stage have the encodings `gsm_map`
+  2 corrected.** `send_authentication_info_res` now carries the `[3]` tag of
+  `SendAuthenticationInfoRes`; it went out as a bare SEQUENCE, which is the
+  version 2 type. See the `gsm_map` 2.0.0 changelog for the full list.
 - **Content rules no longer evaluate a message they could not read in full.** A
   `Begin` or `Continue` that does not decode completely is dropped in a domain
   with content rules and counted in `sigtran_content_unscreened_total`. Before, a
@@ -97,7 +118,10 @@ doing three things that were wrong on the wire.
 
 ### Changed
 
-- `tcap` 2 (was 1).
+- `tcap` 2 (was 1), `gsm_map` 2 (was 1.1).
+- `content::MapView` has `imsi_unreadable`; `content::Action` has `Unevaluable`.
+- A Python handler that raises has what it staged before the exception discarded
+  (an `async def` handler used to have it sent).
 - `dialogue::Dialogue`: `invoke` returns `Result<InvokeId, DialogueError>`;
   `send`, `end` and `abort` return `Result<(), DialogueError>`; `abort` takes no
   argument (a handler aborts as the TC-user and cannot claim to be the provider);
@@ -123,6 +147,10 @@ doing three things that were wrong on the wire.
   `UserAbort`, `DialogueError`; `Dialogue::invoke_with`, `reject`,
   `set_idle_timeout`, `idle_timeout`, `outstanding_invokes`.
 - `content::screen` and `content::Screening`.
+- `dialogue::PeerComponent::mistyped_parameter` and
+  `IncomingOp::mistyped_parameter`: the invoke id and problem to `reject` a
+  component with when its parameter does not decode.
+- Python: `siphon.MistypedParameter`.
 - Metrics: `sigtran_tcap_abort_total{dir,kind,cause}` (`kind` is `p-abort` or
   `u-abort`; `cause` is a closed set, a P-Abort cause value Q.773 does not name
   counts as `other`), `sigtran_tcap_reject_total{dir,problem}`,
@@ -145,6 +173,11 @@ doing three things that were wrong on the wire.
   so a handler that only tests `is_result` / `is_invoke` / `is_error` ignores them
   correctly. Use `closed` (and `is_end`) to release what the script tied to the
   dialogue.
+- **`arg.sm_rp_oa` / `sm_rp_da` / `sm_rp_ui` raise `siphon.MistypedParameter`**
+  for an argument that does not decode, and are `None` for any operation other
+  than MO-ForwardSM (46) and MT-ForwardSM (44). A handler that tested them for
+  `None` to detect a bad argument has to catch the exception, or let it propagate
+  to have the Invoke rejected.
 - **Saying nothing on a follow-up turn no longer aborts.** A handler that relied
   on that to get rid of a dialogue has to call `dlg.abort()` or `dlg.end()`.
 - **Set an idle timeout on a dialogue that waits** (`dlg.set_idle_timeout(...)`):
