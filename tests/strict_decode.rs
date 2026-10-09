@@ -413,3 +413,215 @@ mod map {
         assert!(rejects_of(&out[0]).is_empty());
     }
 }
+
+// ── INAP CS-1 (ETS 300 374-1 / Q.1218) ───────────────────────────────────────
+
+mod inap_cs1 {
+    use super::*;
+    use inap::operations::{ConnectArg, InitialDpArg, RequestReportBcsmEventArg};
+    use inap::types::{BcsmEvent, EventTypeBcsm, LegId, MonitorMode};
+    use siphon_sigtran::dialogue::{DialogueEngine, OperationClass};
+
+    /// The IN SCP subsystem; Wireshark hands its TCAP components to the INAP
+    /// dissector.
+    const SCP: u8 = 106;
+    const INITIAL_DP: i64 = 0;
+
+    /// `cs1-ssp-to-scp`: `{ ccitt(0) identified-organization(4) etsi(0)
+    /// inDomain(1) in-network(1) ac(1) cs1-ssp-to-scp(0) version1(0) }` (ETS
+    /// 300 374-1 clause 6.5), as OBJECT IDENTIFIER content octets.
+    const CS1_SSP_TO_SCP: [u8; 7] = [0x04, 0x00, 0x01, 0x01, 0x01, 0x00, 0x00];
+
+    /// Q.763 Called Party Number, international, ISDN numbering plan, for the
+    /// digits 15550142: nature of address 4 with an even count, plan 1.
+    const CALLED: [u8; 6] = [0x04, 0x10, 0x51, 0x55, 0x10, 0x24];
+
+    /// `InitialDPArg ::= SEQUENCE { serviceKey [0] ServiceKey,
+    /// calledPartyNumber [2] CalledPartyNumber OPTIONAL, .. }` with service key
+    /// 100.
+    fn initial_dp() -> Vec<u8> {
+        tlv(
+            0x30,
+            &[&[0x80, 0x01, 0x64][..], &tlv(0x82, &CALLED)[..]].concat(),
+        )
+    }
+
+    /// An SCP that reads the InitialDP strictly, arms two detection points each
+    /// on its leg and connects the call, holding the dialogue open.
+    fn scp() -> DialogueEngine {
+        let probe = Probe::new()
+            .on_begin(|dlg, op| {
+                let argument = op.argument.as_deref().unwrap_or_default();
+                let Ok(idp) = inap::decode::<InitialDpArg>(argument) else {
+                    let (invoke_id, problem) = op.mistyped_parameter();
+                    dlg.reject(invoke_id, problem);
+                    dlg.end().expect("end");
+                    return;
+                };
+                assert_eq!(i64::try_from(&idp.service_key), Ok(100));
+                let mut answer =
+                    BcsmEvent::new(EventTypeBcsm::OAnswer, MonitorMode::NotifyAndContinue);
+                answer.leg_id = Some(LegId::sending(2));
+                let mut disconnect =
+                    BcsmEvent::new(EventTypeBcsm::ODisconnect, MonitorMode::Interrupted);
+                disconnect.leg_id = Some(LegId::sending(1));
+                let rrbe = RequestReportBcsmEventArg::new(vec![answer, disconnect]);
+                let connect = ConnectArg::new(CALLED.to_vec().into());
+                // Both are class 2 operations (Q.1218): no reply is success.
+                for (code, argument) in [
+                    (
+                        inap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+                        inap::encode(&rrbe),
+                    ),
+                    (inap::op_codes::CONNECT, inap::encode(&connect)),
+                ] {
+                    dlg.invoke_with(
+                        code,
+                        Some(argument.expect("encode")),
+                        OperationClass::Two,
+                        None,
+                    )
+                    .expect("invoke");
+                }
+                dlg.send().expect("send");
+            })
+            .arc();
+        let mut engine = DialogueEngine::new(Default::default());
+        engine.register(SCP, INITIAL_DP, probe);
+        engine
+    }
+
+    /// A dialogue under the real cs1-ssp-to-scp context: the Begin with
+    /// InitialDP reaches the handler, and the Continue it answers with carries
+    /// the AARE for that context, a RequestReportBCSMEvent whose events name
+    /// their legs, and a Connect. Wireshark reads all of it as INAP.
+    #[test]
+    fn a_dialogue_under_the_cs1_application_context_dissects_as_inap() {
+        let engine = scp();
+        let request = inbound_between(
+            SCP,
+            SCP,
+            &begin(
+                &[0x1A, 0x1B],
+                Some(&aarq(&CS1_SSP_TO_SCP)),
+                &[invoke(1, INITIAL_DP, Some(&initial_dp()))],
+            ),
+        );
+        let out = engine.deliver(&request, "ingress");
+        assert_eq!(out.len(), 1);
+        let TcapMessage::Continue(c) = decode(&out[0]) else {
+            panic!("expected a Continue");
+        };
+        assert_eq!(c.dtid.as_ref(), &[0x1A, 0x1B]);
+        let Ok(Some(tcap::DialoguePdu::Aare {
+            application_context_name,
+            ..
+        })) = c.dialogue_portion.as_ref().expect("an AARE").dialogue_pdu()
+        else {
+            panic!("expected an AARE");
+        };
+        assert_eq!(
+            application_context_name.as_ref(),
+            &inap::application_context::CS1_SSP_TO_SCP[..],
+            "the helper names the context a peer sends"
+        );
+
+        // The RequestReportBCSMEvent on the wire, against the ASN.1 by hand:
+        // legID [2] is an explicit tag around the LegID CHOICE.
+        let bytes = tcap_bytes(&out[0]);
+        let events = [
+            // 30 { [0] oAnswer (7), [1] notifyAndContinue (1), [2] { [0] leg 2 } }
+            &[0x30, 0x0B, 0x80, 0x01, 0x07, 0x81, 0x01, 0x01][..],
+            &[0xA2, 0x03, 0x80, 0x01, 0x02][..],
+            // 30 { [0] oDisconnect (9), [1] interrupted (0), [2] { [0] leg 1 } }
+            &[0x30, 0x0B, 0x80, 0x01, 0x09, 0x81, 0x01, 0x00][..],
+            &[0xA2, 0x03, 0x80, 0x01, 0x01][..],
+        ]
+        .concat();
+        assert!(contains(&bytes, &tlv(0x30, &tlv(0xA0, &events))));
+
+        if let Some(d) = dissect_all(&[&request, &out[0]]) {
+            d.present("inap")
+                // The Begin: the context, and the InitialDP.
+                .show("tcap.aarq_application_context_name", "0.4.0.1.1.1.0.0")
+                .present("inap.InitialDPArg_element")
+                .show("inap.serviceKey", "100")
+                // The Continue: the AARE, then the two invokes.
+                .present("tcap.continue_element")
+                .hex("tcap.dtid", "1a1b")
+                .show("tcap.aare_application_context_name", "0.4.0.1.1.1.0.0")
+                .show_all("inap.code.local", &["0", "23", "20"])
+                .present("inap.RequestReportBCSMEventArg_element")
+                .show("inap.bcsmEvents", "2")
+                .show_all("inap.eventTypeBCSM", &["7", "9"])
+                .show_all("inap.monitorMode", &["1", "0"])
+                .show_all("inap.sendingSideID", &["02", "01"])
+                .present("inap.ConnectArg_element")
+                .show("inap.destinationRoutingAddress", "1")
+                .show_all("inap.CalledPartyNumber", &["04:10:51:55:10:24"]);
+        }
+    }
+
+    /// An InitialDP that does not decode is rejected: Reject, invokeProblem,
+    /// mistypedParameter, in an End that still answers the dialogue request.
+    #[test]
+    fn an_initial_dp_that_does_not_decode_is_rejected() {
+        let engine = scp();
+        for damaged in [
+            // serviceKey [0] announces four octets and holds one.
+            tlv(0x30, &[0x80, 0x04, 0x64]),
+            // No serviceKey, which ETS 300 374-1 makes mandatory.
+            tlv(0x30, &tlv(0x82, &CALLED)),
+            // A member InitialDPArg does not have ([45]).
+            tlv(0x30, &[0x80, 0x01, 0x64, 0x9F, 0x2D, 0x01, 0x00]),
+            // An eventTypeBCSM [28] that is not one of the enumeration (99).
+            tlv(0x30, &[0x80, 0x01, 0x64, 0x9C, 0x01, 0x63]),
+        ] {
+            let request = inbound_between(
+                SCP,
+                SCP,
+                &begin(
+                    &[0x1C],
+                    Some(&aarq(&CS1_SSP_TO_SCP)),
+                    &[invoke(3, INITIAL_DP, Some(&damaged))],
+                ),
+            );
+            let out = engine.deliver(&request, "ingress");
+            assert_eq!(out.len(), 1, "{damaged:02x?}");
+            let TcapMessage::End(_) = decode(&out[0]) else {
+                panic!("expected an End");
+            };
+            assert_eq!(
+                rejects_of(&out[0]),
+                vec![Reject::invoke(3, tcap::InvokeProblem::MISTYPED_PARAMETER)],
+                "{damaged:02x?}"
+            );
+            assert_eq!(engine.open_dialogues(), 0);
+            if let Some(d) = dissect(&out[0]) {
+                d.present("tcap.end_element")
+                    .hex("tcap.dtid", "1c")
+                    .show("tcap.aare_application_context_name", "0.4.0.1.1.1.0.0")
+                    .present("inap.reject_element")
+                    .show("inap.present", "3")
+                    .show("inap.invokeProblem", "2")
+                    .label("inap.invokeProblem", "mistypedArgument");
+            }
+        }
+    }
+
+    /// The lenient decoder took an InitialDP with an unreadable member behind
+    /// an explicit tag for one without that member.
+    #[test]
+    fn the_lenient_decoder_returns_the_initial_dp_without_the_unreadable_member() {
+        // bearerCapability [27] is an explicit tag around a CHOICE { bearerCap
+        // [0], tmr [1] }; [5] is no alternative of it.
+        let wire = tlv(
+            0x30,
+            &[&[0x80, 0x01, 0x64][..], &tlv(0xBB, &[0x85, 0x01, 0x00])[..]].concat(),
+        );
+        let lenient: InitialDpArg =
+            rasn::ber::decode(&wire).expect("the lenient decoder accepts it");
+        assert_eq!(lenient.bearer_capability, None);
+        assert!(inap::decode::<InitialDpArg>(&wire).is_err());
+    }
+}

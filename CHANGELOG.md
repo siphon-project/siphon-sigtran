@@ -104,6 +104,24 @@ doing three things that were wrong on the wire.
   version 1 and 2 forms of cancelLocation, purgeMS and sendAuthenticationInfo do
   not decode, so an IMSI rule on those operations now drops them where it used to
   miss them.
+- **The INAP application context was a module identifier.**
+  `inap.AC.ssp_to_scp` was `0.4.0.1.1.0.3.0`, the object identifier of the ASN.1
+  module `Core-INAP-CS1-Codes`. A dialogue the node opened with it named no
+  application context an SSF knows. It is `0.4.0.1.1.1.0.0` (cs1-ssp-to-scp, ETS
+  300 374-1 clause 6.5) on `inap` 2. Terminated dialogues were not affected:
+  handlers are found by subsystem and operation, and the answer carries the
+  context the peer proposed.
+- **INAP encodings that a conforming SSF rejects are gone.** A leg in
+  RequestReportBCSMEvent went out as a primitive `[2]` (`82 01 02`) where `legID`
+  is an explicit tag around a CHOICE (`A2 03 80 01 02`); `informationToSend` and
+  `collectedInfo` went out as opaque octets behind a primitive tag where both are
+  constructed choices. See the `inap` 2.0.0 changelog for the full list.
+- **An INAP InitialDP that does not decode is a mistyped parameter.** The
+  `inap_service_key` / `inap_called_party_number` / `inap_calling_party_number`
+  getters returned `None`; they raise `siphon.MistypedParameter`, answered with a
+  Reject as for MAP. An InitialDP carrying the members a real SSF sends
+  (`bearerCapability`, `extensions`, `redirectionInformation`, …) used to be
+  refused as a whole, and decodes.
 - **The MAP results and arguments the builders stage have the encodings `gsm_map`
   2 corrected.** `send_authentication_info_res` now carries the `[3]` tag of
   `SendAuthenticationInfoRes`; it went out as a bare SEQUENCE, which is the
@@ -118,7 +136,7 @@ doing three things that were wrong on the wire.
 
 ### Changed
 
-- `tcap` 2 (was 1), `gsm_map` 2 (was 1.1).
+- `tcap` 2 (was 1), `gsm_map` 2 (was 1.1), `inap` 2 (was 1.1).
 - `content::MapView` has `imsi_unreadable`; `content::Action` has `Unevaluable`.
 - A Python handler that raises has what it staged before the exception discarded
   (an `async def` handler used to have it sent).
@@ -150,7 +168,9 @@ doing three things that were wrong on the wire.
 - `dialogue::PeerComponent::mistyped_parameter` and
   `IncomingOp::mistyped_parameter`: the invoke id and problem to `reject` a
   component with when its parameter does not decode.
-- Python: `siphon.MistypedParameter`.
+- Python: `siphon.MistypedParameter`; `inap.AC.assist_handoff_ssp_to_scp` and
+  `inap.AC.ip_to_scp`; a leg in `inap.request_report_bcsm_event` events; INAP
+  event types 1, 8 and 16.
 - Metrics: `sigtran_tcap_abort_total{dir,kind,cause}` (`kind` is `p-abort` or
   `u-abort`; `cause` is a closed set, a P-Abort cause value Q.773 does not name
   counts as `other`), `sigtran_tcap_reject_total{dir,problem}`,
@@ -178,6 +198,15 @@ doing three things that were wrong on the wire.
   than MO-ForwardSM (46) and MT-ForwardSM (44). A handler that tested them for
   `None` to detect a bad argument has to catch the exception, or let it propagate
   to have the Invoke rejected.
+- **`inap.play_announcement` and `inap.prompt_and_collect_user_information` take
+  typed arguments.** `information_to_send=` used to be opaque octets put on the
+  wire as given; it is now the BER of an `InformationToSend` value and is refused
+  if it is not one, and `message_id=` / `tone_id=` build the common cases.
+  `collected_info=` likewise, with `maximum_digits=` for the common case.
+- **`inap.AC.ssp_to_scp` has another value** (`0.4.0.1.1.1.0.0`). A script that
+  compared an application context with the old arcs has to compare with the new.
+- **The `inap_*` getters raise `siphon.MistypedParameter`** for an InitialDP that
+  does not decode, and are `None` for any operation other than initialDP.
 - **Saying nothing on a follow-up turn no longer aborts.** A handler that relied
   on that to get rid of a dialogue has to call `dlg.abort()` or `dlg.end()`.
 - **Set an idle timeout on a dialogue that waits** (`dlg.set_idle_timeout(...)`):

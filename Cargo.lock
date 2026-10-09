@@ -1042,7 +1042,7 @@ version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41f20d4ebad4f25dec4e9bc7b61f660a8124541cbea73b4dee3b081c16ea7c66"
 dependencies = [
- "inap",
+ "inap 1.1.0",
  "rasn",
  "thiserror 2.0.20",
 ]
@@ -1411,6 +1411,16 @@ name = "inap"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d377252b44d8202a736736b49896653055903646d14c33bec33824af01476729"
+dependencies = [
+ "rasn",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "inap"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad9e33756e8b519cb21a2900ea28fff7745edada59b2c64cdc1b6d7ffd47f58d"
 dependencies = [
  "rasn",
  "thiserror 2.0.20",
@@ -3017,7 +3027,7 @@ dependencies = [
  "criterion",
  "gsm_cap",
  "gsm_map",
- "inap",
+ "inap 2.0.0",
  "itu-isup",
  "m2pa",
  "m3ua",

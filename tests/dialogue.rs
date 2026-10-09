@@ -60,7 +60,7 @@ const AC_INFO_RETRIEVAL: [u32; 8] = [0, 4, 0, 0, 1, 0, 14, 3]; // infoRetrieval 
 const AC_MO_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 21, 3]; // shortMsgMO-Relay v3
 const AC_MT_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 25, 3]; // shortMsgMT-Relay v3
 const AC_CAP: [u32; 8] = [0, 4, 0, 0, 1, 21, 3, 4]; // gsmSSF-scfGeneric v3
-const AC_INAP: [u32; 8] = [0, 4, 0, 1, 1, 0, 3, 0]; // cs1-ssp-to-scp (Core INAP CS-1)
+const AC_INAP: [u32; 8] = [0, 4, 0, 1, 1, 1, 0, 0]; // cs1-ssp-to-scp (ETS 300 374-1 6.5)
 
 // The IN SCP subsystem (route-on-SSN, dispatched to the INAP dissector in
 // Wireshark by default).
@@ -395,49 +395,27 @@ fn release_call_arg() -> Vec<u8> {
 
 fn inap_initial_dp_arg() -> Vec<u8> {
     let arg = inap::operations::InitialDpArg {
-        service_key: 100.into(),
         called_party_number: Some(isdn("15550142").into()),
         calling_party_number: Some(isdn(PEER_GT).into()),
-        calling_partys_category: None,
-        ip_ssp_capabilities: None,
-        ip_available: None,
-        location_number: None,
-        original_called_party_id: None,
-        high_layer_compatibility: None,
-        service_interaction_indicators: None,
-        additional_calling_party_number: None,
-        forward_call_indicators: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
+        ..inap::operations::InitialDpArg::new(100)
     };
     inap::encode(&arg).expect("encode inap idp")
 }
 
 fn inap_rrbe_arg() -> Vec<u8> {
-    let arg = inap::operations::RequestReportBcsmEventArg {
-        bcsm_events: vec![
-            inap::types::BcsmEvent {
-                event_type_bcsm: inap::types::EventTypeBcsm::OAnswer,
-                monitor_mode: inap::types::MonitorMode::Interrupted,
-                leg_id: None,
-            },
-            inap::types::BcsmEvent {
-                event_type_bcsm: inap::types::EventTypeBcsm::ODisconnect,
-                monitor_mode: inap::types::MonitorMode::NotifyAndContinue,
-                leg_id: None,
-            },
-        ],
-    };
+    use inap::types::{BcsmEvent, EventTypeBcsm, LegId, MonitorMode};
+    // oAnswer on the called leg, oDisconnect on the calling leg: `legID [2]`
+    // is an explicit tag around the LegID CHOICE.
+    let mut answer = BcsmEvent::new(EventTypeBcsm::OAnswer, MonitorMode::Interrupted);
+    answer.leg_id = Some(LegId::sending(2));
+    let mut disconnect = BcsmEvent::new(EventTypeBcsm::ODisconnect, MonitorMode::NotifyAndContinue);
+    disconnect.leg_id = Some(LegId::sending(1));
+    let arg = inap::operations::RequestReportBcsmEventArg::new(vec![answer, disconnect]);
     inap::encode(&arg).expect("encode inap rrbe")
 }
 
 fn inap_connect_arg() -> Vec<u8> {
-    let arg = inap::operations::ConnectArg {
-        destination_routing_address: vec![isdn("15550123").into()],
-        correlation_id: None,
-        original_called_party_id: None,
-        scf_id: None,
-    };
+    let arg = inap::operations::ConnectArg::new(isdn("15550123").into());
     inap::encode(&arg).expect("encode inap connect")
 }
 
@@ -448,11 +426,9 @@ fn inap_release_call_arg() -> Vec<u8> {
 }
 
 fn inap_event_report_bcsm_arg() -> Vec<u8> {
-    let arg = inap::operations::EventReportBcsmArg {
-        event_type_bcsm: inap::types::EventTypeBcsm::OAnswer,
-        leg_id: None,
-        misc_call_info: None,
-    };
+    let mut arg = inap::operations::EventReportBcsmArg::new(inap::types::EventTypeBcsm::OAnswer);
+    arg.leg_id = Some(inap::types::LegId::receiving(2));
+    arg.misc_call_info = Some(inap::types::MiscCallInfo::request());
     inap::encode(&arg).expect("encode inap erb")
 }
 

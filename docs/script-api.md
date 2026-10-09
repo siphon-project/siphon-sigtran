@@ -171,11 +171,28 @@ argument off the [`IncomingOp`](#incomingop) `inap_*` getters (`inap_service_key
 | `call-information-report` | CallInformationReport | 44 |
 | `specialized-resource-report` | SpecializedResourceReport | 49 |
 
-The SCF invoke builders an SCP stages toward the SSF (`inap.connect`,
-`inap.request_report_bcsm_event`, `inap.apply_charging`, `inap.release_call`,
-`inap.play_announcement`, `inap.prompt_and_collect_user_information`,
-`inap.connect_to_resource`, `inap.continue_()`) stage the same way as `gsm_cap`'s,
-with `inap.AC` supplying the application contexts.
+The SCF invoke builders an SCP stages toward the SSF stage the same way as
+`gsm_cap`'s:
+
+| Call | Stages |
+|---|---|
+| `inap.connect(destination_routing_address=[…], original_called_party_id=None)` | Connect. ETS 300 374-1 allows one destination, Q.1218 up to three. |
+| `inap.request_report_bcsm_event(events=[…])` | RequestReportBCSMEvent. Each event is `(event_type_bcsm, monitor_mode)` or `(event_type_bcsm, monitor_mode, leg)`; the leg goes out as `legID [2] { sendingSideID [0] }`. Event types 1 to 18 of Q.1218, including `origAttemptAuthorized` (1), `oMidCall` (8) and `tMidCall` (16). |
+| `inap.apply_charging(charging_characteristics=…, party_to_charge=None)` | ApplyCharging. |
+| `inap.release_call(cause=…)` | ReleaseCall with a Q.850 cause. |
+| `inap.continue_()` | Continue. |
+| `inap.play_announcement(message_id=… \| tone_id=…, tone_duration=… \| information_to_send=…)` | PlayAnnouncement. What to send is a typed choice: an elementary announcement id, a tone, or the BER of an `InformationToSend` value (decoded and refused if it is not one). |
+| `inap.prompt_and_collect_user_information(maximum_digits=…, minimum_digits=None \| collected_info=…, …)` | PromptAndCollectUserInformation, with an optional prompt given as for `play_announcement`. |
+| `inap.connect_to_resource(ip_routing_address=None)` | ConnectToResource, to that address or to the SRF colocated with the SSF. |
+
+`inap.AC` supplies the application contexts of ETS 300 374-1 clause 6.5:
+`inap.AC.ssp_to_scp` (`0.4.0.1.1.1.0.0`), `inap.AC.assist_handoff_ssp_to_scp`
+(`0.4.0.1.1.1.1.0`) and `inap.AC.ip_to_scp` (`0.4.0.1.1.1.2.0`). A terminated
+dialogue answers with the context the SSF proposed.
+
+The `inap_*` getters decode the InitialDP strictly and raise
+[`MistypedParameter`](#mistyped) when it does not decode: a member that cannot be
+read, a member the argument does not have, a missing `serviceKey`.
 
 ## The `Dialogue` handle { #dialogue }
 

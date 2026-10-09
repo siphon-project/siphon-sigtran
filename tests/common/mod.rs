@@ -230,6 +230,25 @@ pub fn inbound_to(called_ssn: SubsystemNumber, tcap_bytes: &[u8]) -> Msu {
     }
 }
 
+/// The same between two subsystems given by number, for the protocols whose
+/// dissector Wireshark picks by subsystem (the peer's becomes the called
+/// subsystem of our replies).
+pub fn inbound_between(called_ssn: u8, calling_ssn: u8, tcap_bytes: &[u8]) -> Msu {
+    let called = SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::from_u8(called_ssn)));
+    let calling = SccpAddress::with_gt(gt(PEER_GT), Some(SubsystemNumber::from_u8(calling_ssn)));
+    Msu {
+        opc: PEER_PC,
+        dpc: OUR_PC,
+        si: 3,
+        ni: 0,
+        mp: 0,
+        sls: 0,
+        payload: UnitData::new(called, calling, tcap_bytes.to_vec())
+            .encode()
+            .expect("encode sccp udt"),
+    }
+}
+
 fn udt_of(m: &Msu) -> UnitData {
     match SccpMessage::decode(&m.payload).expect("decode sccp") {
         SccpMessage::Udt(u) => u,

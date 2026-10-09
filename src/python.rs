@@ -434,34 +434,48 @@ impl PyIncomingOp {
             .map(|n| PyBytes::new(py, n.as_ref()))
     }
 
-    /// The `serviceKey` of an INAP CS-1 initialDP, if decoded: the IN service
-    /// logic the SSF triggered on (an `@inap.on_operation("initial-dp")` handler
-    /// keys its service selection on it).
+    /// The `serviceKey` of an INAP CS-1 initialDP: the IN service logic the SSF
+    /// triggered on (an `@inap.on_operation("initial-dp")` handler keys its
+    /// service selection on it). `None` for another operation. Raises
+    /// `MistypedParameter` when the argument does not decode as an INAP
+    /// InitialDPArg, or the key does not fit an integer.
     #[getter]
-    fn inap_service_key(&self) -> Option<i64> {
-        let bytes = self.argument.as_ref()?;
-        let idp: inap::operations::InitialDpArg = inap::decode(bytes).ok()?;
-        i64::try_from(&idp.service_key).ok()
+    fn inap_service_key(&self) -> PyResult<Option<i64>> {
+        let Some(idp) = self.inap_initial_dp()? else {
+            return Ok(None);
+        };
+        i64::try_from(&idp.service_key)
+            .map(Some)
+            .map_err(|_| mistyped("the InitialDP serviceKey", "it does not fit an integer"))
     }
 
-    /// The `calledPartyNumber` of an INAP CS-1 initialDP, if decoded (the
-    /// fixed-network dialled digits, distinct from the CAMEL initialDP the
+    /// The `calledPartyNumber` of an INAP CS-1 initialDP (the fixed-network
+    /// dialled digits, distinct from the CAMEL initialDP the
     /// [`called_party_number`](Self::called_party_number) getter decodes).
+    /// `None` when the argument carries none, or for another operation; raises
+    /// `MistypedParameter` when the argument does not decode.
     #[getter]
-    fn inap_called_party_number<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
-        let bytes = self.argument.as_ref()?;
-        let idp: inap::operations::InitialDpArg = inap::decode(bytes).ok()?;
-        idp.called_party_number
-            .map(|n| PyBytes::new(py, n.as_ref()))
+    fn inap_called_party_number<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        Ok(self
+            .inap_initial_dp()?
+            .and_then(|idp| idp.called_party_number)
+            .map(|n| PyBytes::new(py, n.as_ref())))
     }
 
-    /// The `callingPartyNumber` of an INAP CS-1 initialDP, if decoded.
+    /// The `callingPartyNumber` of an INAP CS-1 initialDP. As
+    /// `inap_called_party_number`.
     #[getter]
-    fn inap_calling_party_number<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
-        let bytes = self.argument.as_ref()?;
-        let idp: inap::operations::InitialDpArg = inap::decode(bytes).ok()?;
-        idp.calling_party_number
-            .map(|n| PyBytes::new(py, n.as_ref()))
+    fn inap_calling_party_number<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        Ok(self
+            .inap_initial_dp()?
+            .and_then(|idp| idp.calling_party_number)
+            .map(|n| PyBytes::new(py, n.as_ref())))
     }
 
     /// Always false: an opening-leg view. A held-open handler that is re-entered
@@ -1034,6 +1048,23 @@ enum MoField {
 }
 
 impl PyIncomingOp {
+    /// The argument as an INAP CS-1 InitialDPArg (ETS 300 374-1 / Q.1218), when
+    /// the operation is initialDP. The decode is `inap::decode`: a member or a
+    /// list element on the wire that cannot be read, a member the type does not
+    /// have, and octets after the argument are errors, where the argument used
+    /// to read as "no such field".
+    fn inap_initial_dp(&self) -> PyResult<Option<inap::operations::InitialDpArg>> {
+        if self.operation_code != inap::op_codes::INITIAL_DP {
+            return Ok(None);
+        }
+        let what = "the INAP InitialDP argument";
+        let bytes = self
+            .argument
+            .as_ref()
+            .ok_or_else(|| mistyped(what, "the Invoke carries no argument"))?;
+        inap::decode(bytes).map(Some).map_err(|e| mistyped(what, e))
+    }
+
     /// One field of a MO-ForwardSM (46) or MT-ForwardSM (44) argument. `None`
     /// for any other operation. The decode is `gsm_map::decode`: an argument
     /// with a member that cannot be read, or with octets after it, is a
@@ -2620,35 +2651,37 @@ impl Inap {
     // ── Originating builders (SCF -> SSF, the SCP instructs) ──
 
     /// Stage an INAP RequestReportBCSMEvent invoke: arm the SSF to report the
-    /// given BCSM detection points. `events` is a list of
-    /// `(event_type_bcsm, monitor_mode)` integer pairs (ITU-T Q.1218), e.g.
-    /// `(7, 0)` = oAnswer interrupted, `(9, 1)` = oDisconnect notifyAndContinue.
+    /// given BCSM detection points. `events` is a list of `(event_type_bcsm,
+    /// monitor_mode)` integer pairs (ITU-T Q.1218), e.g. `(7, 0)` = oAnswer
+    /// interrupted, `(9, 1)` = oDisconnect notifyAndContinue. A third element
+    /// names the leg the event is armed on, as its number: `(9, 1, 2)` =
+    /// oDisconnect on leg 2. It goes out as `legID [2] { sendingSideID [0] }`,
+    /// the form an SCF uses toward the SSF.
     #[pyo3(signature = (events))]
-    fn request_report_bcsm_event(&self, events: Vec<(i64, i64)>) -> PyResult<StagedInvoke> {
+    fn request_report_bcsm_event(&self, events: Vec<Bound<'_, PyAny>>) -> PyResult<StagedInvoke> {
         use inap::operations::RequestReportBcsmEventArg;
-        use inap::types::BcsmEvent;
+        use inap::types::{BcsmEvent, LegId};
         let bcsm_events = events
-            .into_iter()
-            .map(|(et, mm)| {
-                Ok(BcsmEvent {
-                    event_type_bcsm: inap_event_type_bcsm(et)?,
-                    monitor_mode: inap_monitor_mode(mm)?,
-                    leg_id: None,
-                })
+            .iter()
+            .map(|event| {
+                let (et, mm, leg) = bcsm_event_arg(event)?;
+                let mut armed = BcsmEvent::new(inap_event_type_bcsm(et)?, inap_monitor_mode(mm)?);
+                armed.leg_id = leg.map(LegId::sending);
+                Ok(armed)
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let arg = RequestReportBcsmEventArg { bcsm_events };
         staged_inap_invoke(
             inap::op_codes::REQUEST_REPORT_BCSM_EVENT,
-            &arg,
+            &RequestReportBcsmEventArg::new(bcsm_events),
             OperationClass::Two,
         )
     }
 
     /// Stage an INAP Connect invoke: instruct the SSF to route the call to
     /// `destination_routing_address` (a list of called-party numbers, each a digit
-    /// string or raw bytes). `original_called_party_id`, when given, preserves the
-    /// originally dialled number across the reroute.
+    /// string or raw bytes; ETS 300 374-1 allows exactly one, Q.1218 up to
+    /// three). `original_called_party_id`, when given, preserves the originally
+    /// dialled number across the reroute.
     #[pyo3(signature = (*, destination_routing_address, original_called_party_id=None))]
     fn connect(
         &self,
@@ -2656,20 +2689,22 @@ impl Inap {
         original_called_party_id: Option<Bound<'_, PyAny>>,
     ) -> PyResult<StagedInvoke> {
         use inap::operations::ConnectArg;
-        let dra = destination_routing_address
+        let mut dra = destination_routing_address
             .iter()
             .map(called_party)
-            .collect::<PyResult<Vec<_>>>()?;
-        let arg = ConnectArg {
-            destination_routing_address: dra.into_iter().map(Into::into).collect(),
-            correlation_id: None,
-            original_called_party_id: original_called_party_id
-                .as_ref()
-                .map(called_party)
-                .transpose()?
-                .map(Into::into),
-            scf_id: None,
-        };
+            .collect::<PyResult<Vec<_>>>()?
+            .into_iter()
+            .map(Into::into);
+        let first = dra
+            .next()
+            .ok_or_else(|| err("connect: destination_routing_address is empty"))?;
+        let mut arg = ConnectArg::new(first);
+        arg.destination_routing_address.extend(dra);
+        arg.original_called_party_id = original_called_party_id
+            .as_ref()
+            .map(called_party)
+            .transpose()?
+            .map(Into::into);
         staged_inap_invoke(inap::op_codes::CONNECT, &arg, OperationClass::Two)
     }
 
@@ -2699,51 +2734,79 @@ impl Inap {
     ) -> PyResult<StagedInvoke> {
         use inap::operations::ApplyChargingArg;
         use inap::types::LegId;
-        let arg = ApplyChargingArg {
-            ach_billing_charging_characteristics: charging_characteristics.into(),
-            party_to_charge: party_to_charge.map(|l| LegId::SendingSideId(l.into())),
-        };
+        let mut arg = ApplyChargingArg::new(charging_characteristics.into());
+        arg.party_to_charge = party_to_charge.map(|l| LegId::SendingSideId(l.into()));
         staged_inap_invoke(inap::op_codes::APPLY_CHARGING, &arg, OperationClass::Two)
     }
 
     /// Stage an INAP PlayAnnouncement invoke: instruct the SRF to play an
-    /// announcement or tone. `information_to_send` is the opaque announcement
-    /// descriptor. `disconnect_from_ip_forbidden` keeps the SRF connection up
-    /// afterwards; `request_announcement_complete` asks for a
+    /// announcement or a tone. Say what to send in one of three ways:
+    /// `message_id=` (an elementary announcement id), `tone_id=` (with an
+    /// optional `tone_duration=` in seconds), or `information_to_send=`, the BER
+    /// encoding of an `InformationToSend` value for anything else (it is decoded
+    /// and refused if it is not one). `disconnect_from_ip_forbidden` keeps the
+    /// SRF connection up afterwards; `request_announcement_complete` asks for a
     /// specializedResourceReport once it finishes.
-    #[pyo3(signature = (*, information_to_send, disconnect_from_ip_forbidden=None, request_announcement_complete=None))]
+    #[pyo3(signature = (*, message_id=None, tone_id=None, tone_duration=None, information_to_send=None, disconnect_from_ip_forbidden=None, request_announcement_complete=None))]
     fn play_announcement(
         &self,
-        information_to_send: Vec<u8>,
+        message_id: Option<u32>,
+        tone_id: Option<u32>,
+        tone_duration: Option<u32>,
+        information_to_send: Option<Vec<u8>>,
         disconnect_from_ip_forbidden: Option<bool>,
         request_announcement_complete: Option<bool>,
     ) -> PyResult<StagedInvoke> {
         use inap::operations::PlayAnnouncementArg;
-        let arg = PlayAnnouncementArg {
-            information_to_send: information_to_send.into(),
-            disconnect_from_ip_forbidden,
-            request_announcement_complete,
-        };
+        let info =
+            inap_information_to_send(message_id, tone_id, tone_duration, information_to_send)?
+                .ok_or_else(|| {
+                    err("play_announcement: give message_id, tone_id or information_to_send")
+                })?;
+        let mut arg = PlayAnnouncementArg::new(info);
+        arg.disconnect_from_ip_forbidden = disconnect_from_ip_forbidden;
+        arg.request_announcement_complete = request_announcement_complete;
         staged_inap_invoke(inap::op_codes::PLAY_ANNOUNCEMENT, &arg, OperationClass::Two)
     }
 
     /// Stage an INAP PromptAndCollectUserInformation invoke: instruct the SRF to
-    /// collect digits from the user, optionally after playing a prompt.
-    /// `collected_info` is the opaque collection descriptor; `information_to_send`
-    /// is the optional prompt to play first.
-    #[pyo3(signature = (*, collected_info, disconnect_from_ip_forbidden=None, information_to_send=None))]
+    /// collect digits from the user, optionally after playing a prompt. Say
+    /// what to collect with `maximum_digits=` (and `minimum_digits=`), or with
+    /// `collected_info=`, the BER encoding of a `CollectedInfo` value. The
+    /// prompt is given as for `play_announcement` (`message_id=`, `tone_id=`,
+    /// `information_to_send=`), or left out.
+    #[pyo3(signature = (*, maximum_digits=None, minimum_digits=None, collected_info=None, disconnect_from_ip_forbidden=None, message_id=None, tone_id=None, tone_duration=None, information_to_send=None))]
+    #[allow(clippy::too_many_arguments)]
     fn prompt_and_collect_user_information(
         &self,
-        collected_info: Vec<u8>,
+        maximum_digits: Option<u8>,
+        minimum_digits: Option<u8>,
+        collected_info: Option<Vec<u8>>,
         disconnect_from_ip_forbidden: Option<bool>,
+        message_id: Option<u32>,
+        tone_id: Option<u32>,
+        tone_duration: Option<u32>,
         information_to_send: Option<Vec<u8>>,
     ) -> PyResult<StagedInvoke> {
         use inap::operations::PromptAndCollectUserInformationArg;
-        let arg = PromptAndCollectUserInformationArg {
-            collected_info: collected_info.into(),
-            disconnect_from_ip_forbidden,
-            information_to_send: information_to_send.map(Into::into),
-        };
+        use inap::types::{CollectedDigits, CollectedInfo};
+        let what =
+            match (maximum_digits, collected_info) {
+                (Some(max), None) => {
+                    let mut digits = CollectedDigits::new(max);
+                    digits.minimum_nb_of_digits = minimum_digits;
+                    CollectedInfo::CollectedDigits(digits)
+                }
+                (None, Some(bytes)) => inap::decode::<CollectedInfo>(&bytes)
+                    .map_err(|e| err(format!("collected_info is not a CollectedInfo: {e}")))?,
+                _ => return Err(err(
+                    "prompt_and_collect_user_information: give maximum_digits or collected_info",
+                )),
+            };
+        let mut arg = PromptAndCollectUserInformationArg::new(what);
+        arg.disconnect_from_ip_forbidden = disconnect_from_ip_forbidden;
+        arg.information_to_send =
+            inap_information_to_send(message_id, tone_id, tone_duration, information_to_send)?;
         staged_inap_invoke(
             inap::op_codes::PROMPT_AND_COLLECT_USER_INFORMATION,
             &arg,
@@ -2757,14 +2820,14 @@ impl Inap {
     #[pyo3(signature = (*, ip_routing_address=None))]
     fn connect_to_resource(&self, ip_routing_address: Option<Vec<u8>>) -> PyResult<StagedInvoke> {
         use inap::operations::ConnectToResourceArg;
-        let none = ip_routing_address.is_none();
-        let arg = ConnectToResourceArg {
-            resource_address_ipv4: ip_routing_address.map(Into::into),
-            resource_address_none: none.then_some(()),
+        use inap::types::ResourceAddress;
+        let address = match ip_routing_address {
+            Some(address) => ResourceAddress::IpRoutingAddress(address.into()),
+            None => ResourceAddress::None(()),
         };
         staged_inap_invoke(
             inap::op_codes::CONNECT_TO_RESOURCE,
-            &arg,
+            &ConnectToResourceArg::new(address),
             OperationClass::Two,
         )
     }
@@ -2781,13 +2844,30 @@ pub struct InapAc;
 #[pymethods]
 impl InapAc {
     /// cs1-ssp-to-scp, the Core INAP CS-1 SSP-to-SCP application context
-    /// (`0.4.0.1.1.0.3.0`). Carried in the AARQ/AARE of an INAP SSF-SCF dialogue,
-    /// so the response the engine builds for an INAP termination echoes the IN
-    /// application context, not a CAMEL one.
+    /// (`0.4.0.1.1.1.0.0`, ETS 300 374-1 clause 6.5). Carried in the AARQ of a
+    /// dialogue the node opens toward an SSF.
     #[getter]
     fn ssp_to_scp(&self) -> MapAcHandle {
         MapAcHandle {
             arcs: oid_arcs(inap::application_context::cs1_ssp_to_scp()),
+        }
+    }
+
+    /// cs1-assist-handoff-ssp-to-scp (`0.4.0.1.1.1.1.0`): the dialogue an
+    /// assisting or handed-off SSP opens with AssistRequestInstructions.
+    #[getter]
+    fn assist_handoff_ssp_to_scp(&self) -> MapAcHandle {
+        MapAcHandle {
+            arcs: oid_arcs(inap::application_context::cs1_assist_handoff_ssp_to_scp()),
+        }
+    }
+
+    /// cs1-ip-to-scp (`0.4.0.1.1.1.2.0`): the dialogue an intelligent
+    /// peripheral opens with AssistRequestInstructions.
+    #[getter]
+    fn ip_to_scp(&self) -> MapAcHandle {
+        MapAcHandle {
+            arcs: oid_arcs(inap::application_context::cs1_ip_to_scp()),
         }
     }
 }
@@ -2803,22 +2883,71 @@ fn staged_inap_invoke<T: rasn::Encode>(
     Ok(StagedInvoke::new(op, Some(bytes), class))
 }
 
+/// One `events` entry of a RequestReportBCSMEvent builder: `(event_type,
+/// monitor_mode)` or `(event_type, monitor_mode, leg)`.
+fn bcsm_event_arg(event: &Bound<'_, PyAny>) -> PyResult<(i64, i64, Option<u8>)> {
+    if let Ok((et, mm, leg)) = event.extract::<(i64, i64, u8)>() {
+        return Ok((et, mm, Some(leg)));
+    }
+    let (et, mm) = event.extract::<(i64, i64)>().map_err(|_| {
+        err("each event is (event_type_bcsm, monitor_mode) or (event_type_bcsm, monitor_mode, leg)")
+    })?;
+    Ok((et, mm, None))
+}
+
+/// The `InformationToSend` of PlayAnnouncement / PromptAndCollectUserInformation
+/// from the builder keywords: an elementary message id, a tone, or the BER of a
+/// value. `None` when none of them is given.
+fn inap_information_to_send(
+    message_id: Option<u32>,
+    tone_id: Option<u32>,
+    tone_duration: Option<u32>,
+    encoded: Option<Vec<u8>>,
+) -> PyResult<Option<inap::types::InformationToSend>> {
+    use inap::types::{InbandInfo, InformationToSend, MessageId, Tone};
+    Ok(match (message_id, tone_id, encoded) {
+        (None, None, None) => None,
+        (Some(id), None, None) => Some(InformationToSend::InbandInfo(InbandInfo::new(
+            MessageId::ElementaryMessageId(id),
+        ))),
+        (None, Some(tone_id), None) => Some(InformationToSend::Tone(Tone {
+            tone_id,
+            duration: tone_duration,
+        })),
+        (None, None, Some(bytes)) => {
+            Some(inap::decode::<InformationToSend>(&bytes).map_err(|e| {
+                err(format!(
+                    "information_to_send is not an InformationToSend: {e}"
+                ))
+            })?)
+        }
+        _ => {
+            return Err(err(
+                "give one of message_id, tone_id and information_to_send, not several",
+            ))
+        }
+    })
+}
+
 /// Map an ITU-T Q.1218 EventTypeBCSM integer to the INAP codec enum.
 fn inap_event_type_bcsm(v: i64) -> PyResult<inap::types::EventTypeBcsm> {
     use inap::types::EventTypeBcsm as E;
     Ok(match v {
+        1 => E::OrigAttemptAuthorized,
         2 => E::CollectedInfo,
         3 => E::AnalysedInformation,
         4 => E::RouteSelectFailure,
         5 => E::OCalledPartyBusy,
         6 => E::ONoAnswer,
         7 => E::OAnswer,
+        8 => E::OMidCall,
         9 => E::ODisconnect,
         10 => E::OAbandon,
         12 => E::TermAttemptAuthorized,
         13 => E::TBusy,
         14 => E::TNoAnswer,
         15 => E::TAnswer,
+        16 => E::TMidCall,
         17 => E::TDisconnect,
         18 => E::TAbandon,
         _ => return Err(err(format!("unknown EventTypeBCSM {v}"))),

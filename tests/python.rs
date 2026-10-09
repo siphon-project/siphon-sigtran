@@ -250,10 +250,29 @@ assert inap.continue_() is not None
 assert inap.release_call(cause=b"\x90\x03") is not None
 assert inap.apply_charging(charging_characteristics=b"\x01\x02\x03") is not None
 assert inap.apply_charging(charging_characteristics=b"\x01", party_to_charge=b"\x01") is not None
-assert inap.play_announcement(information_to_send=b"\x0a\x0b") is not None
-assert inap.prompt_and_collect_user_information(collected_info=b"\x01\x02") is not None
 assert inap.connect_to_resource() is not None
-assert list(inap.AC.ssp_to_scp.arcs) == [0, 4, 0, 1, 1, 0, 3, 0]
+# What the SRF is told to send is a typed choice, built from keywords or handed
+# over as the BER of an InformationToSend value (here a tone: [1] { [0] 7 }).
+assert inap.play_announcement(message_id=7) is not None
+assert inap.play_announcement(tone_id=3, tone_duration=10) is not None
+assert inap.play_announcement(information_to_send=b"\xa1\x03\x80\x01\x07") is not None
+assert inap.prompt_and_collect_user_information(maximum_digits=4) is not None
+assert inap.prompt_and_collect_user_information(maximum_digits=4, minimum_digits=4, message_id=9) is not None
+for bad in (lambda: inap.play_announcement(),
+            lambda: inap.play_announcement(information_to_send=b"\x0a\x0b"),
+            lambda: inap.play_announcement(message_id=1, tone_id=2),
+            lambda: inap.prompt_and_collect_user_information(),
+            lambda: inap.prompt_and_collect_user_information(collected_info=b"\x01\x02"),
+            lambda: inap.connect(destination_routing_address=[]),
+            lambda: inap.request_report_bcsm_event(events=[(7,)])):
+    try:
+        bad()
+        raise AssertionError("expected SigtranError")
+    except siphon.SigtranError:
+        pass
+assert list(inap.AC.ssp_to_scp.arcs) == [0, 4, 0, 1, 1, 1, 0, 0]
+assert list(inap.AC.assist_handoff_ssp_to_scp.arcs) == [0, 4, 0, 1, 1, 1, 1, 0]
+assert list(inap.AC.ip_to_scp.arcs) == [0, 4, 0, 1, 1, 1, 2, 0]
 
 inap_begin = node.assemble_begin(
     op="initial-dp",
@@ -267,7 +286,7 @@ inap_out = node.deliver(inap_begin, opc=2000, dpc=1000)
 assert len(inap_out) == 1
 dinap = node.decode(inap_out[0])
 assert dinap.kind == "end"                            # both invokes ride the closing End
-assert list(dinap.app_context) == [0, 4, 0, 1, 1, 0, 3, 0]  # IN AC echoed in the AARE, not a CAMEL one
+assert list(dinap.app_context) == [0, 4, 0, 1, 1, 1, 0, 0]  # IN AC echoed in the AARE, not a CAMEL one
 inap_ops = [op for (op, _) in dinap.invokes]
 assert 23 in inap_ops and 20 in inap_ops              # RequestReportBCSMEvent + Connect
 assert inap_seen["service_key"] == 100                # the decoded INAP serviceKey
@@ -564,6 +583,46 @@ def on_purge_fields(dlg, arg):
     dlg.end()
 
 assert node.decode(drive("purge-ms")[0]).rejects == []
+
+# ── INAP: the argument is decoded strictly, a leg is an explicit choice ───────
+# RequestReportBCSMEvent with a leg: `legID [2]` wraps the LegID CHOICE, so the
+# event is `30 0B { 80 01 09, 81 01 01, A2 03 { 80 01 02 } }` (oDisconnect,
+# notifyAndContinue, sendingSideID leg 2; 3 + 3 + 5 = 11 octets). The primitive `82 01 02` of the
+# earlier encoding is what a conforming SSF rejects.
+inap_rrbe = {}
+
+@inap.on_operation("initial-dp")
+def on_inap_strict(dlg, idp):
+    if idp.is_peer_turn:
+        return
+    inap_rrbe["key"] = idp.inap_service_key          # raises MistypedParameter if unreadable
+    dlg.invoke(inap.request_report_bcsm_event(events=[(7, 0), (9, 1, 2)]))
+    dlg.send()
+
+def inap_idp(argument):
+    return node.deliver(node.assemble_begin(
+        op="initial-dp", called_gt="15550100", called_ssn=106, calling_gt="15550170",
+        arg=argument, ac=inap.AC.ssp_to_scp,
+    ), opc=2000, dpc=1000)
+
+d = node.decode(inap_idp(INAP_IDP)[0])
+assert d.kind == "continue" and inap_rrbe.pop("key") == 100
+assert list(d.app_context) == [0, 4, 0, 1, 1, 1, 0, 0]
+rrbe = d.invokes[0][1]
+assert bytes.fromhex("300b800109810101" "a203800102") in bytes(rrbe)
+assert bytes.fromhex("3006800107810100") in bytes(rrbe)   # the event without a leg
+node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, bytes(d.otid)))), opc=2000, dpc=1000)
+
+# An InitialDP whose serviceKey [0] announces four octets and holds one does not
+# decode: Reject, invokeProblem mistypedParameter, in an End.
+out = inap_idp(tlv(0x30, b"\x80\x04\x64"))
+assert "key" not in inap_rrbe
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [(1, "invoke", 2)] and d.invokes == []
+# So does one without its mandatory serviceKey, and one carrying a member the
+# argument does not have ([45]).
+assert node.decode(inap_idp(tlv(0x30, b"\x82\x05\x91\x51\x55\x10\x24"))[0]).rejects == [(1, "invoke", 2)]
+assert node.decode(inap_idp(tlv(0x30, b"\x80\x01\x64" + b"\x9f\x2d\x01\x00"))[0]).rejects == [(1, "invoke", 2)]
 
 # The new metric families are exposed.
 text = siphon.metrics()

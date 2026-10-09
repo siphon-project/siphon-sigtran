@@ -94,7 +94,7 @@ const AC_MO_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 21, 3];
 /// gsmSSF-scfGenericAC v3 (CAMEL initialDP).
 const AC_CAP: [u32; 8] = [0, 4, 0, 0, 1, 21, 3, 4];
 /// cs1-ssp-to-scp (Core INAP CS-1 initialDP). Binds Wireshark's INAP dissector.
-const AC_INAP: [u32; 8] = [0, 4, 0, 1, 1, 0, 3, 0];
+const AC_INAP: [u32; 8] = [0, 4, 0, 1, 1, 1, 0, 0];
 /// The IN SCP subsystem number (Wireshark dispatches SSN 106 to INAP by default).
 const SCP_SSN: u8 = 106;
 
@@ -179,20 +179,9 @@ fn initial_dp_arg(imsi: &str) -> Vec<u8> {
 /// An INAP CS-1 initialDP argument (fixed-network IEs, no mobile fields).
 fn inap_initial_dp_arg() -> Vec<u8> {
     let arg = inap::operations::InitialDpArg {
-        service_key: 100.into(),
         called_party_number: Some(isdn("15550142").into()),
         calling_party_number: Some(isdn("15550101").into()),
-        calling_partys_category: None,
-        ip_ssp_capabilities: None,
-        ip_available: None,
-        location_number: None,
-        original_called_party_id: None,
-        high_layer_compatibility: None,
-        service_interaction_indicators: None,
-        additional_calling_party_number: None,
-        forward_call_indicators: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
+        ..inap::operations::InitialDpArg::new(100)
     };
     inap::encode(&arg).expect("encode inap idp")
 }
