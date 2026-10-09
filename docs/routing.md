@@ -165,6 +165,10 @@ call. The families:
 | `sigtran_dialogue_timeouts_total` | counter | |
 | `sigtran_invoke_timeouts_total` | counter | `operation` |
 | `sigtran_abort_total` | counter | `source` |
+| `sigtran_tcap_abort_total` | counter | `dir`, `kind`, `cause` |
+| `sigtran_tcap_reject_total` | counter | `dir`, `problem` |
+| `sigtran_tcap_discarded_total` | counter | `reason` |
+| `sigtran_tcap_send_errors_total` | counter | |
 | `sigtran_loops_detected_total` | counter | `kind` |
 | `sigtran_isup_screened_total` | counter | `reason` |
 

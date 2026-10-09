@@ -99,9 +99,39 @@ async def on_idp(dlg, idp):
 - **`gsm_cap.apply_charging(charging_characteristics=…)`** hands the gsmSSF an
   online-charging control (a call-duration limit, say).
 
-When you arm detection points, the gsmSSF reports them back with EventReportBCSM
-in the same dialogue. Terminate those with `@gsm_cap.on_operation("event-report-bcsm")` and
-drive the next leg (extend the timer, play an announcement, release).
+When you arm detection points and want the reports, keep the dialogue open
+(`dlg.send()` instead of `dlg.end()`): the gsmSSF reports each event with
+EventReportBCSM in the same dialogue, and the handler is re-entered with a
+[`PeerTurn`](../script-api.md#peerturn).
+
+```python
+@gsm_cap.on_operation("initial-dp")
+async def on_idp(dlg, event):
+    if not event.is_peer_turn:
+        dlg.set_idle_timeout(4 * 3600)          # as long as a call may last
+        dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 1), (9, 1)]))
+        dlg.invoke(gsm_cap.connect(destination_routing_address=[reroute(event.called_party_number)]))
+        dlg.send()                               # Continue: the dialogue stays open
+        return
+    if event.closed or event.is_end:
+        close_charging_session(dlg.otid)         # however it ended: told once
+    elif event.is_invoke:
+        note_event(dlg.otid, event.argument)     # an EventReportBCSM; nothing to answer
+```
+
+Three things make this work for a dialogue that waits minutes for its next event:
+
+- `request_report_bcsm_event` and `connect` are **class 2** operations: no reply is
+  their success, so the expiry of their invocation timer ends nothing. (The handler
+  is told, with `event.is_timeout`; ignore it.)
+- A handler that stages nothing on a follow-up leg leaves the dialogue open. An
+  EventReportBCSM needs no answer.
+- The idle timeout is per dialogue. The node default (`tcap.dialogue_timer_ms`) is
+  sized for request / response dialogues, so set what the call can last.
+
+`event.closed` tells the handler the dialogue is gone when the gsmSSF aborted it,
+a damaged message arrived for it, or it sat idle: release what you tied to it
+there, as well as on `event.is_end`.
 
 For a routing-heavy node that mixes call control with transit SS7, pair this with
 the [STP recipe](stp.md); to terminate SMS instead, see

@@ -111,6 +111,10 @@ frames = node.deliver(begin, opc=2000, dpc=1000)
 assert replied["op"] == 46          # MO-ForwardSM operation code
 assert len(frames) == 1             # a single closing End
 assert node.open_dialogues() == 0   # the End closed it
+# MO-ForwardSM returns nothing: the ack is a ReturnResultLast with the invoke id
+# and no result sequence (Q.773), and it is on the wire.
+mo_end = node.decode(frames[0])
+assert mo_end.kind == "end" and mo_end.result is None and mo_end.result_invoke_id == 1
 
 # ── Full HLR: updateLocation held open for an insertSubscriberData leg ─────────
 # The engine terminates updateLocation; the HLR pushes subscriber data to the
@@ -320,6 +324,192 @@ async def on_late(dlg, arg):
 catchall_ops.clear()
 drive("report-sm-delivery-status")
 assert late_ops == [47] and catchall_ops == []      # specific beats the earlier catch-all
+
+# ── Abnormal procedures reach the script as what they are ──────────────────────
+# A handler that holds the dialogue open with a class 1 invoke (ISD) and records
+# every later call. TCAP is assembled by hand below: tag, length, content.
+def tlv(tag, content):
+    assert len(content) < 128
+    return bytes([tag, len(content)]) + bytes(content)
+
+events = []
+
+@gsm_map.on_operation("cancel-location")
+def on_cl(dlg, event):
+    if not event.is_peer_turn:
+        assert event.further == []
+        dlg.invoke(gsm_map.insert_subscriber_data(imsi=UL_IMSI, msisdn=UL_MSISDN))
+        dlg.send()
+        return
+    events.append(event)
+    if event.is_reject and not event.reject_is_local:
+        dlg.end()
+
+def open_cl():
+    events.clear()
+    out = node.deliver(node.assemble_begin(
+        op="cancel-location", called_gt="15550100", called_ssn=6, calling_gt="15550180",
+    ), opc=2000, dpc=1000)
+    d = node.decode(out[0])
+    assert d.kind == "continue"
+    return bytes(d.otid)
+
+def cont(dtid, components):
+    return node.assemble_tcap(tlv(0x65, tlv(0x48, b"\x22\x22\x22\x22") + tlv(0x49, dtid)
+                                  + tlv(0x6C, components)))
+
+# The builders know the class of their operation.
+assert gsm_map.insert_subscriber_data(imsi=UL_IMSI, msisdn=UL_MSISDN).operation_class == 1
+assert gsm_cap.release_call(cause=b"\x90\x03").operation_class == 4
+assert gsm_cap.continue_().operation_class == 4
+assert inap.continue_().operation_class == 4
+assert inap.connect_to_resource().operation_class == 2
+
+# A Reject from the peer is a reject, not an error with code -1: the invoke id and
+# the typed problem. `A4 { 02 01 01, 81 01 02 }` = invoke 1, invokeProblem,
+# mistypedParameter (2).
+tid = open_cl()
+out = node.deliver(cont(tid, tlv(0xA4, b"\x02\x01\x01" + b"\x81\x01\x02")), opc=2000, dpc=1000)
+turn = events[0]
+assert turn.is_reject and not turn.reject_is_local and not turn.is_error
+assert turn.error_code is None
+assert turn.reject_invoke_id == 1
+assert (turn.reject_problem_class, turn.reject_problem_code) == ("invoke", 2)
+assert turn.reject_problem_name == "mistypedParameter"
+comp = turn.components[0]
+assert (comp.kind, comp.invoke_id, comp.problem_class, comp.problem_code) == ("reject", 1, "invoke", 2)
+assert node.decode(out[0]).kind == "end"
+assert node.open_dialogues() == 0
+
+# A Reject whose invoke id the peer could not derive (NULL): `A4 { 05 00, 80 01 02 }`.
+tid = open_cl()
+node.deliver(cont(tid, tlv(0xA4, b"\x05\x00" + b"\x80\x01\x02")), opc=2000, dpc=1000)
+assert events[0].is_reject and events[0].reject_invoke_id is None
+assert (events[0].reject_problem_class, events[0].reject_problem_name) == ("general", "badlyStructuredComponent")
+
+# A component this node cannot read (an Invoke that stops after its invoke id) is
+# rejected here: the handler is told, and the Reject leaves with its next flush.
+tid = open_cl()
+out = node.deliver(cont(tid, tlv(0xA1, b"\x02\x01\x09")), opc=2000, dpc=1000)
+assert out == [] and node.open_dialogues() == 1     # the handler said nothing: it waits
+assert events[0].is_reject and events[0].reject_is_local
+assert (events[0].reject_invoke_id, events[0].reject_problem_class, events[0].reject_problem_code) == (9, "general", 1)
+out = node.deliver(cont(tid, tlv(0xA4, b"\x02\x01\x01" + b"\x81\x01\x02")), opc=2000, dpc=1000)
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [(9, "general", 1)]
+
+# A P-Abort from the peer: `67 { 49 dtid, 4A 01 04 }`, resource limitation.
+tid = open_cl()
+out = node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, tid) + b"\x4a\x01\x04")), opc=2000, dpc=1000)
+assert out == [] and node.open_dialogues() == 0
+assert len(events) == 1                              # told once
+e = events[0]
+assert e.is_peer_turn and e.is_end and e.is_abort and e.components == []
+assert (e.closed, e.abort_kind, e.p_abort_cause, e.abort_cause) == ("peer-abort", "p-abort", 4, "resource-limitation")
+
+# A U-Abort with no information, and one with an ABRT from the dialogue-service-user.
+tid = open_cl()
+node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, tid))), opc=2000, dpc=1000)
+assert (events[0].closed, events[0].abort_kind, events[0].p_abort_cause, events[0].abort_cause) == ("peer-abort", "u-abort", None, "none")
+tid = open_cl()
+abrt = tlv(0x28, tlv(0x06, b"\x00\x11\x86\x05\x01\x01\x01") + tlv(0xA0, tlv(0x64, b"\x80\x01\x00")))
+node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, tid) + tlv(0x6B, abrt))), opc=2000, dpc=1000)
+assert (events[0].abort_kind, events[0].abort_cause) == ("u-abort", "dialogue-service-user")
+
+# A damaged Continue for the dialogue (one octet after the message): the node
+# answers with a P-Abort and tells the handler the dialogue is gone.
+tid = open_cl()
+damaged = bytes(node.assemble_tcap(tlv(0x65, tlv(0x48, b"\x22\x22") + tlv(0x49, tid)) + b"\x00"))
+out = node.deliver(damaged, opc=2000, dpc=1000)
+d = node.decode(out[0])
+assert (d.kind, d.abort_kind, d.p_abort_cause) == ("abort", "p-abort", 2)
+assert bytes(d.dtid) == b"\x22\x22"
+assert (events[0].closed, events[0].abort_kind, events[0].abort_cause) == ("provider-abort", "p-abort", "badly-formatted-transaction-portion")
+assert node.open_dialogues() == 0
+
+# A Continue for a transaction id the node does not know is answered, not dropped.
+out = node.deliver(node.assemble_tcap(tlv(0x65, tlv(0x48, b"\x33") + tlv(0x49, b"\x80\x00\x7f\x7f"))), opc=2000, dpc=1000)
+d = node.decode(out[0])
+assert (d.kind, d.abort_kind, d.p_abort_cause, bytes(d.dtid)) == ("abort", "p-abort", 1, b"\x33")
+
+# The class 1 invoke gets no reply: the handler is told (is_timeout), and since it
+# stages nothing the node aborts as the dialogue's user and says why.
+tid = open_cl()
+out = node.sweep(ahead=20)
+assert len(events) == 2
+assert events[0].is_timeout and not events[0].is_abort
+assert (events[0].invoke_id, events[0].operation_code, events[0].operation_class) == (1, 7, 1)
+assert (events[1].closed, events[1].abort_kind) == ("invoke-timeout", "u-abort")
+d = node.decode(out[0])
+assert (d.kind, d.abort_kind, d.p_abort_cause) == ("abort", "u-abort", None)
+assert node.open_dialogues() == 0
+
+# A class 2 operation (CAP RequestReportBCSMEvent) answered by silence succeeded:
+# the handler is told and the dialogue lives on, for as long as it says it may.
+scp_events = []
+
+@gsm_cap.on_operation("initial-dp")
+def on_idp_held(dlg, event):
+    if not event.is_peer_turn:
+        dlg.set_idle_timeout(7200)
+        dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 1)]))
+        dlg.send()
+        return
+    scp_events.append(event)
+
+out = node.deliver(node.assemble_begin(
+    op="initial-dp", called_gt="15550100", called_ssn=6, calling_gt="15550142",
+    arg=bytes.fromhex("3003800101"),
+), opc=2000, dpc=1000)
+assert node.decode(out[0]).kind == "continue" and node.open_dialogues() == 1
+assert node.sweep(ahead=3600) == []                  # an hour later: no abort
+assert node.open_dialogues() == 1
+assert len(scp_events) == 1 and scp_events[0].is_timeout
+assert scp_events[0].operation_class == 2 and scp_events[0].operation_code == 23
+out = node.sweep(ahead=7300)                         # past its own idle timeout
+assert node.decode(out[0]).abort_kind == "u-abort"
+assert scp_events[-1].closed == "idle-timeout" and node.open_dialogues() == 0
+
+# A handler rejects an Invoke whose argument it cannot use: Reject, invokeProblem,
+# mistypedParameter, in the closing End.
+@gsm_map.on_operation("report-sm-delivery-status")
+def on_rsds(dlg, op):
+    dlg.reject(op.invoke_id, "invoke", 2)
+    dlg.end()
+
+out = node.deliver(node.assemble_begin(
+    op="report-sm-delivery-status", called_gt="15550100", called_ssn=6, calling_gt="15550180",
+), opc=2000, dpc=1000)
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [(1, "invoke", 2)]
+
+# Invoke ids are INTEGER (-128..127), and an unknown problem class is refused, at
+# the call that passes them.
+class _Probe:
+    seen = None
+@gsm_map.on_operation("ready-for-sm")
+def on_rfs(dlg, op):
+    errors = []
+    for call in (lambda: dlg.reply_to(300, gsm_map.ready_for_sm_res()),
+                 lambda: dlg.error(-129, 34),
+                 lambda: dlg.reject(1, "bogus", 0),
+                 lambda: dlg.invoke(gsm_map.insert_subscriber_data(imsi=UL_IMSI, msisdn=UL_MSISDN), operation_class=5)):
+        try:
+            call()
+        except siphon.SigtranError as e:
+            errors.append(str(e))
+    _Probe.seen = errors
+    dlg.reply(gsm_map.ready_for_sm_res())
+    dlg.end()
+
+out = drive("ready-for-sm")
+assert len(_Probe.seen) == 4, _Probe.seen
+assert node.decode(out[0]).kind == "end"
+
+# The new metric families are exposed.
+text = siphon.metrics()
+assert 'sigtran_tcap_abort_total{dir="rx",kind="p-abort",cause="resource-limitation"}' in text
+assert 'sigtran_tcap_reject_total{dir="rx",problem="invoke"}' in text
 
 # An unknown operation name raises at decoration time, before any dialogue runs.
 try:

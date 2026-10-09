@@ -186,17 +186,48 @@ encoding stays in Rust.
 
 | Method | Stages / does |
 |---|---|
-| `dlg.invoke(staged)` | Stage an `Invoke` from an invoke builder (`gsm_map.insert_subscriber_data(...)`, `gsm_cap.connect(...)`), e.g. the ISD leg of a held-open updateLocation. |
+| `dlg.invoke(staged, *, operation_class=None, timeout=None)` | Stage an `Invoke` from an invoke builder (`gsm_map.insert_subscriber_data(...)`, `gsm_cap.connect(...)`), e.g. the ISD leg of a held-open updateLocation. The builder knows the class of its operation (`staged.operation_class`); `operation_class=` (1 to 4) overrides it, `timeout=` is the invocation timer in seconds (default `tcap.invoke_timer_ms`). |
 | `dlg.reply(result)` | Stage a `ReturnResultLast` answering the opening invoke. |
 | `dlg.reply_to(invoke_id, result)` | Stage a result answering a specific invoke id. |
-| `dlg.error(invoke_id, error_code)` | Stage a `ReturnError`. |
+| `dlg.error(invoke_id, error_code)` | Stage a `ReturnError`: the operation failed. |
+| `dlg.reject(invoke_id, problem_class, problem_code)` | Stage a `Reject`: the component the peer sent is a protocol error. `problem_class` is `general` / `invoke` / `return-result` / `return-error`, `problem_code` the code within it (Q.773 Tables 26 to 29). An Invoke whose argument does not decode is `dlg.reject(arg.invoke_id, "invoke", 2)`, mistyped parameter. |
+| `dlg.set_idle_timeout(seconds)` | How long this dialogue may go without a message before the node aborts it, overriding `tcap.dialogue_timer_ms`. `None` waits until the peer ends it. |
 | `dlg.send()` | Flush as a `Continue` (dialogue stays open). |
 | `dlg.end()` | Flush as an `End` (dialogue closes). |
-| `dlg.abort()` | Abort (a dialogue-service-user abort). |
+| `dlg.abort()` | Abort as the dialogue's user: a U-Abort, carrying an ABRT (dialogue-service-user) when the dialogue has an application context. |
 
 `dlg.otid` and `dlg.dtid` expose the originating and peer transaction ids as
 bytes. In-process termination (reply / invoke / send / end) needs no transport and
 is exercised by [`node.deliver`](#testing).
+
+Invoke ids are `INTEGER (-128..127)`: `reply_to`, `error` and `reject` raise
+`SigtranError` for anything else. A flush the encoder refuses (a parameter that is
+not one BER element, say) is logged at error level with the dialogue's transaction
+ids and counted in `sigtran_tcap_send_errors_total`; when that leaves a `Begin`
+unanswered the node aborts the dialogue, so the peer is told instead of waiting.
+
+### Operation classes and timers { #operation-classes }
+
+Every invoke has a class (Q.774 Table 2) that says which outcomes its performer
+reports, and an invocation timer.
+
+| Class | Reports | When the timer expires |
+|---|---|---|
+| 1 | success and failure | No reply came: an abnormal situation. The handler is called with a `PeerTurn` whose `is_timeout` is true. If it stages nothing the node aborts the dialogue (a U-Abort); staging an answer (`dlg.error(...)`, `dlg.end()`, `dlg.send()`) keeps or closes it as the script decides. |
+| 2 | failure only | The operation succeeded. The handler is told (`is_timeout`, `operation_class == 2`) and the dialogue goes on. |
+| 3 | success only | The operation failed. Told the same way; the dialogue goes on. |
+| 4 | nothing | Nothing is reported. |
+
+The MAP builders are class 1. The CAP and INAP builders carry the class of their
+operation: `connect`, `request_report_bcsm_event`, `apply_charging`,
+`play_announcement` and `connect_to_resource` are class 2,
+`prompt_and_collect_user_information` is class 1, `continue_` and `release_call`
+are class 4.
+
+A handler that stages nothing on a follow-up leg leaves the dialogue open: an SCP
+that armed a detection point simply waits for the next event. Give such a dialogue
+the idle timeout the call can last (`dlg.set_idle_timeout(...)`); the default
+`tcap.dialogue_timer_ms` is sized for request / response dialogues.
 
 ## Decoded views { #views }
 
@@ -211,6 +242,7 @@ argument (`arg` / `idp`).
 | `invoke_id` | The invoke id the peer used. |
 | `calling_gt` / `called_gt` | Calling / called global-title digits, if present. |
 | `argument` | The raw BER argument bytes, if the Invoke carried a parameter. |
+| `further` | Every other component of the `Begin`, in order, as [`Component`](#component) objects. Empty for the usual single Invoke. |
 | `sm_rp_oa` / `sm_rp_da` / `sm_rp_ui` | For MO/MT-ForwardSM: the originating address, destination address, and TPDU bytes, decoded where present. |
 | `called_party_number` | For a CAMEL initialDP: the dialled number bytes. |
 
@@ -234,13 +266,42 @@ what the peer sent back (its `Continue` or `End`). Tell the two apart with
 | Field / getter | Meaning |
 |---|---|
 | `is_peer_turn` | Always `True` (the opening `IncomingOp` is `False`). |
-| `is_end` | The peer closed the dialogue with a TCAP `End`. |
-| `is_result` / `is_invoke` / `is_error` | What the first component is. |
+| `is_end` | The dialogue is over: the peer closed it with a TCAP `End`, or it ended otherwise (`closed`). |
+| `is_result` / `is_invoke` / `is_error` | Whether the turn carries a result, an invoke, a `returnError`. |
 | `operation_code` | The operation code of the first component (a result echoes the one it answers). |
 | `invoke_id` | The invoke id of the first component. |
 | `error_code` | The MAP/CAP error code, if the peer sent a `returnError`. |
 | `result` | The raw BER result parameter of the first `returnResultLast`, if present. |
 | `argument` | The raw BER argument of the first `Invoke` the peer sent, if present. |
+| `components` | Every component of the turn, in order, as [`Component`](#component) objects. |
+| `is_reject` | The turn carries a `Reject`. A Reject is a protocol error, not a MAP/CAP error: `is_error` is false and `error_code` is `None`. |
+| `reject_is_local` | The Reject was raised by this node for a component of the peer's that could not be read or did not fit the dialogue. It is sent with the next `send()` / `end()`; components after an unreadable one were discarded. |
+| `reject_invoke_id` | The invoke id the Reject names, `None` if it could not be derived. |
+| `reject_problem_class` / `reject_problem_code` / `reject_problem_name` | The typed problem: the class (`general` / `invoke` / `return-result` / `return-error`), the code within it, and the name Q.773 gives it (`mistypedParameter`). |
+| `is_timeout` | Not a message: the invocation timer of one of our invokes expired. `invoke_id`, `operation_code` and `operation_class` name it. See [operation classes](#operation-classes). |
+| `closed` | Not a message: the dialogue ended without the script ending it. `peer-abort`, `provider-abort` (a damaged message arrived for it), `abnormal-dialogue`, `invoke-timeout`, `idle-timeout`, `no-answer` (the handler answered nothing to a `Begin`) or `not-sent`. Told exactly once; nothing can be sent any more. |
+| `is_abort` | `closed` is set. |
+| `abort_kind` | `p-abort` (a transaction sub-layer aborted) or `u-abort` (a TC-user or a component sub-layer did); `None` if no Abort message was involved. |
+| `p_abort_cause` | The P-Abort cause value (0 unrecognized message type, 1 unrecognized transaction ID, 2 badly formatted transaction portion, 3 incorrect transaction portion, 4 resource limitation). |
+| `abort_cause` | What the abort carried, as a fixed label: a P-Abort cause name, or `none`, `dialogue-service-user`, `abnormal-dialogue`, `no-common-dialogue-portion`, `application-context-not-supported`, `dialogue-refused`, `user-defined`. |
+
+A handler written before these existed keeps working: a turn that is a timeout or
+a closure has no components, so `is_result` / `is_invoke` / `is_error` are all
+false. Release whatever the script tied to the dialogue (a charging session, a
+pending delivery) when `closed` is set or `is_end` is true.
+
+### `Component` { #component }
+
+One component of a turn (`turn.components`, `arg.further`).
+
+| Field | Meaning |
+|---|---|
+| `kind` | `invoke`, `result`, `error`, `reject` (from the peer) or `local-reject` (raised here). |
+| `invoke_id` | The invoke id; `None` only for a reject whose invoke id could not be derived. |
+| `operation_code` | Of an invoke, or the one a result echoes. |
+| `parameter` | The raw BER argument of an invoke or parameter of a result. |
+| `error_code` | Of an error. |
+| `problem_class` / `problem_code` / `problem_name` | Of a reject. |
 
 ### `Address` { #address }
 
@@ -251,7 +312,8 @@ Built with `ss7.gt(digits, ssn=…)`: an SCCP address (E.164, GTI-4). Exposes
 
 `Invoke` and `Result` are opaque staged components produced by the builders
 above and consumed by `dlg.invoke(...)` / `dlg.reply(...)`. You do not
-construct them directly.
+construct them directly. An `Invoke` exposes `operation_code` and
+`operation_class`.
 
 ## Testing your handlers { #testing }
 
@@ -279,8 +341,10 @@ assert node.decode(replies[0]).kind == "end"        # the closing End your handl
 | `node.metrics()` | The Prometheus text exposition. |
 | `node.assemble_begin(op, called_gt, called_ssn, calling_gt, arg=None, ac=None)` | Build a genuine inbound `Begin(AARQ, Invoke)` SCCP payload for `op` (a kebab-case operation name). Returns the SCCP bytes. |
 | `node.assemble_continue(dtid, staged, invoke_id=1, otid=None)` | Build an inbound `Continue` for a held-open dialogue keyed to `dtid` (read off the first reply with `decode`), carrying a staged [`Result`](#staged) or [`Invoke`](#staged). |
+| `node.assemble_tcap(tcap, called_ssn=6)` | Wrap raw TCAP octets in an inbound SCCP UDT, for what the other helpers cannot build: a damaged message, a `Reject`, an `Abort`. |
 | `node.deliver(payload, opc=…, dpc=…)` | Deliver one inbound SCCP payload to the dialogue engine and return the SCCP payloads to send back. |
-| `node.decode(payload)` | Decode an outbound SCCP payload into a read-only `Decoded` view: `.kind`, `.otid` / `.dtid`, `.app_context`, `.invoke` / `.invokes`, `.result`, `.error`. |
+| `node.sweep(ahead=0.0)` | Run the dialogue timers as the live node does once a second, with the clock moved `ahead` seconds forward, and return the SCCP payloads to send. |
+| `node.decode(payload)` | Decode an outbound SCCP payload into a read-only `Decoded` view: `.kind`, `.otid` / `.dtid`, `.app_context`, `.invoke` / `.invokes`, `.result`, `.result_invoke_id`, `.error`, `.rejects` (a list of `(invoke_id, problem_class, problem_code)`), and for an abort `.abort_kind`, `.p_abort_cause`, `.abort_source`. |
 
 ## Hot reload, restated
 

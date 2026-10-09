@@ -35,6 +35,7 @@
 //!   mirroring how a handler runs on siphon's runtime.
 
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -56,8 +57,9 @@ use siphon::script::ScriptHandle;
 use crate::config::{Config, ContentRule, GttRule, DEFAULT_TENANT};
 use crate::content::{ContentEngine, Operation};
 use crate::dialogue::{
-    Dialogue as CoreDialogue, DialogueEngine, IncomingOp as CoreIncomingOp, OutgoingBegin,
-    PeerComponent, PeerTurn, TerminationHandler,
+    CloseReason, Dialogue as CoreDialogue, DialogueClosed, DialogueEngine,
+    IncomingOp as CoreIncomingOp, InvokeTimeout, OperationClass, OutgoingBegin, PeerAbort,
+    PeerComponent, PeerTurn, Problem, TerminationHandler, UserAbort,
 };
 use crate::mtp3::route::Destination;
 use crate::routing::Router;
@@ -124,10 +126,9 @@ fn staged_map_res<T: rasn::Encode>(op: i64, res: &T) -> PyResult<StagedResult> {
 /// `dlg.invoke(...)`, carrying the operation code.
 fn staged_map_invoke<T: rasn::Encode>(op: i64, arg: &T) -> PyResult<StagedInvoke> {
     let bytes = rasn::ber::encode(arg).map_err(err)?;
-    Ok(StagedInvoke {
-        op,
-        arg: Some(bytes),
-    })
+    // Every MAP operation this namespace builds reports both its result and its
+    // errors (TS 29.002 clause 7 and following: class 1).
+    Ok(StagedInvoke::new(op, Some(bytes), OperationClass::One))
 }
 
 /// A UMTS/EPS authentication quintuplet as `(rand, xres, ck, ik, autn)` bytes.
@@ -306,6 +307,40 @@ fn gt_address(digits: &str, ssn: Option<u8>) -> SccpAddress {
 pub struct StagedInvoke {
     op: i64,
     arg: Option<Vec<u8>>,
+    /// The operation class (Q.774 Table 2), known to the builder: it decides
+    /// which replies are valid and what the expiry of the invocation timer
+    /// means.
+    class: OperationClass,
+}
+
+impl StagedInvoke {
+    fn new(op: i64, arg: Option<Vec<u8>>, class: OperationClass) -> Self {
+        Self { op, arg, class }
+    }
+}
+
+#[pymethods]
+impl StagedInvoke {
+    /// The local operation code.
+    #[getter]
+    fn operation_code(&self) -> i64 {
+        self.op
+    }
+
+    /// The operation class, 1 to 4 (Q.774 Table 2): 1 reports success and
+    /// failure, 2 failure only, 3 success only, 4 nothing.
+    #[getter]
+    fn operation_class(&self) -> u8 {
+        self.class.number()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Invoke(operation_code={}, operation_class={})",
+            self.op,
+            self.class.number()
+        )
+    }
 }
 
 /// A staged `ReturnResult` produced by a result helper
@@ -334,10 +369,20 @@ pub struct PyIncomingOp {
     #[pyo3(get)]
     called_gt: Option<String>,
     argument: Option<Vec<u8>>,
+    further: Vec<PeerComp>,
 }
 
 #[pymethods]
 impl PyIncomingOp {
+    /// Every other component of the Begin, in the order received, as
+    /// [`Component`](PyComponent) objects: further Invokes, or a
+    /// `local-reject` for a component this node could not read. Empty for the
+    /// usual Begin with a single Invoke.
+    #[getter]
+    fn further(&self) -> Vec<PyComponent> {
+        self.further.iter().cloned().map(PyComponent).collect()
+    }
+
     /// The raw BER argument bytes, if the Invoke carried a parameter.
     #[getter]
     fn argument<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
@@ -419,14 +464,288 @@ impl PyIncomingOp {
 
 // ── The decoded peer turn handed to a follow-up-leg handler ──────────────────
 
-/// One decoded component of a peer's follow-up turn.
+/// One decoded component of a peer's turn.
 #[derive(Clone)]
 struct PeerComp {
     kind: &'static str,
     operation_code: Option<i64>,
-    invoke_id: i64,
+    /// `None` only for a Reject whose invoke id could not be derived.
+    invoke_id: Option<i64>,
     parameter: Option<Vec<u8>>,
     error_code: Option<i64>,
+    problem: Option<Problem>,
+}
+
+impl PeerComp {
+    fn from_core(c: &PeerComponent) -> Self {
+        let blank = PeerComp {
+            kind: "",
+            operation_code: None,
+            invoke_id: None,
+            parameter: None,
+            error_code: None,
+            problem: None,
+        };
+        match c {
+            PeerComponent::Invoke {
+                invoke_id,
+                operation_code,
+                argument,
+            } => PeerComp {
+                kind: "invoke",
+                operation_code: Some(*operation_code),
+                invoke_id: Some(i64::from(*invoke_id)),
+                parameter: argument.clone(),
+                ..blank
+            },
+            PeerComponent::Result {
+                invoke_id,
+                operation_code,
+                parameter,
+            } => PeerComp {
+                kind: "result",
+                operation_code: *operation_code,
+                invoke_id: Some(i64::from(*invoke_id)),
+                parameter: parameter.clone(),
+                ..blank
+            },
+            PeerComponent::Error {
+                invoke_id,
+                error_code,
+            } => PeerComp {
+                kind: "error",
+                invoke_id: Some(i64::from(*invoke_id)),
+                error_code: Some(*error_code),
+                ..blank
+            },
+            PeerComponent::Reject { invoke_id, problem } => PeerComp {
+                kind: "reject",
+                invoke_id: invoke_id.map(i64::from),
+                problem: Some(*problem),
+                ..blank
+            },
+            PeerComponent::LocalReject { invoke_id, problem } => PeerComp {
+                kind: "local-reject",
+                invoke_id: invoke_id.map(i64::from),
+                problem: Some(*problem),
+                ..blank
+            },
+        }
+    }
+}
+
+/// The class of a Reject problem as the Python layer names it, and its code.
+fn problem_parts(problem: &Problem) -> (&'static str, i64, Option<&'static str>) {
+    match problem {
+        Problem::General(p) => ("general", p.value(), p.name()),
+        Problem::Invoke(p) => ("invoke", p.value(), p.name()),
+        Problem::ReturnResult(p) => ("return-result", p.value(), p.name()),
+        Problem::ReturnError(p) => ("return-error", p.value(), p.name()),
+    }
+}
+
+/// Build a Reject problem from the Python-facing class name and code.
+fn problem_from_parts(class: &str, code: i64) -> PyResult<Problem> {
+    Ok(match class {
+        "general" => Problem::General(code.into()),
+        "invoke" => Problem::Invoke(code.into()),
+        "return-result" => Problem::ReturnResult(code.into()),
+        "return-error" => Problem::ReturnError(code.into()),
+        other => {
+            return Err(err(format!(
+                "unknown reject problem class `{other}` \
+                 (general / invoke / return-result / return-error)"
+            )))
+        }
+    })
+}
+
+/// One component of a peer's turn, as `turn.components` / `op.further` list it.
+#[pyclass(name = "Component", module = "siphon", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyComponent(PeerComp);
+
+#[pymethods]
+impl PyComponent {
+    /// `invoke`, `result`, `error`, `reject` (the peer rejected one of our
+    /// components) or `local-reject` (this node rejected one of the peer's: the
+    /// Reject leaves with the next `send()` / `end()`).
+    #[getter]
+    fn kind(&self) -> &'static str {
+        self.0.kind
+    }
+
+    /// The invoke id. `None` only for a reject whose invoke id could not be
+    /// derived.
+    #[getter]
+    fn invoke_id(&self) -> Option<i64> {
+        self.0.invoke_id
+    }
+
+    /// The operation code of an invoke, or the one a result echoes.
+    #[getter]
+    fn operation_code(&self) -> Option<i64> {
+        self.0.operation_code
+    }
+
+    /// The raw BER argument of an invoke or parameter of a result.
+    #[getter]
+    fn parameter<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.0.parameter.as_ref().map(|p| PyBytes::new(py, p))
+    }
+
+    /// The error code of an error.
+    #[getter]
+    fn error_code(&self) -> Option<i64> {
+        self.0.error_code
+    }
+
+    /// The problem class of a reject: `general`, `invoke`, `return-result` or
+    /// `return-error`.
+    #[getter]
+    fn problem_class(&self) -> Option<&'static str> {
+        self.0.problem.as_ref().map(|p| problem_parts(p).0)
+    }
+
+    /// The problem code of a reject within its class (Q.773 Tables 26 to 29).
+    #[getter]
+    fn problem_code(&self) -> Option<i64> {
+        self.0.problem.as_ref().map(|p| problem_parts(p).1)
+    }
+
+    /// The name Q.773 gives the problem (`mistypedParameter`, ...), or `None`
+    /// for a code it does not name.
+    #[getter]
+    fn problem_name(&self) -> Option<&'static str> {
+        self.0.problem.as_ref().and_then(|p| problem_parts(p).2)
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.0.problem {
+            Some(p) => {
+                let (class, code, _) = problem_parts(p);
+                format!(
+                    "Component(kind={}, invoke_id={:?}, problem={class}:{code})",
+                    self.0.kind, self.0.invoke_id
+                )
+            }
+            None => format!(
+                "Component(kind={}, invoke_id={:?}, operation_code={:?})",
+                self.0.kind, self.0.invoke_id, self.0.operation_code
+            ),
+        }
+    }
+}
+
+/// How a dialogue ended abnormally, or which invocation timer expired, when a
+/// [`PeerTurn`](PyPeerTurn) carries that instead of components.
+#[derive(Clone, Default)]
+struct TurnEvent {
+    /// `peer-abort`, `provider-abort`, `abnormal-dialogue`, `invoke-timeout`,
+    /// `idle-timeout`, `no-answer` or `not-sent`.
+    closed: Option<&'static str>,
+    /// `p-abort` or `u-abort`, for an Abort (received or sent).
+    abort_kind: Option<&'static str>,
+    /// The P-Abort cause value, for a P-Abort.
+    p_abort_cause: Option<i64>,
+    /// A fixed label for what the abort carried.
+    abort_cause: Option<&'static str>,
+    /// The invoke whose timer expired: `(invoke_id, operation_code, class)`.
+    timeout: Option<(i64, i64, u8)>,
+}
+
+fn p_abort_label(value: i64) -> &'static str {
+    crate::metrics::AbortCause::from_p_abort(value).label()
+}
+
+impl TurnEvent {
+    /// The event for an abnormal end, or `None` for an end the script already
+    /// knows of (it ended or aborted the dialogue itself, or was handed the
+    /// peer's End as a turn).
+    fn from_closed(reason: &CloseReason) -> Option<Self> {
+        let mut e = TurnEvent::default();
+        match reason {
+            CloseReason::PeerAbort(abort) => {
+                e.closed = Some("peer-abort");
+                match abort {
+                    PeerAbort::Provider(cause) => {
+                        e.abort_kind = Some("p-abort");
+                        e.p_abort_cause = Some(cause.value());
+                        e.abort_cause = Some(p_abort_label(cause.value()));
+                    }
+                    PeerAbort::AbnormalDialogue => {
+                        e.abort_kind = Some("u-abort");
+                        e.abort_cause = Some("abnormal-dialogue");
+                    }
+                    PeerAbort::NoCommonDialoguePortion => {
+                        e.abort_kind = Some("u-abort");
+                        e.abort_cause = Some("no-common-dialogue-portion");
+                    }
+                    PeerAbort::User(user) => {
+                        e.abort_kind = Some("u-abort");
+                        e.abort_cause = Some(match user {
+                            UserAbort::NoInformation => "none",
+                            UserAbort::DialogueServiceUser => "dialogue-service-user",
+                            UserAbort::ApplicationContextNotSupported => {
+                                "application-context-not-supported"
+                            }
+                            UserAbort::DialogueRefused => "dialogue-refused",
+                            UserAbort::UserDefined => "user-defined",
+                        });
+                    }
+                }
+            }
+            CloseReason::ProviderAbort { cause, sent } => {
+                e.closed = Some("provider-abort");
+                e.abort_kind = sent.then_some("p-abort");
+                e.p_abort_cause = Some(cause.value());
+                e.abort_cause = Some(p_abort_label(cause.value()));
+            }
+            CloseReason::AbnormalDialogue { sent } => {
+                e.closed = Some("abnormal-dialogue");
+                e.abort_kind = sent.then_some("u-abort");
+                e.abort_cause = Some("abnormal-dialogue");
+            }
+            CloseReason::InvokeTimeout {
+                invoke_id,
+                operation_code,
+            } => {
+                e.closed = Some("invoke-timeout");
+                e.abort_kind = Some("u-abort");
+                e.timeout = Some((i64::from(*invoke_id), *operation_code, 1));
+            }
+            CloseReason::IdleTimeout => {
+                e.closed = Some("idle-timeout");
+                e.abort_kind = Some("u-abort");
+            }
+            CloseReason::NoAnswer => {
+                e.closed = Some("no-answer");
+                e.abort_kind = Some("u-abort");
+            }
+            CloseReason::NotSent => e.closed = Some("not-sent"),
+            CloseReason::Ended | CloseReason::PeerEnded | CloseReason::Aborted => return None,
+        }
+        Some(e)
+    }
+
+    fn from_timeout(t: &InvokeTimeout) -> Self {
+        TurnEvent {
+            timeout: Some((i64::from(t.invoke_id), t.operation_code, t.class.number())),
+            ..TurnEvent::default()
+        }
+    }
+
+    fn describe(&self) -> String {
+        let mut text = self.closed.unwrap_or("invoke timer expired").to_string();
+        if let Some(kind) = self.abort_kind {
+            text.push_str(&format!(" ({kind}"));
+            if let Some(cause) = self.abort_cause {
+                text.push_str(&format!(", {cause}"));
+            }
+            text.push(')');
+        }
+        text
+    }
 }
 
 /// The decoded peer view a termination handler receives on a follow-up leg of a
@@ -435,56 +754,34 @@ struct PeerComp {
 /// example, observe an insertSubscriberData `returnResultLast` and then finish
 /// the updateLocation with its own result. The opening leg gets an
 /// [`IncomingOp`](PyIncomingOp) instead; branch on `is_peer_turn`.
+///
+/// The same object tells the handler of two things that are not a message from
+/// the peer: an invocation timer that expired (`is_timeout`), and a dialogue
+/// that ended without the script ending it (`closed`: the peer aborted, a
+/// damaged message arrived, the dialogue sat idle).
 #[pyclass(name = "PeerTurn", module = "siphon", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyPeerTurn {
     is_end: bool,
     comps: Vec<PeerComp>,
+    event: TurnEvent,
 }
 
 impl PyPeerTurn {
     fn from_peer(peer: &PeerTurn) -> Self {
-        let comps = peer
-            .components
-            .iter()
-            .map(|c| match c {
-                PeerComponent::Invoke {
-                    invoke_id,
-                    operation_code,
-                    argument,
-                } => PeerComp {
-                    kind: "invoke",
-                    operation_code: Some(*operation_code),
-                    invoke_id: *invoke_id,
-                    parameter: argument.clone(),
-                    error_code: None,
-                },
-                PeerComponent::Result {
-                    invoke_id,
-                    operation_code,
-                    parameter,
-                } => PeerComp {
-                    kind: "result",
-                    operation_code: *operation_code,
-                    invoke_id: *invoke_id,
-                    parameter: parameter.clone(),
-                    error_code: None,
-                },
-                PeerComponent::Error {
-                    invoke_id,
-                    error_code,
-                } => PeerComp {
-                    kind: "error",
-                    operation_code: None,
-                    invoke_id: *invoke_id,
-                    parameter: None,
-                    error_code: Some(*error_code),
-                },
-            })
-            .collect();
         PyPeerTurn {
             is_end: peer.is_end,
-            comps,
+            comps: peer.components.iter().map(PeerComp::from_core).collect(),
+            event: TurnEvent::default(),
+        }
+    }
+
+    fn from_event(event: TurnEvent) -> Self {
+        PyPeerTurn {
+            // A dialogue that ended is closed to the script either way.
+            is_end: event.closed.is_some(),
+            comps: Vec::new(),
+            event,
         }
     }
 
@@ -494,6 +791,11 @@ impl PyPeerTurn {
 
     fn first_of(&self, kind: &str) -> Option<&PeerComp> {
         self.comps.iter().find(|c| c.kind == kind)
+    }
+
+    fn first_reject(&self) -> Option<&PeerComp> {
+        self.first_of("reject")
+            .or_else(|| self.first_of("local-reject"))
     }
 }
 
@@ -506,23 +808,35 @@ impl PyPeerTurn {
         true
     }
 
-    /// Whether this turn arrived in a TCAP `End` (the peer closed the dialogue).
+    /// Whether the dialogue is over: this turn arrived in a TCAP `End` (the peer
+    /// closed the dialogue), or reports that it ended (`closed`).
     #[getter]
     fn is_end(&self) -> bool {
         self.is_end
+    }
+
+    /// Every component of the turn, in the order received.
+    #[getter]
+    fn components(&self) -> Vec<PyComponent> {
+        self.comps.iter().cloned().map(PyComponent).collect()
     }
 
     /// The operation code of the first component: a `returnResultLast` echoes the
     /// operation it answers, an `Invoke` carries its own. `None` if absent.
     #[getter]
     fn operation_code(&self) -> Option<i64> {
-        self.first().and_then(|c| c.operation_code)
+        self.first()
+            .and_then(|c| c.operation_code)
+            .or(self.event.timeout.map(|t| t.1))
     }
 
-    /// The invoke id of the first component, if any.
+    /// The invoke id of the first component, if any (for `is_timeout`, the
+    /// invoke whose timer expired).
     #[getter]
     fn invoke_id(&self) -> Option<i64> {
-        self.first().map(|c| c.invoke_id)
+        self.first()
+            .and_then(|c| c.invoke_id)
+            .or(self.event.timeout.map(|t| t.0))
     }
 
     /// Whether the peer answered one of our invokes with a `returnResultLast`.
@@ -549,6 +863,112 @@ impl PyPeerTurn {
         self.first_of("error").and_then(|c| c.error_code)
     }
 
+    /// Whether the turn carries a Reject: one the peer sent for a component of
+    /// ours, or one this node raised for a component of the peer's (see
+    /// `reject_is_local`). A Reject is a protocol error, not a MAP/CAP error:
+    /// `is_error` stays false.
+    #[getter]
+    fn is_reject(&self) -> bool {
+        self.first_reject().is_some()
+    }
+
+    /// Whether the first Reject was raised here, for a component of the peer's
+    /// that could not be read or did not fit the dialogue. It is sent to the
+    /// peer with the next `send()` / `end()`.
+    #[getter]
+    fn reject_is_local(&self) -> bool {
+        self.first_reject()
+            .is_some_and(|c| c.kind == "local-reject")
+    }
+
+    /// The invoke id the first Reject names, or `None` when there is no Reject
+    /// or its invoke id could not be derived.
+    #[getter]
+    fn reject_invoke_id(&self) -> Option<i64> {
+        self.first_reject().and_then(|c| c.invoke_id)
+    }
+
+    /// The problem class of the first Reject: `general`, `invoke`,
+    /// `return-result` or `return-error`.
+    #[getter]
+    fn reject_problem_class(&self) -> Option<&'static str> {
+        self.first_reject()
+            .and_then(|c| c.problem.as_ref())
+            .map(|p| problem_parts(p).0)
+    }
+
+    /// The problem code of the first Reject within its class.
+    #[getter]
+    fn reject_problem_code(&self) -> Option<i64> {
+        self.first_reject()
+            .and_then(|c| c.problem.as_ref())
+            .map(|p| problem_parts(p).1)
+    }
+
+    /// The name Q.773 gives the first Reject's problem, if it names it.
+    #[getter]
+    fn reject_problem_name(&self) -> Option<&'static str> {
+        self.first_reject()
+            .and_then(|c| c.problem.as_ref())
+            .and_then(|p| problem_parts(p).2)
+    }
+
+    /// Whether this reports an invocation timer that expired, not a message.
+    /// `invoke_id` and `operation_code` name the invoke and `operation_class`
+    /// its class: for class 1 no reply came (stage an answer to keep the
+    /// dialogue, or it is aborted), for class 2 the operation succeeded, for
+    /// class 3 it failed.
+    #[getter]
+    fn is_timeout(&self) -> bool {
+        self.event.timeout.is_some() && self.event.closed.is_none()
+    }
+
+    /// The operation class (1 to 4) of the invoke whose timer expired.
+    #[getter]
+    fn operation_class(&self) -> Option<u8> {
+        self.event.timeout.map(|t| t.2)
+    }
+
+    /// Why the dialogue ended, when it ended without the script ending it and
+    /// without an `End` from the peer: `peer-abort`, `provider-abort` (a damaged
+    /// message for this dialogue), `abnormal-dialogue`, `invoke-timeout`,
+    /// `idle-timeout`, `no-answer` or `not-sent`. `None` for a turn from the
+    /// peer. Nothing can be sent on the dialogue any more.
+    #[getter]
+    fn closed(&self) -> Option<&'static str> {
+        self.event.closed
+    }
+
+    /// Whether the dialogue was aborted (by the peer or by this node).
+    #[getter]
+    fn is_abort(&self) -> bool {
+        self.event.closed.is_some()
+    }
+
+    /// `p-abort` when a transaction sub-layer aborted, `u-abort` when a TC-user
+    /// or a component sub-layer did, `None` when no Abort message was involved.
+    #[getter]
+    fn abort_kind(&self) -> Option<&'static str> {
+        self.event.abort_kind
+    }
+
+    /// The P-Abort cause value (Q.773 Table 12: 0 unrecognized message type, 1
+    /// unrecognized transaction ID, 2 badly formatted transaction portion, 3
+    /// incorrect transaction portion, 4 resource limitation).
+    #[getter]
+    fn p_abort_cause(&self) -> Option<i64> {
+        self.event.p_abort_cause
+    }
+
+    /// What the abort carried, as a fixed label: a P-Abort cause name, or for a
+    /// U-Abort `none`, `dialogue-service-user`, `abnormal-dialogue`,
+    /// `no-common-dialogue-portion`, `application-context-not-supported`,
+    /// `dialogue-refused` or `user-defined`.
+    #[getter]
+    fn abort_cause(&self) -> Option<&'static str> {
+        self.event.abort_cause
+    }
+
     /// The raw BER result parameter of the first `returnResultLast`, if present.
     #[getter]
     fn result<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
@@ -566,11 +986,18 @@ impl PyPeerTurn {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "PeerTurn(is_end={}, components={})",
-            self.is_end,
-            self.comps.len()
-        )
+        match (&self.event.closed, self.event.timeout) {
+            (Some(_), _) => format!("PeerTurn(closed={})", self.event.describe()),
+            (None, Some((id, op, class))) => format!(
+                "PeerTurn(is_timeout=True, invoke_id={id}, operation_code={op}, \
+                 operation_class={class})"
+            ),
+            _ => format!(
+                "PeerTurn(is_end={}, components={})",
+                self.is_end,
+                self.comps.len()
+            ),
+        }
     }
 }
 
@@ -625,30 +1052,48 @@ enum DlgCmd {
     Invoke {
         op: i64,
         arg: Option<Vec<u8>>,
+        class: OperationClass,
+        timeout: Option<Duration>,
     },
     Reply {
         op: i64,
         result: Option<Vec<u8>>,
     },
     ReplyTo {
-        id: i64,
+        id: i8,
         op: i64,
         result: Option<Vec<u8>>,
     },
     Error {
-        id: i64,
+        id: i8,
         code: i64,
     },
+    Reject {
+        id: Option<i8>,
+        problem: Problem,
+    },
+    IdleTimeout(Option<Duration>),
     Send,
     End,
     Abort,
 }
 
+/// An invoke id from Python: `InvokeIdType ::= INTEGER (-128..127)` (Q.773).
+fn invoke_id_arg(invoke_id: i64) -> PyResult<i8> {
+    i8::try_from(invoke_id).map_err(|_| err(format!("invoke id {invoke_id} is outside -128..127")))
+}
+
+/// A timeout in seconds from Python.
+fn seconds_arg(seconds: f64, what: &str) -> PyResult<Duration> {
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| err(format!("{what} must be a non-negative number of seconds")))
+}
+
 /// The live dialogue handle a termination handler drives. It records the
-/// components the handler stages (`invoke` / `reply` / `error`) and the flush
-/// points (`send` / `end` / `abort`); the engine replays them onto the real
-/// Rust dialogue to build the wire TCAP. This keeps the handler's view simple
-/// and the wire encoding in Rust.
+/// components the handler stages (`invoke` / `reply` / `error` / `reject`) and
+/// the flush points (`send` / `end` / `abort`); the engine replays them onto the
+/// real Rust dialogue to build the wire TCAP. This keeps the handler's view
+/// simple and the wire encoding in Rust.
 #[pyclass(name = "Dialogue", module = "siphon")]
 pub struct PyDialogue {
     cmds: Mutex<Vec<DlgCmd>>,
@@ -660,11 +1105,36 @@ pub struct PyDialogue {
 impl PyDialogue {
     /// Stage an `Invoke` (from an originating helper), e.g.
     /// `dlg.invoke(gsm_map.mt_forward_sm(...))`.
-    fn invoke(&self, invoke: &StagedInvoke) {
+    ///
+    /// The helper knows the class of its operation (`invoke.operation_class`);
+    /// `operation_class=` overrides it (1 to 4) for an operation staged by
+    /// hand. `timeout=` is the invocation timer in seconds; the default is the
+    /// node's `tcap.invoke_timer_ms`. When the timer of a class 1 invoke expires
+    /// with no reply the handler is called with a `PeerTurn` whose `is_timeout`
+    /// is true; for class 2 and 3 the expiry is the outcome of the operation,
+    /// reported the same way, and the dialogue goes on.
+    #[pyo3(signature = (invoke, *, operation_class=None, timeout=None))]
+    fn invoke(
+        &self,
+        invoke: &StagedInvoke,
+        operation_class: Option<u8>,
+        timeout: Option<f64>,
+    ) -> PyResult<()> {
+        let class = match operation_class {
+            None => invoke.class,
+            Some(n) => OperationClass::from_number(n)
+                .ok_or_else(|| err(format!("operation class {n} is not 1, 2, 3 or 4")))?,
+        };
+        let timeout = timeout
+            .map(|t| seconds_arg(t, "invoke timeout"))
+            .transpose()?;
         self.push(DlgCmd::Invoke {
             op: invoke.op,
             arg: invoke.arg.clone(),
+            class,
+            timeout,
         });
+        Ok(())
     }
 
     /// Stage a `ReturnResultLast` answering the opening invoke.
@@ -676,20 +1146,57 @@ impl PyDialogue {
     }
 
     /// Stage a `ReturnResultLast` answering a specific invoke id.
-    fn reply_to(&self, invoke_id: i64, result: &StagedResult) {
+    fn reply_to(&self, invoke_id: i64, result: &StagedResult) -> PyResult<()> {
         self.push(DlgCmd::ReplyTo {
-            id: invoke_id,
+            id: invoke_id_arg(invoke_id)?,
             op: result.op,
             result: result.param.clone(),
         });
+        Ok(())
     }
 
     /// Stage a `ReturnError` answering a specific invoke id.
-    fn error(&self, invoke_id: i64, error_code: i64) {
+    fn error(&self, invoke_id: i64, error_code: i64) -> PyResult<()> {
         self.push(DlgCmd::Error {
-            id: invoke_id,
+            id: invoke_id_arg(invoke_id)?,
             code: error_code,
         });
+        Ok(())
+    }
+
+    /// Stage a `Reject` of a component the peer sent: a protocol error in it,
+    /// as opposed to an operation that failed (`error`). `invoke_id` is the id
+    /// of the rejected component (`None` if it has none that can be named),
+    /// `problem_class` one of `general` / `invoke` / `return-result` /
+    /// `return-error`, and `problem_code` the code within that class (Q.773
+    /// Tables 26 to 29). The usual one for a handler is an Invoke whose argument
+    /// does not decode: `dlg.reject(op.invoke_id, "invoke", 2)`, mistyped
+    /// parameter.
+    #[pyo3(signature = (invoke_id, problem_class, problem_code))]
+    fn reject(
+        &self,
+        invoke_id: Option<i64>,
+        problem_class: &str,
+        problem_code: i64,
+    ) -> PyResult<()> {
+        self.push(DlgCmd::Reject {
+            id: invoke_id.map(invoke_id_arg).transpose()?,
+            problem: problem_from_parts(problem_class, problem_code)?,
+        });
+        Ok(())
+    }
+
+    /// Set how long this dialogue may go without a message in either direction
+    /// before the node aborts it, in seconds, overriding `tcap.dialogue_timer_ms`.
+    /// A dialogue that waits for the next event of a call sets what the call can
+    /// last; `None` waits until the peer ends it.
+    #[pyo3(signature = (seconds))]
+    fn set_idle_timeout(&self, seconds: Option<f64>) -> PyResult<()> {
+        let timeout = seconds
+            .map(|t| seconds_arg(t, "idle timeout"))
+            .transpose()?;
+        self.push(DlgCmd::IdleTimeout(timeout));
+        Ok(())
     }
 
     /// Flush the staged components as a `Continue` (the dialogue stays open).
@@ -702,7 +1209,9 @@ impl PyDialogue {
         self.push(DlgCmd::End);
     }
 
-    /// Abort the dialogue (a dialogue-service-user abort).
+    /// Abort the dialogue as its user (a U-Abort; with an ABRT APDU,
+    /// abort-source dialogue-service-user, when the dialogue has an application
+    /// context).
     fn abort(&self) {
         self.push(DlgCmd::Abort);
     }
@@ -754,20 +1263,61 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Replay a Python dialogue's recorded commands onto the real Rust dialogue.
-fn replay(dlg: &mut CoreDialogue, cmds: Vec<DlgCmd>) {
+///
+/// The script has returned by the time its commands run, so a command the
+/// dialogue refuses cannot be raised into it. It is logged at error level with
+/// the dialogue's transaction ids (a flush that cannot be encoded is logged by
+/// the engine itself, which also counts it), and returned so the caller can
+/// surface it where there is somebody to surface it to. A dialogue left with
+/// nothing sent in answer to a Begin is aborted by the engine, so the peer is
+/// not left waiting on a reply that vanished.
+fn replay(dlg: &mut CoreDialogue, cmds: Vec<DlgCmd>) -> Result<(), crate::dialogue::DialogueError> {
+    let mut first_error = None;
     for cmd in cmds {
-        match cmd {
-            DlgCmd::Invoke { op, arg } => {
-                dlg.invoke(op, arg);
+        let (what, outcome) = match cmd {
+            DlgCmd::Invoke {
+                op,
+                arg,
+                class,
+                timeout,
+            } => (
+                "invoke",
+                dlg.invoke_with(op, arg, class, timeout).map(|_| ()),
+            ),
+            DlgCmd::Reply { op, result } => {
+                dlg.reply(op, result);
+                ("reply", Ok(()))
             }
-            DlgCmd::Reply { op, result } => dlg.reply(op, result),
-            DlgCmd::ReplyTo { id, op, result } => dlg.reply_to(id, op, result),
-            DlgCmd::Error { id, code } => dlg.error(id, code),
-            DlgCmd::Send => dlg.send(),
-            DlgCmd::End => dlg.end(),
-            DlgCmd::Abort => dlg.abort(tcap::dialogue::AbortSource::DialogueServiceUser),
+            DlgCmd::ReplyTo { id, op, result } => {
+                dlg.reply_to(id, op, result);
+                ("reply_to", Ok(()))
+            }
+            DlgCmd::Error { id, code } => {
+                dlg.error(id, code);
+                ("error", Ok(()))
+            }
+            DlgCmd::Reject { id, problem } => {
+                dlg.reject(id, problem);
+                ("reject", Ok(()))
+            }
+            DlgCmd::IdleTimeout(timeout) => {
+                dlg.set_idle_timeout(timeout);
+                ("set_idle_timeout", Ok(()))
+            }
+            DlgCmd::Send => ("send", dlg.send()),
+            DlgCmd::End => ("end", dlg.end()),
+            DlgCmd::Abort => ("abort", dlg.abort()),
+        };
+        if let Err(e) = outcome {
+            eprintln!(
+                "siphon-sigtran: ERROR: dialogue otid={} dtid={}: {what}() failed: {e}",
+                hex(dlg.otid()),
+                hex(dlg.dtid())
+            );
+            first_error.get_or_insert(e);
         }
     }
+    first_error.map_or(Ok(()), Err)
 }
 
 // ── The Python termination handler bridge ────────────────────────────────────
@@ -787,19 +1337,28 @@ enum Leg<'a> {
     Begin(&'a CoreIncomingOp),
     Start,
     Continue(&'a PeerTurn),
+    /// An invocation timer expired, or the dialogue ended abnormally.
+    Event(TurnEvent),
 }
 
 impl PyHandler {
-    fn run(&self, dlg: &mut CoreDialogue, leg: Leg<'_>) {
+    /// Call the script for one leg on a live dialogue and replay what it staged.
+    /// Returns whether the script staged anything.
+    fn run(&self, dlg: &mut CoreDialogue, leg: Leg<'_>) -> bool {
+        let cmds = self.call(dlg.otid(), dlg.dtid(), leg);
+        let staged = !cmds.is_empty();
+        let _ = replay(dlg, cmds);
+        staged
+    }
+
+    /// Call the script for one leg and return the commands it staged.
+    fn call(&self, otid: &[u8], dtid: &[u8], leg: Leg<'_>) -> Vec<DlgCmd> {
         Python::attach(|py| {
-            let pydlg = match Bound::new(
-                py,
-                PyDialogue::new(dlg.otid().to_vec(), dlg.dtid().to_vec()),
-            ) {
+            let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec())) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("siphon-sigtran: building Dialogue failed: {e}");
-                    return;
+                    return Vec::new();
                 }
             };
 
@@ -807,16 +1366,17 @@ impl PyHandler {
                 Leg::Begin(o) => {
                     let arg = PyIncomingOp {
                         operation_code: o.operation_code,
-                        invoke_id: o.invoke_id,
+                        invoke_id: i64::from(o.invoke_id),
                         calling_gt: o.calling_gt.clone(),
                         called_gt: o.called_gt.clone(),
                         argument: o.argument.clone(),
+                        further: o.further.iter().map(PeerComp::from_core).collect(),
                     };
                     match Bound::new(py, arg) {
                         Ok(a) => self.func.bind(py).call1((&pydlg, &a)),
                         Err(e) => {
                             eprintln!("siphon-sigtran: building IncomingOp failed: {e}");
-                            return;
+                            return Vec::new();
                         }
                     }
                 }
@@ -824,7 +1384,14 @@ impl PyHandler {
                     Ok(t) => self.func.bind(py).call1((&pydlg, &t)),
                     Err(e) => {
                         eprintln!("siphon-sigtran: building PeerTurn failed: {e}");
-                        return;
+                        return Vec::new();
+                    }
+                },
+                Leg::Event(event) => match Bound::new(py, PyPeerTurn::from_event(event)) {
+                    Ok(t) => self.func.bind(py).call1((&pydlg, &t)),
+                    Err(e) => {
+                        eprintln!("siphon-sigtran: building PeerTurn failed: {e}");
+                        return Vec::new();
                     }
                 },
                 Leg::Start => self.func.bind(py).call1((&pydlg,)),
@@ -838,12 +1405,24 @@ impl PyHandler {
                 }
                 Err(e) => {
                     eprintln!("siphon-sigtran: termination handler raised: {e}");
-                    return;
+                    return Vec::new();
                 }
             }
             let cmds = pydlg.borrow().take();
-            replay(dlg, cmds);
-        });
+            cmds
+        })
+    }
+}
+
+/// The handler's part in an invocation timeout, shared by the script-backed
+/// handlers: tell the script, and when it has nothing to say to a class 1
+/// expiry, abort. Q.774 3.2.1.1.3: "It is now up to the application to decide
+/// whether to abort the transaction or to report an error to the peer
+/// application"; a script decides by staging something (an error, an End, a
+/// Continue), and one that does not know of timeouts gets the abort.
+fn after_timeout(dlg: &mut CoreDialogue, timeout: &InvokeTimeout, script_acted: bool) {
+    if !script_acted && timeout.class == OperationClass::One && !dlg.is_closed() {
+        let _ = dlg.abort();
     }
 }
 
@@ -858,6 +1437,19 @@ impl TerminationHandler for PyHandler {
 
     fn on_continue(&self, dialogue: &mut CoreDialogue, peer: &PeerTurn) {
         self.run(dialogue, Leg::Continue(peer));
+    }
+
+    fn on_invoke_timeout(&self, dialogue: &mut CoreDialogue, timeout: &InvokeTimeout) {
+        let acted = self.run(dialogue, Leg::Event(TurnEvent::from_timeout(timeout)));
+        after_timeout(dialogue, timeout, acted);
+    }
+
+    fn on_closed(&self, closed: &DialogueClosed) {
+        // An end the script brought about or was handed as a turn is not told
+        // twice. Whatever it stages on a dialogue that is over is discarded.
+        if let Some(event) = TurnEvent::from_closed(&closed.reason) {
+            let _ = self.call(&closed.otid, &closed.dtid, Leg::Event(event));
+        }
     }
 }
 
@@ -883,54 +1475,95 @@ fn set_origin_tx(tx: mpsc::UnboundedSender<Origination>) {
 struct OriginationHandler {
     op: i64,
     arg: Option<Vec<u8>>,
-    responder: Mutex<Option<oneshot::Sender<PeerTurn>>>,
+    class: OperationClass,
+    responder: Mutex<Option<oneshot::Sender<Result<PeerTurn, String>>>>,
 }
 
-impl TerminationHandler for OriginationHandler {
-    fn on_start(&self, dialogue: &mut CoreDialogue) {
-        dialogue.invoke(self.op, self.arg.clone());
-        dialogue.send();
-    }
-
-    fn on_continue(&self, dialogue: &mut CoreDialogue, peer: &PeerTurn) {
+impl OriginationHandler {
+    fn resolve(&self, outcome: Result<PeerTurn, String>) {
         if let Some(tx) = self
             .responder
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
-            let _ = tx.send(peer.clone());
+            let _ = tx.send(outcome);
         }
+    }
+}
+
+impl TerminationHandler for OriginationHandler {
+    fn on_start(&self, dialogue: &mut CoreDialogue) {
+        // A failure is logged by the engine with the dialogue's identifiers and
+        // comes back to the awaiting caller through `on_closed`.
+        if dialogue
+            .invoke_with(self.op, self.arg.clone(), self.class, None)
+            .is_ok()
+        {
+            let _ = dialogue.send();
+        }
+    }
+
+    fn on_continue(&self, dialogue: &mut CoreDialogue, peer: &PeerTurn) {
+        self.resolve(Ok(peer.clone()));
         // v1 origination is single request/response: we've handed the caller the
         // peer's first turn. If the peer left the dialogue open (a Continue, not an
         // End), close it cleanly with an End so it never lingers or draws a
         // provider Abort it did not earn.
         if !peer.is_end && !dialogue.is_closed() {
-            dialogue.end();
+            let _ = dialogue.end();
         }
+    }
+
+    fn on_invoke_timeout(&self, dialogue: &mut CoreDialogue, timeout: &InvokeTimeout) {
+        // The awaiting caller asked one question. For a class 2 operation
+        // silence until the timer is its success and there is no reply to wait
+        // for; for class 1 (and 3) no reply is a failure.
+        if timeout.class == OperationClass::Two {
+            self.resolve(Ok(PeerTurn {
+                is_end: false,
+                components: Vec::new(),
+            }));
+        }
+        let _ = dialogue.abort();
+    }
+
+    fn on_closed(&self, closed: &DialogueClosed) {
+        // Whatever ended the dialogue before an answer came, the caller is
+        // told why instead of waiting on a reply that will not come.
+        let why = match TurnEvent::from_closed(&closed.reason) {
+            Some(event) => event.describe(),
+            None => "closed with no response".to_string(),
+        };
+        self.resolve(Err(format!("originated dialogue ended: {why}")));
     }
 }
 
 /// Call a Python leg callback `func(dialogue, peer_turn)` and replay the commands
 /// it stages onto the real dialogue. The follow-up-leg counterpart of
 /// [`PyHandler::run`], shared by the script-driven [`OriginationScriptHandler`].
-fn call_python_leg(func: &Py<PyAny>, dlg: &mut CoreDialogue, peer: &PeerTurn) {
+fn call_python_leg(func: &Py<PyAny>, dlg: &mut CoreDialogue, turn: PyPeerTurn) -> bool {
+    let cmds = call_python_turn(func, dlg.otid(), dlg.dtid(), turn);
+    let staged = !cmds.is_empty();
+    let _ = replay(dlg, cmds);
+    staged
+}
+
+/// Call `func(dialogue, turn)` and return the commands it staged.
+fn call_python_turn(func: &Py<PyAny>, otid: &[u8], dtid: &[u8], turn: PyPeerTurn) -> Vec<DlgCmd> {
     Python::attach(|py| {
-        let pydlg = match Bound::new(
-            py,
-            PyDialogue::new(dlg.otid().to_vec(), dlg.dtid().to_vec()),
-        ) {
+        let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec())) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("siphon-sigtran: building Dialogue failed: {e}");
-                return;
+                return Vec::new();
             }
         };
-        let turn = match Bound::new(py, PyPeerTurn::from_peer(peer)) {
+        let turn = match Bound::new(py, turn) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("siphon-sigtran: building PeerTurn failed: {e}");
-                return;
+                return Vec::new();
             }
         };
         match func.bind(py).call1((&pydlg, &turn)) {
@@ -941,12 +1574,12 @@ fn call_python_leg(func: &Py<PyAny>, dlg: &mut CoreDialogue, peer: &PeerTurn) {
             }
             Err(e) => {
                 eprintln!("siphon-sigtran: origination reply handler raised: {e}");
-                return;
+                return Vec::new();
             }
         }
         let cmds = pydlg.borrow().take();
-        replay(dlg, cmds);
-    });
+        cmds
+    })
 }
 
 /// A [`TerminationHandler`] for a **script-driven multi-leg origination**
@@ -957,17 +1590,35 @@ fn call_python_leg(func: &Py<PyAny>, dlg: &mut CoreDialogue, peer: &PeerTurn) {
 struct OriginationScriptHandler {
     op: i64,
     arg: Option<Vec<u8>>,
+    class: OperationClass,
     on_reply: Py<PyAny>,
 }
 
 impl TerminationHandler for OriginationScriptHandler {
     fn on_start(&self, dlg: &mut CoreDialogue) {
-        dlg.invoke(self.op, self.arg.clone());
-        dlg.send();
+        if dlg
+            .invoke_with(self.op, self.arg.clone(), self.class, None)
+            .is_ok()
+        {
+            let _ = dlg.send();
+        }
     }
 
     fn on_continue(&self, dlg: &mut CoreDialogue, peer: &PeerTurn) {
-        call_python_leg(&self.on_reply, dlg, peer);
+        call_python_leg(&self.on_reply, dlg, PyPeerTurn::from_peer(peer));
+    }
+
+    fn on_invoke_timeout(&self, dlg: &mut CoreDialogue, timeout: &InvokeTimeout) {
+        let turn = PyPeerTurn::from_event(TurnEvent::from_timeout(timeout));
+        let acted = call_python_leg(&self.on_reply, dlg, turn);
+        after_timeout(dlg, timeout, acted);
+    }
+
+    fn on_closed(&self, closed: &DialogueClosed) {
+        if let Some(event) = TurnEvent::from_closed(&closed.reason) {
+            let turn = PyPeerTurn::from_event(event);
+            let _ = call_python_turn(&self.on_reply, &closed.otid, &closed.dtid, turn);
+        }
     }
 }
 
@@ -1015,6 +1666,7 @@ fn origination_begin<'py>(
     let handler: Arc<dyn TerminationHandler> = Arc::new(OriginationHandler {
         op: invoke.op,
         arg: invoke.arg.clone(),
+        class: invoke.class,
         responder: Mutex::new(Some(resp_tx)),
     });
     let req = OutgoingBegin {
@@ -1034,7 +1686,8 @@ fn origination_begin<'py>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let peer = resp_rx
             .await
-            .map_err(|_| err("originated dialogue closed with no response"))?;
+            .map_err(|_| err("originated dialogue closed with no response"))?
+            .map_err(err)?;
         Ok(PyPeerTurn::from_peer(&peer))
     })
 }
@@ -1535,10 +2188,11 @@ impl GsmMap {
             more_messages_to_send: more_messages_to_send.then_some(()),
         };
         let bytes = rasn::ber::encode(&arg).map_err(err)?;
-        Ok(StagedInvoke {
-            op: Operation::MtForwardSm.op_code(),
-            arg: Some(bytes),
-        })
+        Ok(StagedInvoke::new(
+            Operation::MtForwardSm.op_code(),
+            Some(bytes),
+            OperationClass::One,
+        ))
     }
 
     fn __repr__(&self) -> String {
@@ -1707,10 +2361,11 @@ impl GsmCap {
             generic_numbers: None,
         };
         let bytes = gsm_cap::encode(&arg).map_err(err)?;
-        Ok(StagedInvoke {
-            op: gsm_cap::op_codes::CONNECT,
-            arg: Some(bytes),
-        })
+        Ok(StagedInvoke::new(
+            gsm_cap::op_codes::CONNECT,
+            Some(bytes),
+            OperationClass::Two,
+        ))
     }
 
     /// Stage a CAP ReleaseCall invoke: tear the call down with a Q.850 `cause`.
@@ -1721,10 +2376,11 @@ impl GsmCap {
         // STRING (a delegate newtype), not a SEQUENCE.
         let arg = ReleaseCallArg(cause.into());
         let bytes = gsm_cap::encode(&arg).map_err(err)?;
-        Ok(StagedInvoke {
-            op: gsm_cap::op_codes::RELEASE_CALL,
-            arg: Some(bytes),
-        })
+        Ok(StagedInvoke::new(
+            gsm_cap::op_codes::RELEASE_CALL,
+            Some(bytes),
+            OperationClass::Four,
+        ))
     }
 
     /// Stage a CAP RequestReportBCSMEvent invoke: arm the gsmSSF to report the
@@ -1747,10 +2403,11 @@ impl GsmCap {
             .collect::<PyResult<Vec<_>>>()?;
         let arg = RequestReportBcsmEventArg { bcsm_events };
         let bytes = gsm_cap::encode(&arg).map_err(err)?;
-        Ok(StagedInvoke {
-            op: gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT,
-            arg: Some(bytes),
-        })
+        Ok(StagedInvoke::new(
+            gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+            Some(bytes),
+            OperationClass::Two,
+        ))
     }
 
     /// Stage a CAP ApplyCharging invoke: hand the gsmSSF the encoded charging
@@ -1768,19 +2425,17 @@ impl GsmCap {
             party_to_charge: party_to_charge.map(Into::into),
         };
         let bytes = gsm_cap::encode(&arg).map_err(err)?;
-        Ok(StagedInvoke {
-            op: gsm_cap::op_codes::APPLY_CHARGING,
-            arg: Some(bytes),
-        })
+        Ok(StagedInvoke::new(
+            gsm_cap::op_codes::APPLY_CHARGING,
+            Some(bytes),
+            OperationClass::Two,
+        ))
     }
 
     /// Stage a CAP Continue invoke: let the gsmSSF resume normal call processing
     /// at the detection point. It carries no argument.
     fn continue_(&self) -> StagedInvoke {
-        StagedInvoke {
-            op: gsm_cap::op_codes::CONTINUE,
-            arg: None,
-        }
+        StagedInvoke::new(gsm_cap::op_codes::CONTINUE, None, OperationClass::Four)
     }
 
     fn __repr__(&self) -> String {
@@ -1923,7 +2578,11 @@ impl Inap {
             })
             .collect::<PyResult<Vec<_>>>()?;
         let arg = RequestReportBcsmEventArg { bcsm_events };
-        staged_inap_invoke(inap::op_codes::REQUEST_REPORT_BCSM_EVENT, &arg)
+        staged_inap_invoke(
+            inap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+            &arg,
+            OperationClass::Two,
+        )
     }
 
     /// Stage an INAP Connect invoke: instruct the SSF to route the call to
@@ -1951,16 +2610,13 @@ impl Inap {
                 .map(Into::into),
             scf_id: None,
         };
-        staged_inap_invoke(inap::op_codes::CONNECT, &arg)
+        staged_inap_invoke(inap::op_codes::CONNECT, &arg, OperationClass::Two)
     }
 
     /// Stage an INAP Continue invoke: let the SSF resume normal call processing
     /// at the detection point. It carries no argument.
     fn continue_(&self) -> StagedInvoke {
-        StagedInvoke {
-            op: inap::op_codes::CONTINUE,
-            arg: None,
-        }
+        StagedInvoke::new(inap::op_codes::CONTINUE, None, OperationClass::Four)
     }
 
     /// Stage an INAP ReleaseCall invoke: tear the call down with a Q.850 `cause`.
@@ -1968,7 +2624,7 @@ impl Inap {
     fn release_call(&self, cause: Vec<u8>) -> PyResult<StagedInvoke> {
         use inap::operations::ReleaseCallArg;
         let arg = ReleaseCallArg(cause.into());
-        staged_inap_invoke(inap::op_codes::RELEASE_CALL, &arg)
+        staged_inap_invoke(inap::op_codes::RELEASE_CALL, &arg, OperationClass::Four)
     }
 
     /// Stage an INAP ApplyCharging invoke: install the encoded charging
@@ -1987,7 +2643,7 @@ impl Inap {
             ach_billing_charging_characteristics: charging_characteristics.into(),
             party_to_charge: party_to_charge.map(|l| LegId::SendingSideId(l.into())),
         };
-        staged_inap_invoke(inap::op_codes::APPLY_CHARGING, &arg)
+        staged_inap_invoke(inap::op_codes::APPLY_CHARGING, &arg, OperationClass::Two)
     }
 
     /// Stage an INAP PlayAnnouncement invoke: instruct the SRF to play an
@@ -2008,7 +2664,7 @@ impl Inap {
             disconnect_from_ip_forbidden,
             request_announcement_complete,
         };
-        staged_inap_invoke(inap::op_codes::PLAY_ANNOUNCEMENT, &arg)
+        staged_inap_invoke(inap::op_codes::PLAY_ANNOUNCEMENT, &arg, OperationClass::Two)
     }
 
     /// Stage an INAP PromptAndCollectUserInformation invoke: instruct the SRF to
@@ -2028,7 +2684,11 @@ impl Inap {
             disconnect_from_ip_forbidden,
             information_to_send: information_to_send.map(Into::into),
         };
-        staged_inap_invoke(inap::op_codes::PROMPT_AND_COLLECT_USER_INFORMATION, &arg)
+        staged_inap_invoke(
+            inap::op_codes::PROMPT_AND_COLLECT_USER_INFORMATION,
+            &arg,
+            OperationClass::One,
+        )
     }
 
     /// Stage an INAP ConnectToResource invoke: connect the call to a specialised
@@ -2042,7 +2702,11 @@ impl Inap {
             resource_address_ipv4: ip_routing_address.map(Into::into),
             resource_address_none: none.then_some(()),
         };
-        staged_inap_invoke(inap::op_codes::CONNECT_TO_RESOURCE, &arg)
+        staged_inap_invoke(
+            inap::op_codes::CONNECT_TO_RESOURCE,
+            &arg,
+            OperationClass::Two,
+        )
     }
 
     fn __repr__(&self) -> String {
@@ -2070,12 +2734,13 @@ impl InapAc {
 
 /// Encode an INAP operation argument to BER and stage it as an `Invoke` for
 /// `dlg.invoke(...)`, carrying the operation code.
-fn staged_inap_invoke<T: rasn::Encode>(op: i64, arg: &T) -> PyResult<StagedInvoke> {
+fn staged_inap_invoke<T: rasn::Encode>(
+    op: i64,
+    arg: &T,
+    class: OperationClass,
+) -> PyResult<StagedInvoke> {
     let bytes = inap::encode(arg).map_err(err)?;
-    Ok(StagedInvoke {
-        op,
-        arg: Some(bytes),
-    })
+    Ok(StagedInvoke::new(op, Some(bytes), class))
 }
 
 /// Map an ITU-T Q.1218 EventTypeBCSM integer to the INAP codec enum.
@@ -2343,7 +3008,21 @@ pub struct PyDecoded {
     app_context: Option<Vec<u32>>,
     invokes: Vec<(i64, Option<Vec<u8>>)>,
     result: Option<(i64, Option<Vec<u8>>)>,
+    /// The invoke id of the first `ReturnResultLast`, with or without a result.
+    result_invoke_id: Option<i64>,
     error: Option<(i64, i64)>,
+    /// Every Reject as `(invoke_id, problem)`.
+    rejects: Vec<(Option<i64>, Problem)>,
+    /// `p-abort` / `u-abort` for an Abort.
+    #[pyo3(get)]
+    abort_kind: Option<&'static str>,
+    /// The P-Abort cause value of a P-Abort.
+    #[pyo3(get)]
+    p_abort_cause: Option<i64>,
+    /// The abort-source of the ABRT APDU a U-Abort carries (0 dialogue-service-
+    /// user, 1 dialogue-service-provider), if it carries one.
+    #[pyo3(get)]
+    abort_source: Option<i64>,
 }
 
 /// The parts of a decoded TCAP message [`PyDecoded::from_tcap`] pulls out: the
@@ -2355,6 +3034,18 @@ type MsgParts<'a> = (
     Option<&'a DialoguePortion>,
     Option<&'a Vec<Component>>,
 );
+
+/// A `ReturnResultLast` for a staged result. Q.773 3.1: the result sequence is
+/// there with its operation code and parameter, or not at all.
+fn staged_result_component(invoke_id: i8, res: &StagedResult) -> Component {
+    Component::ReturnResultLast(ReturnResult {
+        invoke_id,
+        result: res.param.clone().map(|parameter| ReturnResultValue {
+            operation_code: OperationCode::Local(res.op),
+            parameter: Some(rasn::types::Any::new(parameter)),
+        }),
+    })
+}
 
 /// Pull the first local `returnResult` out as `(op, parameter)`.
 fn first_local_result(rr: &ReturnResult) -> Option<(i64, Option<Vec<u8>>)> {
@@ -2389,29 +3080,52 @@ impl PyDecoded {
                 e.dialogue_portion.as_ref(),
                 e.components.as_ref(),
             ),
-            TcapMessage::Abort(a) => ("abort", Vec::new(), a.dtid.to_vec(), None, None),
+            TcapMessage::Abort(a) => (
+                "abort",
+                Vec::new(),
+                a.dtid.to_vec(),
+                msg.dialogue_portion(),
+                None,
+            ),
             TcapMessage::Unidirectional(_) => {
                 ("unidirectional", Vec::new(), Vec::new(), None, None)
             }
         };
 
-        let app_context = dp
-            .and_then(DialoguePortion::dialogue_pdu)
-            .and_then(|pdu| match pdu {
-                DialoguePdu::Aarq {
-                    application_context_name,
-                    ..
-                }
-                | DialoguePdu::Aare {
-                    application_context_name,
-                    ..
-                } => Some(application_context_name.as_ref().to_vec()),
-                _ => None,
-            });
+        // The message came out of the strict decoder, so its dialogue portion
+        // parses; one that does not is shown as carrying no APDU.
+        let pdu = dp.and_then(|d| d.dialogue_pdu().ok().flatten());
+        let app_context = pdu.as_ref().and_then(|pdu| match pdu {
+            DialoguePdu::Aarq {
+                application_context_name,
+                ..
+            }
+            | DialoguePdu::Aare {
+                application_context_name,
+                ..
+            } => Some(application_context_name.as_ref().to_vec()),
+            _ => None,
+        });
+        let (abort_kind, p_abort_cause, abort_source) = match msg {
+            TcapMessage::Abort(a) => match a.p_abort_cause() {
+                Some(cause) => (Some("p-abort"), Some(cause.value()), None),
+                None => (
+                    Some("u-abort"),
+                    None,
+                    match &pdu {
+                        Some(DialoguePdu::Abrt { abort_source, .. }) => Some(abort_source.value()),
+                        _ => None,
+                    },
+                ),
+            },
+            _ => (None, None, None),
+        };
 
         let mut invokes = Vec::new();
         let mut result = None;
+        let mut result_invoke_id = None;
         let mut error = None;
+        let mut rejects = Vec::new();
         if let Some(cs) = comps {
             for c in cs {
                 match c {
@@ -2425,13 +3139,16 @@ impl PyDecoded {
                         if result.is_none() {
                             result = first_local_result(rr);
                         }
+                        result_invoke_id.get_or_insert(i64::from(rr.invoke_id));
                     }
                     Component::ReturnError(re) => {
                         if let ErrorCode::Local(code) = re.error_code {
-                            error.get_or_insert((re.invoke_id, code));
+                            error.get_or_insert((i64::from(re.invoke_id), code));
                         }
                     }
-                    _ => {}
+                    Component::Reject(rj) => {
+                        rejects.push((rj.invoke_id.map(i64::from), rj.problem));
+                    }
                 }
             }
         }
@@ -2443,7 +3160,12 @@ impl PyDecoded {
             app_context,
             invokes,
             result,
+            result_invoke_id,
             error,
+            rejects,
+            abort_kind,
+            p_abort_cause,
+            abort_source,
         }
     }
 }
@@ -2492,6 +3214,26 @@ impl PyDecoded {
     #[getter]
     fn error(&self) -> Option<(i64, i64)> {
         self.error
+    }
+
+    /// The invoke id of the first `ReturnResultLast`, whether or not it carries
+    /// a result (`result` is `None` for an operation that returns nothing).
+    #[getter]
+    fn result_invoke_id(&self) -> Option<i64> {
+        self.result_invoke_id
+    }
+
+    /// Every `Reject` the message carries, as `(invoke_id, problem_class,
+    /// problem_code)`; the invoke id is `None` when it could not be derived.
+    #[getter]
+    fn rejects(&self) -> Vec<(Option<i64>, &'static str, i64)> {
+        self.rejects
+            .iter()
+            .map(|(id, problem)| {
+                let (class, code, _) = problem_parts(problem);
+                (*id, class, code)
+            })
+            .collect()
     }
 
     fn __repr__(&self) -> String {
@@ -2557,6 +3299,40 @@ impl Node {
             .collect()
     }
 
+    /// Run the dialogue timers for loopback / tests, as the live transport does
+    /// once a second: expire invocation timers (the handler is called with a
+    /// `PeerTurn` whose `is_timeout` is true) and abort dialogues idle past
+    /// their idle timeout. `ahead` moves the clock that many seconds forward, so
+    /// a test does not have to wait. Returns the outbound SCCP payloads.
+    #[pyo3(signature = (ahead=0.0))]
+    fn sweep<'py>(&self, py: Python<'py>, ahead: f64) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let now = std::time::Instant::now() + seconds_arg(ahead, "ahead")?;
+        let engine = self.state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(engine
+            .sweep(now)
+            .into_iter()
+            .map(|(_, out)| PyBytes::new(py, &out.payload))
+            .collect())
+    }
+
+    /// Wrap raw TCAP octets in an inbound SCCP UDT for loopback / tests, as the
+    /// other `assemble_*` helpers do for the messages they build. For what they
+    /// cannot build: a damaged message, a Reject, an Abort.
+    #[pyo3(signature = (tcap, *, called_ssn=6))]
+    fn assemble_tcap<'py>(
+        &self,
+        py: Python<'py>,
+        tcap: Vec<u8>,
+        called_ssn: u8,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let called = gt_address("15550100", Some(called_ssn));
+        let calling = gt_address("15550170", Some(called_ssn));
+        let sccp = SccpMessage::Udt(UnitData::new(called, calling, tcap))
+            .encode()
+            .map_err(err)?;
+        Ok(PyBytes::new(py, &sccp))
+    }
+
     /// Assemble an inbound TCAP `Begin` SCCP payload for loopback / tests: a
     /// `Begin(AARQ, Invoke(op))` addressed to our SSN `called_ssn`. `op` is a
     /// kebab-case MAP/CAP operation name. Returns the SCCP payload bytes.
@@ -2612,15 +3388,10 @@ impl Node {
         invoke_id: i64,
         otid: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        let invoke_id = invoke_id_arg(invoke_id)?;
         let component = if let Ok(res) = staged.cast::<StagedResult>() {
             let res = res.borrow();
-            Component::ReturnResultLast(ReturnResult {
-                invoke_id,
-                result: Some(ReturnResultValue {
-                    operation_code: OperationCode::Local(res.op),
-                    parameter: res.param.clone().map(rasn::types::Any::new),
-                }),
-            })
+            staged_result_component(invoke_id, &res)
         } else if let Ok(inv) = staged.cast::<StagedInvoke>() {
             let inv = inv.borrow();
             Component::Invoke(Invoke {
@@ -2664,18 +3435,13 @@ impl Node {
         staged: Option<&Bound<'_, PyAny>>,
         invoke_id: i64,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        let invoke_id = invoke_id_arg(invoke_id)?;
         let components = match staged {
             None => None,
             Some(s) => {
                 let component = if let Ok(res) = s.cast::<StagedResult>() {
                     let res = res.borrow();
-                    Component::ReturnResultLast(ReturnResult {
-                        invoke_id,
-                        result: Some(ReturnResultValue {
-                            operation_code: OperationCode::Local(res.op),
-                            parameter: res.param.clone().map(rasn::types::Any::new),
-                        }),
-                    })
+                    staged_result_component(invoke_id, &res)
                 } else if let Ok(inv) = s.cast::<StagedInvoke>() {
                     let inv = inv.borrow();
                     Component::Invoke(Invoke {
@@ -2725,7 +3491,7 @@ impl Node {
         ac: PyRef<'_, MapAcHandle>,
         opc: Option<u32>,
         sls: u8,
-    ) -> Vec<Bound<'py, PyBytes>> {
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let (opc_default, ni) = {
             let router = lock_router(&self.state);
             (
@@ -2746,14 +3512,15 @@ impl Node {
         let handler: Arc<dyn TerminationHandler> = Arc::new(OriginationScriptHandler {
             op: invoke.op,
             arg: invoke.arg.clone(),
+            class: invoke.class,
             on_reply,
         });
         let engine = self.state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        let (_tid, frames) = engine.begin(req, handler);
-        frames
+        let (_tid, frames) = engine.begin(req, handler).map_err(err)?;
+        Ok(frames
             .into_iter()
             .map(|msu| PyBytes::new(py, &msu.payload))
-            .collect()
+            .collect())
     }
 
     /// Decode one outbound SCCP payload (a UDT carrying TCAP) into a read-only
@@ -2876,6 +3643,7 @@ fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Node>()?;
     m.add_class::<PyIncomingOp>()?;
     m.add_class::<PyPeerTurn>()?;
+    m.add_class::<PyComponent>()?;
     m.add_class::<PyDecoded>()?;
     m.add_class::<PyDialogue>()?;
     m.add_class::<Address>()?;

@@ -1435,7 +1435,7 @@ impl TerminationHandler for WireHlr {
             },
         };
         dlg.reply(op.operation_code, Some(rasn::ber::encode(&res).unwrap()));
-        dlg.end();
+        dlg.end().expect("end");
     }
 }
 
@@ -1473,10 +1473,8 @@ fn decode_sri_sm_reply(payload: &[u8]) -> Option<(i64, Vec<u8>, Vec<u8>)> {
     };
     // An AARE must be present on the terminating End.
     let has_aare = matches!(
-        end.dialogue_portion
-            .as_ref()
-            .and_then(|dp| dp.dialogue_pdu()),
-        Some(DialoguePdu::Aare { .. })
+        end.dialogue_portion.as_ref().map(|dp| dp.dialogue_pdu()),
+        Some(Ok(Some(DialoguePdu::Aare { .. })))
     );
     assert!(has_aare, "the terminating End carries an AARE");
     match end.components?.into_iter().next()? {
@@ -1584,8 +1582,8 @@ struct WireOriginator {
 }
 impl TerminationHandler for WireOriginator {
     fn on_start(&self, dlg: &mut Dialogue) {
-        dlg.invoke(self.op, Some(self.arg.clone()));
-        dlg.send();
+        dlg.invoke(self.op, Some(self.arg.clone())).expect("invoke");
+        dlg.send().expect("send");
     }
     fn on_continue(&self, _dlg: &mut Dialogue, peer: &PeerTurn) {
         if let Some(tx) = self.responder.lock().unwrap().take() {
@@ -1845,7 +1843,7 @@ async fn wire_originates_sri_sm_and_correlates_the_response() {
 const AC_MT_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 25, 3];
 
 /// An `Invoke` component with an explicit id / operation / optional argument.
-fn invoke_comp(id: i64, op: i64, arg: Option<Vec<u8>>) -> Component {
+fn invoke_comp(id: i8, op: i64, arg: Option<Vec<u8>>) -> Component {
     Component::Invoke(Invoke {
         invoke_id: id,
         linked_id: None,
@@ -1855,12 +1853,14 @@ fn invoke_comp(id: i64, op: i64, arg: Option<Vec<u8>>) -> Component {
 }
 
 /// A `ReturnResultLast` component answering `id` for `op` (optional parameter).
-fn result_comp(id: i64, op: i64, param: Option<Vec<u8>>) -> Component {
+fn result_comp(id: i8, op: i64, param: Option<Vec<u8>>) -> Component {
     Component::ReturnResultLast(ReturnResult {
         invoke_id: id,
-        result: Some(ReturnResultValue {
+        // Q.773 3.1: the result sequence is there with its parameter, or not
+        // at all.
+        result: param.map(|p| ReturnResultValue {
             operation_code: OperationCode::Local(op),
-            parameter: param.map(Any::new),
+            parameter: Some(Any::new(p)),
         }),
     })
 }

@@ -1,6 +1,6 @@
 [package]
 name = "siphon-sigtran"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.80"
 description = "SIGTRAN/SS7 runtime: M3UA/M2PA/SUA transport, MTP3 routing, SCCP GTT, content routing, MAP/CAP/INAP termination on the published SS7 codec crates"
@@ -39,8 +39,9 @@ sua = "1"
 # ISUP (Q.763): circuit-switched call control, a direct MTP3-user (SI=5). Decoded
 # on the transit path for the optional ISUP-aware screening layer.
 itu-isup = "1"
-# TCAP (Q.773): transactions + components. Decoded for content routing.
-tcap = "1"
+# TCAP (Q.773): transactions + components, and the decode problems Q.774 answers
+# with an Abort or a Reject. Drives the dialogue engine and content routing.
+tcap = "2"
 # GSM MAP (TS 29.002): operation codes + argument types (content routing view).
 gsm_map = "1.1"
 # CAMEL CAP (TS 29.078): operation codes (content routing view for SCP).

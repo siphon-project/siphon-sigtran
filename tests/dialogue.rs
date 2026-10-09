@@ -35,7 +35,7 @@ use tcap::{
 
 use siphon_sigtran::config::Tcap;
 use siphon_sigtran::dialogue::{
-    Dialogue, DialogueEngine, IncomingOp, OutgoingBegin, PeerComponent, PeerTurn,
+    Dialogue, DialogueEngine, IncomingOp, OperationClass, OutgoingBegin, PeerComponent, PeerTurn,
     TerminationHandler,
 };
 use siphon_sigtran::metrics;
@@ -110,7 +110,7 @@ fn aarq(ac: &[u32]) -> DialoguePortion {
     DialoguePortion::aarq(Oid::new(ac).expect("valid ac oid"))
 }
 
-fn invoke(op: i64, arg: Vec<u8>, id: i64) -> Component {
+fn invoke(op: i64, arg: Vec<u8>, id: i8) -> Component {
     Component::Invoke(Invoke {
         invoke_id: id,
         linked_id: None,
@@ -119,7 +119,7 @@ fn invoke(op: i64, arg: Vec<u8>, id: i64) -> Component {
     })
 }
 
-fn return_result(op: i64, param: Vec<u8>, id: i64) -> Component {
+fn return_result(op: i64, param: Vec<u8>, id: i8) -> Component {
     Component::ReturnResultLast(ReturnResult {
         invoke_id: id,
         result: Some(ReturnResultValue {
@@ -265,7 +265,7 @@ fn aare_ac(msg: &TcapMessage) -> Option<Vec<u32>> {
         TcapMessage::Continue(c) => c.dialogue_portion.as_ref(),
         _ => None,
     }?;
-    match dp.dialogue_pdu()? {
+    match dp.dialogue_pdu().ok()?? {
         DialoguePdu::Aare {
             application_context_name,
             ..
@@ -479,7 +479,7 @@ struct FakeHlrSriSm;
 impl TerminationHandler for FakeHlrSriSm {
     fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
         dlg.reply(op.operation_code, Some(sri_sm_res()));
-        dlg.end();
+        dlg.end().expect("end");
     }
 }
 
@@ -491,8 +491,9 @@ impl TerminationHandler for FakeHlrUpdateLocation {
         dlg.invoke(
             gsm_map::operations::subscriber_data::op_codes::INSERT_SUBSCRIBER_DATA,
             Some(isd_arg()),
-        );
-        dlg.send(); // Continue: AARE + Invoke(ISD), dialogue held open
+        )
+        .expect("invoke");
+        dlg.send().expect("send"); // Continue: AARE + Invoke(ISD), dialogue held open
     }
     fn on_continue(&self, dlg: &mut Dialogue, peer: &PeerTurn) {
         // The VLR acked the ISD; close with the updateLocation result.
@@ -501,7 +502,7 @@ impl TerminationHandler for FakeHlrUpdateLocation {
                 gsm_map::operations::location::op_codes::UPDATE_LOCATION,
                 Some(update_location_res()),
             );
-            dlg.end();
+            dlg.end().expect("end");
         }
     }
 }
@@ -511,7 +512,7 @@ struct FakeSmscMoForward;
 impl TerminationHandler for FakeSmscMoForward {
     fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
         dlg.reply(op.operation_code, Some(mo_forward_sm_res()));
-        dlg.end();
+        dlg.end().expect("end");
     }
 }
 
@@ -519,8 +520,9 @@ impl TerminationHandler for FakeSmscMoForward {
 struct FakeScp;
 impl TerminationHandler for FakeScp {
     fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
-        dlg.invoke(gsm_cap::op_codes::CONNECT, Some(connect_arg()));
-        dlg.end(); // connect Invoke in the closing dialogue
+        dlg.invoke(gsm_cap::op_codes::CONNECT, Some(connect_arg()))
+            .expect("invoke");
+        dlg.end().expect("end"); // connect Invoke in the closing dialogue
     }
 }
 
@@ -530,7 +532,7 @@ struct FakeHlrSendAuthInfo;
 impl TerminationHandler for FakeHlrSendAuthInfo {
     fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
         dlg.reply(op.operation_code, Some(send_auth_info_res()));
-        dlg.end();
+        dlg.end().expect("end");
     }
 }
 
@@ -542,9 +544,11 @@ impl TerminationHandler for FakeScpFull {
         dlg.invoke(
             gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT,
             Some(rrbe_arg()),
-        );
-        dlg.invoke(gsm_cap::op_codes::CONNECT, Some(connect_arg()));
-        dlg.end();
+        )
+        .expect("invoke");
+        dlg.invoke(gsm_cap::op_codes::CONNECT, Some(connect_arg()))
+            .expect("invoke");
+        dlg.end().expect("end");
     }
 }
 
@@ -552,8 +556,9 @@ impl TerminationHandler for FakeScpFull {
 struct FakeScpRelease;
 impl TerminationHandler for FakeScpRelease {
     fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
-        dlg.invoke(gsm_cap::op_codes::RELEASE_CALL, Some(release_call_arg()));
-        dlg.end();
+        dlg.invoke(gsm_cap::op_codes::RELEASE_CALL, Some(release_call_arg()))
+            .expect("invoke");
+        dlg.end().expect("end");
     }
 }
 
@@ -565,9 +570,11 @@ impl TerminationHandler for FakeInapScp {
         dlg.invoke(
             inap::op_codes::REQUEST_REPORT_BCSM_EVENT,
             Some(inap_rrbe_arg()),
-        );
-        dlg.invoke(inap::op_codes::CONNECT, Some(inap_connect_arg()));
-        dlg.end();
+        )
+        .expect("invoke");
+        dlg.invoke(inap::op_codes::CONNECT, Some(inap_connect_arg()))
+            .expect("invoke");
+        dlg.end().expect("end");
     }
 }
 
@@ -577,11 +584,17 @@ impl TerminationHandler for FakeInapScp {
 struct FakeInapScpHeldOpen;
 impl TerminationHandler for FakeInapScpHeldOpen {
     fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
-        dlg.invoke(
+        // RequestReportBCSMEvent is a class 2 operation (Q.1218): no reply is
+        // its success, and the call may last far longer than an invoke timer.
+        dlg.set_idle_timeout(Some(Duration::from_secs(7_200)));
+        dlg.invoke_with(
             inap::op_codes::REQUEST_REPORT_BCSM_EVENT,
             Some(inap_rrbe_arg()),
-        );
-        dlg.send(); // Continue: AARE + RRBE, dialogue held open
+            OperationClass::Two,
+            None,
+        )
+        .expect("invoke");
+        dlg.send().expect("send"); // Continue: AARE + RRBE, dialogue held open
     }
     fn on_continue(&self, dlg: &mut Dialogue, peer: &PeerTurn) {
         // The SSF reported an armed detection point; release the call and close.
@@ -590,8 +603,9 @@ impl TerminationHandler for FakeInapScpHeldOpen {
             .iter()
             .any(|c| matches!(c, PeerComponent::Invoke { .. }))
         {
-            dlg.invoke(inap::op_codes::RELEASE_CALL, Some(inap_release_call_arg()));
-            dlg.end();
+            dlg.invoke(inap::op_codes::RELEASE_CALL, Some(inap_release_call_arg()))
+                .expect("invoke");
+            dlg.end().expect("end");
         }
     }
 }
@@ -602,7 +616,7 @@ struct KeepOpen;
 impl TerminationHandler for KeepOpen {
     fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
         dlg.reply(op.operation_code, Some(mo_forward_sm_res()));
-        dlg.send(); // Continue, no end: stays open, no outstanding invoke
+        dlg.send().expect("send"); // Continue, no end: stays open, no outstanding invoke
     }
 }
 
@@ -623,11 +637,12 @@ impl SmscMtOriginator {
         dlg.invoke(
             gsm_map::op_codes::MT_FORWARD_SM,
             Some(mt_forward_sm_arg(*idx, last)),
-        );
+        )
+        .expect("invoke");
         if last {
-            dlg.end();
+            dlg.end().expect("end");
         } else {
-            dlg.send();
+            dlg.send().expect("send");
         }
         *idx += 1;
     }
@@ -661,8 +676,9 @@ impl TerminationHandler for SriSmOriginator {
         dlg.invoke(
             gsm_map::op_codes::SEND_ROUTING_INFO_FOR_SM,
             Some(rasn::ber::encode(&arg).unwrap()),
-        );
-        dlg.send();
+        )
+        .expect("invoke");
+        dlg.send().expect("send");
     }
     fn on_continue(&self, _dlg: &mut Dialogue, peer: &PeerTurn) {
         for c in &peer.components {
@@ -700,7 +716,7 @@ impl TerminationHandler for Tagger {
             .unwrap_or_else(|e| e.into_inner())
             .push(self.0);
         dlg.reply(op.operation_code, Some(mo_forward_sm_res()));
-        dlg.end();
+        dlg.end().expect("end");
     }
 }
 
@@ -1202,6 +1218,16 @@ fn inap_initial_dp_held_open_then_event_report_releases() {
     assert_eq!(engine.open_dialogues(), 1);
     let our_tid = otid_of(&r1);
 
+    // The call is answered and lasts ten minutes before anything is reported.
+    // Neither the invocation timer of the class 2 RRBE nor an idle timer may
+    // abort the dialogue meanwhile.
+    let waiting = engine.sweep(Instant::now() + Duration::from_secs(600));
+    assert!(
+        waiting.is_empty(),
+        "nothing is aborted while the call lasts"
+    );
+    assert_eq!(engine.open_dialogues(), 1);
+
     // Follow-up leg: the SSF reports the armed event; the SCP releases + closes.
     let leg2 = engine.deliver(
         &continue_msu(
@@ -1234,19 +1260,21 @@ fn mt_forward_sm_multi_segment_with_more_messages_to_send() {
         segments: 3,
         sent: Mutex::new(0),
     });
-    let (our_tid, out) = engine.begin(
-        OutgoingBegin {
-            application_context: AC_MT_RELAY.to_vec(),
-            called: SccpAddress::with_gt(gt(MSC_NUM), Some(SubsystemNumber::Msc)),
-            calling: SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Msc)),
-            opc: OUR_PC,
-            dpc: PEER_PC,
-            ni: 0,
-            sls: 0,
-            ingress_assoc: "msc".into(),
-        },
-        originator,
-    );
+    let (our_tid, out) = engine
+        .begin(
+            OutgoingBegin {
+                application_context: AC_MT_RELAY.to_vec(),
+                called: SccpAddress::with_gt(gt(MSC_NUM), Some(SubsystemNumber::Msc)),
+                calling: SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Msc)),
+                opc: OUR_PC,
+                dpc: PEER_PC,
+                ni: 0,
+                sls: 0,
+                ingress_assoc: "msc".into(),
+            },
+            originator,
+        )
+        .expect("begin");
 
     // Segment 0: a Begin carrying MT-ForwardSM with moreMessagesToSend set.
     let seg0 = decode_reply(&out[0]);
@@ -1328,19 +1356,21 @@ fn originating_sri_sm_captures_the_hlr_result() {
     let originator = Arc::new(SriSmOriginator {
         result: Mutex::new(None),
     });
-    let (our_tid, out) = engine.begin(
-        OutgoingBegin {
-            application_context: AC_SRI_SM.to_vec(),
-            called: SccpAddress::with_gt(gt("15550111"), Some(SubsystemNumber::Hlr)),
-            calling: SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Msc)),
-            opc: OUR_PC,
-            dpc: PEER_PC,
-            ni: 0,
-            sls: 0,
-            ingress_assoc: "hlr".into(),
-        },
-        originator.clone(),
-    );
+    let (our_tid, out) = engine
+        .begin(
+            OutgoingBegin {
+                application_context: AC_SRI_SM.to_vec(),
+                called: SccpAddress::with_gt(gt("15550111"), Some(SubsystemNumber::Hlr)),
+                calling: SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Msc)),
+                opc: OUR_PC,
+                dpc: PEER_PC,
+                ni: 0,
+                sls: 0,
+                ingress_assoc: "hlr".into(),
+            },
+            originator.clone(),
+        )
+        .expect("begin");
     let begin = decode_reply(&out[0]);
     assert!(matches!(begin, TcapMessage::Begin(_)));
     assert_eq!(

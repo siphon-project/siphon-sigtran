@@ -188,16 +188,16 @@ never touches them.
 
 ```yaml
 tcap:
-  invoke_timer_ms: 15000       # outstanding invoke ages out (default)
-  dialogue_timer_ms: 30000     # idle dialogue ages out (default)
-  max_dialogues: 100000        # Begin over the ceiling is refused with an Abort
+  invoke_timer_ms: 15000       # default invocation timer (default)
+  dialogue_timer_ms: 30000     # default idle timeout of a dialogue (default)
+  max_dialogues: 100000        # Begin over the ceiling is refused with a P-Abort
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
-| `invoke_timer_ms` | `15000` | How long an outstanding invoke waits for its result before it is aged out (counted in `sigtran_invoke_timeouts_total`). |
-| `dialogue_timer_ms` | `30000` | How long a dialogue may sit idle before it is aged out (counted in `sigtran_dialogue_timeouts_total`). |
-| `max_dialogues` | `100000` | Ceiling on concurrently open dialogues. A `Begin` over it is rejected with a P-Abort. |
+| `invoke_timer_ms` | `15000` | The invocation timer of an invoke that does not name its own. Its expiry is reported to the handler and means what the operation's class says ([operation classes](script-api.md#operation-classes)); only a class 1 expiry is counted in `sigtran_invoke_timeouts_total`, and only a handler (or the default for class 1) aborts the dialogue on it. |
+| `dialogue_timer_ms` | `30000` | How long a dialogue may go without a message in either direction before it is aborted (a U-Abort to the peer, the handler told, counted in `sigtran_dialogue_timeouts_total`). `0` disables it. A dialogue sets its own with `dlg.set_idle_timeout(...)`: a call-control dialogue that waits for the end of a call needs more than a request / response default. |
+| `max_dialogues` | `100000` | Ceiling on concurrently open dialogues. A `Begin` over it is refused with a P-Abort, cause resource limitation. |
 
 ## `content_routing` { #content-routing }
 

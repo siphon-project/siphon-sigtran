@@ -5,6 +5,153 @@ All notable changes are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the policy.
 
+## [Unreleased]
+
+This will be **2.0.0**: public items of the dialogue engine change type, and the
+Python layer changes with them. The engine moves to `tcap` 2, whose decoder no
+longer returns a message that lost part of itself, and with that this crate stops
+doing three things that were wrong on the wire.
+
+**What was wrong in 1.0.0**
+
+- **Every Abort the node sent was malformed.** It was built as an opaque value
+  under the P-Abort tag (`6A` around an `EXTERNAL`), which no peer reads: neither
+  a P-Abort cause nor user abort information. That covered every abort there was:
+  no handler for the operation, the dialogue ceiling, a handler that answered
+  nothing, an invoke timer, an idle timer.
+- **A damaged or unexpected message was dropped without the answer ITU-T Q.774
+  requires.** A message that failed to decode was discarded in silence, whatever
+  was wrong with it. A `Continue` for a transaction the node did not know was
+  discarded too. And a message whose last component was malformed was not even
+  seen as damaged: it was processed without that component.
+- **A reply without a result parameter was never sent.** `dlg.reply(...)` with a
+  result that carries no parameter (`mo_forward_sm_res()`, `mt_forward_sm_res()`)
+  staged a result sequence Q.773 does not allow. On `tcap` 2 that is refused by
+  the encoder, and the send path swallowed the refusal: the reply vanished.
+
+### Fixed
+
+- **Damaged messages are answered** as Q.774 3.2.2 and 3.3.4 lay down. A fault in
+  the transaction portion of a `Begin`, a `Continue` or a message of unknown type
+  whose originating transaction ID can be read gets an Abort with the P-Abort
+  cause. A fault in the dialogue portion gets an Abort carrying an ABRT APDU,
+  abort-source dialogue-service-provider. A fault in a component gets a `Reject`
+  component: the components before it are delivered as a normal turn, those after
+  it are discarded, and the Reject leaves with the next `Continue` or `End` of the
+  dialogue. Where Q.774 calls for no response (a damaged `End` or `Abort`, an
+  originating transaction ID that cannot be read) there is none, and the message
+  is counted in `sigtran_tcap_discarded_total`.
+- **A `Continue` for an unknown transaction ID** is answered with a P-Abort,
+  cause unrecognized transaction ID, addressed to its originating transaction ID
+  (Q.774 Table 7). An `End` or an `Abort` for one is discarded.
+- **Aborts are well-formed and say what they are.** The dialogue ceiling is a
+  P-Abort, cause resource limitation. Everything the node aborts on behalf of the
+  dialogue's user (no handler for the operation, a handler that answers nothing to
+  a `Begin`, a class 1 invoke that got no reply, an idle dialogue, `dlg.abort()`)
+  is a U-Abort: with an ABRT APDU, abort-source dialogue-service-user, when the
+  dialogue was opened with an application context, and with no reason otherwise.
+  An AARQ that does not list version 1 of the dialogue portion is refused with the
+  AARE of Q.774 3.2.3.
+- **A reply without a result parameter is a `ReturnResult` with no result
+  sequence**, and it is sent.
+- **Nothing on the send path fails silently.** A message the encoder refuses is
+  logged at error level with the dialogue's transaction ids, counted in
+  `sigtran_tcap_send_errors_total`, and returned to the caller (`Dialogue::send` /
+  `end` / `abort` and `DialogueEngine::begin` return a `Result`). When it leaves a
+  `Begin` unanswered the dialogue is aborted, so the peer is told.
+- **A `Reject` from the peer reaches the handler as a Reject**: the invoke id,
+  which may be absent, and the typed problem. It used to arrive as an error with
+  code -1.
+- **Invoke timers follow the operation class** (Q.774 3.2.1.1.3). The expiry of a
+  timer is reported to the handler and is never an abort by the engine: for a
+  class 1 operation it is an abnormal situation the handler decides on (the
+  default aborts), for class 2 and 3 it is the normal outcome, class 4 just
+  returns to idle. Every invoke used to be treated as class 1 and its timer
+  aborted the dialogue, so an SCP that armed a detection point lost its dialogue
+  after 15 seconds.
+- **A handler that says nothing on a follow-up turn keeps the dialogue open.** It
+  used to be aborted. (Saying nothing to a `Begin` still aborts it.)
+- **The idle timeout is per dialogue** (`Dialogue::set_idle_timeout`,
+  `dlg.set_idle_timeout(seconds)`), and `tcap.dialogue_timer_ms: 0` disables the
+  default.
+- **The handler is told when a dialogue ends, once, and why**
+  (`TerminationHandler::on_closed`): a peer abort (P-Abort with its cause, or the
+  kind of U-Abort), a damaged message, a timer. A peer abort or a timer used to
+  remove the dialogue without a word, leaving whatever the handler had tied to it.
+- **Every component of a `Begin` reaches the handler** (`IncomingOp::further`,
+  `arg.further`). Only the first Invoke used to be looked at.
+- **A result or an error that fits no operation in progress is rejected** (Q.774
+  Table 5): an invoke id that names none of our invokes, a result for a class 2 or
+  4 operation, an error for a class 3 or 4 operation, a linked id that is not an
+  active invoke. They used to be delivered as if valid.
+- **Nothing is sent after the peer's `End`.** A handler that staged components on
+  the turn that carried the `End` had them sent to a transaction that no longer
+  existed.
+
+### Changed
+
+- `tcap` 2 (was 1).
+- `dialogue::Dialogue`: `invoke` returns `Result<InvokeId, DialogueError>`;
+  `send`, `end` and `abort` return `Result<(), DialogueError>`; `abort` takes no
+  argument (a handler aborts as the TC-user and cannot claim to be the provider);
+  invoke ids are `i8` (`InvokeIdType ::= INTEGER (-128..127)`), allocated in a ring
+  over 0..=127 that skips ids still in progress.
+- `dialogue::PeerComponent` is `#[non_exhaustive]` and has `Reject` and
+  `LocalReject`; its invoke ids are `i8`. `dialogue::IncomingOp` has `further` and
+  an `i8` invoke id.
+- `DialogueEngine::begin` returns `Result<(Tid, Vec<Msu>), DialogueError>`.
+- `DialogueEngine::sweep` returns whatever the handlers flushed on a timer, not
+  only aborts.
+- `sigtran_abort_total{source}` keeps its three values with a corrected meaning:
+  `user` is a U-Abort from the peer's TC-user, `provider` a P-Abort or an ABRT /
+  refusing AARE from the peer's TCAP, `local` an abort this node sent. A received
+  Abort used to count as `provider` whatever it was.
+- `sigtran_invoke_timeouts_total` counts class 1 expiries only.
+
+### Added
+
+- `dialogue::TerminationHandler::on_invoke_timeout` and `on_closed`;
+  `OperationClass`, `InvokeTimeout`, `DialogueClosed`, `CloseReason`, `PeerAbort`,
+  `UserAbort`, `DialogueError`; `Dialogue::invoke_with`, `reject`,
+  `set_idle_timeout`, `idle_timeout`, `outstanding_invokes`.
+- Metrics: `sigtran_tcap_abort_total{dir,kind,cause}` (`kind` is `p-abort` or
+  `u-abort`; `cause` is a closed set, a P-Abort cause value Q.773 does not name
+  counts as `other`), `sigtran_tcap_reject_total{dir,problem}`,
+  `sigtran_tcap_discarded_total{reason}`, `sigtran_tcap_send_errors_total`.
+- Tests: the abnormal procedures of Q.774 case by case (`tests/abnormal.rs`), with
+  the damaged messages assembled by hand from Q.773 and every message the engine
+  emits in response dissected by Wireshark, asserting on the fields it reads.
+
+### What a script has to change
+
+- **A Reject is no longer an error.** `turn.is_error` is false and
+  `turn.error_code` is `None` for a `Reject`; test `turn.is_reject` and read
+  `turn.reject_invoke_id`, `turn.reject_problem_class`, `turn.reject_problem_code`.
+  A handler that aborted on `is_error` and should also give up on a rejected
+  invoke needs `if turn.is_error or turn.is_reject`.
+- **The handler is called for two things that are not messages.** A `PeerTurn`
+  with `is_timeout` reports an invocation timer; one with `closed` set reports
+  that the dialogue ended without the script ending it. Both have no components,
+  so a handler that only tests `is_result` / `is_invoke` / `is_error` ignores them
+  correctly. Use `closed` (and `is_end`) to release what the script tied to the
+  dialogue.
+- **Saying nothing on a follow-up turn no longer aborts.** A handler that relied
+  on that to get rid of a dialogue has to call `dlg.abort()` or `dlg.end()`.
+- **Set an idle timeout on a dialogue that waits** (`dlg.set_idle_timeout(...)`):
+  with its invoke timers no longer aborting it, a call-control dialogue now lives
+  until `tcap.dialogue_timer_ms` of silence, 30 seconds by default.
+- **`dlg.reply_to` and `dlg.error` raise `SigtranError`** for an invoke id outside
+  -128..127 instead of putting it on the wire.
+- **Nothing staged after the peer's `End` is sent.** `dlg.send()` / `dlg.end()` on
+  a turn with `is_end` is logged as an error; drop the call.
+- **`await gsm_map.begin(...)` raises `SigtranError`** saying why when the dialogue
+  ends before an answer (a peer abort with its kind and cause, a timeout, a `Begin`
+  that could not be encoded) instead of the one "closed with no response".
+- New: `dlg.reject(invoke_id, problem_class, problem_code)`, `dlg.invoke(...,
+  operation_class=, timeout=)`, `arg.further`, `turn.components`, the `Component`
+  view, `node.sweep`, `node.assemble_tcap`, and `rejects` / `abort_kind` /
+  `p_abort_cause` / `abort_source` / `result_invoke_id` on `node.decode(...)`.
+
 ## [1.0.0] — 2026-07-21
 
 Initial release. A SIGTRAN/SS7 runtime that turns a declarative `sigtran.yaml`

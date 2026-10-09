@@ -376,7 +376,14 @@ impl TransportHandle {
                     maybe = rx.recv() => {
                         let Some(origination) = maybe else { break };
                         let dpc = origination.req.dpc;
-                        let (_tid, frames) = engine.begin(origination.req, origination.handler);
+                        // An error is already logged with the dialogue's
+                        // identifiers, and the handler's `on_closed` has told
+                        // whoever is waiting on it.
+                        let Ok((_tid, frames)) =
+                            engine.begin(origination.req, origination.handler)
+                        else {
+                            continue;
+                        };
                         let Some(via) = resolve_egress(&router, &tenant, dpc) else {
                             eprintln!(
                                 "siphon-sigtran: originated dialogue to dpc {dpc} has no MTP3 route, dropped"

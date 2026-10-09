@@ -1056,7 +1056,7 @@ dependencies = [
  "hex",
  "rasn",
  "sccp",
- "tcap",
+ "tcap 1.0.0",
  "thiserror 2.0.20",
 ]
 
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-sigtran"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "async-sctp",
  "criterion",
@@ -3030,7 +3030,7 @@ dependencies = [
  "serde_yaml",
  "siphon-sip",
  "sua",
- "tcap",
+ "tcap 2.0.0",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -3313,6 +3313,17 @@ name = "tcap"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b0b3ae9ef7e1f435857ee51059c1db6a30f512b450ad232bf63e4ad84b3090a"
+dependencies = [
+ "hex",
+ "rasn",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "tcap"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2487e2dd5c81e55c4fb7f4d4ce8b8a4024c20e8e4069e9fa99c48e5634952cdc"
 dependencies = [
  "hex",
  "rasn",

@@ -97,8 +97,8 @@ async def on_update_location(dlg, event):
         if event.is_result:
             dlg.reply(gsm_map.update_location_res(hlr_number=HLR_NUMBER))
             dlg.end()                            # close with the updateLocation result
-        elif event.is_error:
-            dlg.abort()                          # the VLR refused the data
+        elif event.is_error or event.is_reject:
+            dlg.abort()                          # the VLR refused the data, or the invoke
         return
     # Opening leg: push the subscriber profile, hold the dialogue open.
     imsi, msisdn = await load_profile(event.argument)
@@ -112,9 +112,11 @@ Three moving parts, all on real API:
   HLR sends inside the open dialogue. `dlg.send()` flushes it as a `Continue` that
   carries the AARE and keeps the transaction open.
 - **The [`PeerTurn`](../script-api.md#peerturn)** the follow-up leg receives says
-  what the VLR sent: `is_result` / `is_invoke` / `is_error`, the `operation_code`
-  it answers, and the raw `result` bytes. The handler waits for the ISD
-  `returnResultLast` before it closes.
+  what the VLR sent: `is_result` / `is_invoke` / `is_error` / `is_reject`, the
+  `operation_code` it answers, and the raw `result` bytes. The handler waits for
+  the ISD `returnResultLast` before it closes. If the VLR never answers, the same
+  handler is called with `event.is_timeout` and, staging nothing, has the dialogue
+  aborted for it; if the VLR aborts, with `event.closed`.
 - **`gsm_map.update_location_res(hlr_number=…)`** builds the updateLocation result;
   `dlg.reply(...)` then `dlg.end()` sends it in the closing `End`, which echoes the
   VLR's original transaction id.
