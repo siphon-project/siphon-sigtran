@@ -87,6 +87,13 @@ doing three things that were wrong on the wire.
 - **Nothing is sent after the peer's `End`.** A handler that staged components on
   the turn that carried the `End` had them sent to a transaction that no longer
   existed.
+- **Content rules no longer evaluate a message they could not read in full.** A
+  `Begin` or `Continue` that does not decode completely is dropped in a domain
+  with content rules and counted in `sigtran_content_unscreened_total`. Before, a
+  message with a malformed last component was matched on its other components,
+  and one that failed to decode outright was routed on unseen. Segments of a
+  segmented XUDT / LUDT are still not evaluated (the node does not reassemble in
+  transit); they are now counted, in the same family.
 
 ### Changed
 
@@ -102,6 +109,7 @@ doing three things that were wrong on the wire.
 - `DialogueEngine::begin` returns `Result<(Tid, Vec<Msu>), DialogueError>`.
 - `DialogueEngine::sweep` returns whatever the handlers flushed on a timer, not
   only aborts.
+- `routing::Inbound` has `content_undecodable`.
 - `sigtran_abort_total{source}` keeps its three values with a corrected meaning:
   `user` is a U-Abort from the peer's TC-user, `provider` a P-Abort or an ABRT /
   refusing AARE from the peer's TCAP, `local` an abort this node sent. A received
@@ -114,10 +122,12 @@ doing three things that were wrong on the wire.
   `OperationClass`, `InvokeTimeout`, `DialogueClosed`, `CloseReason`, `PeerAbort`,
   `UserAbort`, `DialogueError`; `Dialogue::invoke_with`, `reject`,
   `set_idle_timeout`, `idle_timeout`, `outstanding_invokes`.
+- `content::screen` and `content::Screening`.
 - Metrics: `sigtran_tcap_abort_total{dir,kind,cause}` (`kind` is `p-abort` or
   `u-abort`; `cause` is a closed set, a P-Abort cause value Q.773 does not name
   counts as `other`), `sigtran_tcap_reject_total{dir,problem}`,
-  `sigtran_tcap_discarded_total{reason}`, `sigtran_tcap_send_errors_total`.
+  `sigtran_tcap_discarded_total{reason}`, `sigtran_tcap_send_errors_total`,
+  `sigtran_content_unscreened_total{reason,action}`.
 - Tests: the abnormal procedures of Q.774 case by case (`tests/abnormal.rs`), with
   the damaged messages assembled by hand from Q.773 and every message the engine
   emits in response dissected by Wireshark, asserting on the fields it reads.

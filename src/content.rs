@@ -127,21 +127,56 @@ pub struct MapView {
 
 // ── Decoding a wire message into a MapView ───────────────────────────────────
 
-/// Decode a connectionless SCCP message (UDT/XUDT/LUDT carrying TCAP) into the
-/// [`MapView`] the content engine matches on: the operation, the calling/called
-/// global titles, and the subscriber IMSI/MSISDN the first MAP `Invoke` carries.
+/// What the content layer can say about one connectionless SCCP message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Screening {
+    /// The message is a TCAP `Begin` or `Continue` that decoded in full, and
+    /// this is the view the rules are evaluated on.
+    View(MapView),
+    /// The message is not one the content rules apply to: its payload is not a
+    /// TCAP message, it is an `End`, an `Abort` or a `Unidirectional`, or it is
+    /// a `Begin` / `Continue` without an `Invoke` of a local operation. It is
+    /// routed as if the domain had no content rules.
+    NotApplicable,
+    /// The message is a TCAP `Begin` or `Continue` that could **not** be decoded
+    /// in full: a damaged transaction or dialogue portion, a component that
+    /// cannot be read, octets after the end of the message. Nothing can be said
+    /// about what its receiver would do with it, so it has not passed the rules:
+    /// the router drops it ([`Inbound::content_undecodable`]).
+    ///
+    /// [`Inbound::content_undecodable`]: crate::routing::Inbound::content_undecodable
+    Undecodable,
+    /// The message is one segment of a segmented XUDT / LUDT (Q.714 4.1.1): the
+    /// TCAP message is not whole in it, and this node does not reassemble in
+    /// transit. It is not evaluated against the rules.
+    Segmented,
+}
+
+/// Decode a connectionless SCCP message (UDT/XUDT/LUDT carrying TCAP) for the
+/// content rules: the [`MapView`] they match on, or why there is none.
 ///
-/// Returns `None` when the payload is not a decodable SCCP-over-TCAP `Begin` /
-/// `Continue` with a recognised operation; the router then skips content routing
-/// and falls through to GTT / SSN routing. The transport only calls this for a
-/// tenant that has content rules, so a pure-transit node decodes nothing extra.
-pub fn decode_map_view(sccp: &SccpMessage) -> Option<MapView> {
-    let (op_code, argument) = first_invoke(sccp.data())?;
+/// The decode is strict. A message that is recognisably a `Begin` or a
+/// `Continue` and cannot be decoded in full is [`Screening::Undecodable`], never
+/// a view of the part that could be read and never "nothing to screen": a
+/// message with a malformed last component must not get past a screening rule
+/// by being looked at without that component, or by not being looked at.
+///
+/// The transport only calls this for a domain that has content rules, so a
+/// pure-transit node decodes nothing extra.
+pub fn screen(sccp: &SccpMessage) -> Screening {
+    if is_segment(sccp) {
+        return Screening::Segmented;
+    }
+    let (op_code, argument) = match first_invoke(sccp.data()) {
+        Ok(Some(invoke)) => invoke,
+        Ok(None) => return Screening::NotApplicable,
+        Err(Unreadable) => return Screening::Undecodable,
+    };
     let (imsi, msisdn) = argument
         .as_deref()
         .map(|a| subscriber_identity(op_code, a))
         .unwrap_or((None, None));
-    Some(MapView {
+    Screening::View(MapView {
         operation: Operation::from_op_code(op_code),
         cgpa_gt: sccp
             .calling_party()
@@ -158,22 +193,80 @@ pub fn decode_map_view(sccp: &SccpMessage) -> Option<MapView> {
     })
 }
 
+/// The [`MapView`] of a message that decoded in full, or `None` for every other
+/// [`Screening`] outcome. Use [`screen`] to tell those apart: a `None` here does
+/// not mean the message is clean.
+pub fn decode_map_view(sccp: &SccpMessage) -> Option<MapView> {
+    match screen(sccp) {
+        Screening::View(view) => Some(view),
+        _ => None,
+    }
+}
+
+/// Whether the message is one segment of a segmented message: an XUDT or LUDT
+/// whose optional part carries a Segmentation parameter (Q.713 3.17, parameter
+/// name `0x10`, four octets) that is not "first segment, no segments remaining".
+fn is_segment(sccp: &SccpMessage) -> bool {
+    let optional = match sccp {
+        SccpMessage::Xudt(m) => &m.optional_part,
+        SccpMessage::Ludt(m) => &m.optional_part,
+        _ => return false,
+    };
+    let mut rest = optional.as_slice();
+    // name, length, value; the end-of-optional-parameters name is 0.
+    while let [name, len, tail @ ..] = rest {
+        let len = usize::from(*len);
+        if *name == 0 || tail.len() < len {
+            break;
+        }
+        if *name == 0x10 {
+            // First octet: bit 8 = first segment, bits 4-1 = remaining segments.
+            return match tail.first() {
+                Some(first) => !(first & 0x80 != 0 && first & 0x0F == 0),
+                None => true,
+            };
+        }
+        rest = &tail[len..];
+    }
+    false
+}
+
+/// A TCAP `Begin` or `Continue` that could not be decoded in full.
+struct Unreadable;
+
+/// An `Invoke`'s local operation code and its raw BER argument.
+type FirstInvoke = (i64, Option<Vec<u8>>);
+
 /// The first `Invoke` component's (local operation code, raw BER argument) out of
-/// a TCAP `Begin` or `Continue`.
-fn first_invoke(tcap_bytes: &[u8]) -> Option<(i64, Option<Vec<u8>>)> {
-    use tcap::{Component, OperationCode, TcapMessage};
-    let components = match tcap::decode(tcap_bytes).ok()? {
-        TcapMessage::Begin(b) => b.components,
-        TcapMessage::Continue(c) => c.components,
-        _ => None,
-    }?;
-    components.into_iter().find_map(|c| match c {
-        Component::Invoke(inv) => match inv.operation_code {
-            OperationCode::Local(op) => Some((op, inv.parameter.map(|p| p.as_bytes().to_vec()))),
+/// a TCAP `Begin` or `Continue`; `Ok(None)` when the message is not one the
+/// content rules apply to.
+fn first_invoke(tcap_bytes: &[u8]) -> Result<Option<FirstInvoke>, Unreadable> {
+    use tcap::{Component, Decoded, MessageType, OperationCode, TcapMessage};
+    let components = match tcap::decode_detailed(tcap_bytes) {
+        Decoded::Complete(TcapMessage::Begin(b)) => b.components,
+        Decoded::Complete(TcapMessage::Continue(c)) => c.components,
+        Decoded::Complete(_) => None,
+        Decoded::Problem(problem) => {
+            return match problem.message_type {
+                Some(MessageType::Begin | MessageType::Continue) => Err(Unreadable),
+                // Not a message type the rules look at, or not TCAP at all (an
+                // SCCP management message, another SCCP user).
+                _ => Ok(None),
+            };
+        }
+    };
+    Ok(components
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|c| match c {
+            Component::Invoke(inv) => match inv.operation_code {
+                OperationCode::Local(op) => {
+                    Some((op, inv.parameter.map(|p| p.as_bytes().to_vec())))
+                }
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
-    })
+        }))
 }
 
 /// The subscriber IMSI / MSISDN a MAP operation argument carries, as decimal
@@ -646,5 +739,132 @@ mod tests {
             ..Default::default()
         };
         assert!(e.evaluate(&view).is_none());
+    }
+
+    // ── Messages that cannot be decoded in full ──────────────────────────────
+
+    /// A UDT from GT 15550180 to GT 15550100 carrying `tcap`.
+    fn udt(tcap: &[u8]) -> SccpMessage {
+        use sccp::{GlobalTitle, SccpAddress, SubsystemNumber, UnitData};
+        let gt = |d: &str| GlobalTitle::Gt0100 {
+            translation_type: 0,
+            numbering_plan: 1,
+            encoding_scheme: 1,
+            nature_of_address: 4,
+            digits: d.to_string(),
+        };
+        SccpMessage::Udt(UnitData::new(
+            SccpAddress::with_gt(gt("15550100"), Some(SubsystemNumber::Hlr)),
+            SccpAddress::with_gt(gt("15550180"), Some(SubsystemNumber::Msc)),
+            tcap.to_vec(),
+        ))
+    }
+
+    /// A Begin (otid 11 22) whose component portion is `components`, assembled
+    /// by hand: `62 { 48 02 11 22, 6C { components } }`.
+    fn begin(components: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x48, 0x02, 0x11, 0x22, 0x6C, components.len() as u8];
+        body.extend_from_slice(components);
+        let mut out = vec![0x62, body.len() as u8];
+        out.extend(body);
+        out
+    }
+
+    /// `[1] { INTEGER 1, INTEGER 45 }`: an Invoke of sendRoutingInfoForSM
+    /// without an argument.
+    const SRI_SM_INVOKE: [u8; 8] = [0xA1, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x2D];
+
+    #[test]
+    fn a_whole_message_gives_a_view() {
+        match screen(&udt(&begin(&SRI_SM_INVOKE))) {
+            Screening::View(view) => assert_eq!(view.operation, Some(Operation::SriSm)),
+            other => panic!("expected a view, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_last_component_is_not_screened_on_the_components_before_it() {
+        // The good Invoke, then an Invoke that stops after its invoke id. The
+        // lenient decoder returned the message without the second component,
+        // and the rules were evaluated as if it were the whole message.
+        let mut components = SRI_SM_INVOKE.to_vec();
+        components.extend_from_slice(&[0xA1, 0x03, 0x02, 0x01, 0x02]);
+        let msg = udt(&begin(&components));
+        assert_eq!(screen(&msg), Screening::Undecodable);
+        assert_eq!(decode_map_view(&msg), None);
+    }
+
+    #[test]
+    fn a_malformed_only_component_is_undecodable_not_absent() {
+        let msg = udt(&begin(&[0xA1, 0x03, 0x02, 0x01, 0x02]));
+        assert_eq!(screen(&msg), Screening::Undecodable);
+    }
+
+    #[test]
+    fn octets_after_the_message_make_it_undecodable() {
+        let mut tcap = begin(&SRI_SM_INVOKE);
+        tcap.push(0x00);
+        assert_eq!(screen(&udt(&tcap)), Screening::Undecodable);
+    }
+
+    #[test]
+    fn a_damaged_continue_is_undecodable() {
+        // 65 { 48 01 01, 49 01 02, 6C 00 }: a component portion with no
+        // components.
+        let tcap = [0x65, 0x08, 0x48, 0x01, 0x01, 0x49, 0x01, 0x02, 0x6C, 0x00];
+        assert_eq!(screen(&udt(&tcap)), Screening::Undecodable);
+    }
+
+    #[test]
+    fn what_the_rules_do_not_look_at_is_not_applicable() {
+        // An End (damaged or not), an Abort, and a payload that is not TCAP (an
+        // SCCP management message: SSA for SSN 6 at point code 1000).
+        let end = [0x64, 0x03, 0x49, 0x01, 0x02];
+        let damaged_end = [0x64, 0x05, 0x49, 0x01, 0x02, 0x6C, 0x00];
+        let abort = [0x67, 0x03, 0x49, 0x01, 0x02];
+        let scmg = [0x01, 0x06, 0xE8, 0x03, 0x00];
+        for payload in [&end[..], &damaged_end[..], &abort[..], &scmg[..], &[][..]] {
+            assert_eq!(
+                screen(&udt(payload)),
+                Screening::NotApplicable,
+                "{payload:02x?}"
+            );
+        }
+        // A Begin without components has nothing to match on either.
+        let bare = [0x62, 0x04, 0x48, 0x02, 0x11, 0x22];
+        assert_eq!(screen(&udt(&bare)), Screening::NotApplicable);
+    }
+
+    #[test]
+    fn a_segment_of_a_segmented_xudt_is_told_apart_from_a_damaged_message() {
+        use sccp::ExtendedUnitData;
+        let whole = begin(&SRI_SM_INVOKE);
+        let SccpMessage::Udt(u) = udt(&whole) else {
+            unreachable!()
+        };
+        let xudt = |data: &[u8], optional: &[u8]| {
+            let mut m = ExtendedUnitData::new(
+                u.called_party.clone(),
+                u.calling_party.clone(),
+                data.to_vec(),
+            );
+            m.optional_part = optional.to_vec();
+            SccpMessage::Xudt(m)
+        };
+        // No optional part: an XUDT carrying the whole message.
+        assert!(matches!(screen(&xudt(&whole, &[])), Screening::View(_)));
+        // Segmentation (0x10, length 4): first segment, none remaining. Whole.
+        let single = [0x10, 0x04, 0x80, 0x01, 0x02, 0x03, 0x00];
+        assert!(matches!(screen(&xudt(&whole, &single)), Screening::View(_)));
+        // First segment, one remaining: the TCAP message is cut short.
+        let first = [0x10, 0x04, 0x81, 0x01, 0x02, 0x03, 0x00];
+        assert_eq!(screen(&xudt(&whole[..10], &first)), Screening::Segmented);
+        // The last segment: not first, none remaining.
+        let last = [0x10, 0x04, 0x00, 0x01, 0x02, 0x03, 0x00];
+        assert_eq!(screen(&xudt(&whole[10..], &last)), Screening::Segmented);
+        // The Segmentation parameter after another optional parameter
+        // (Importance, 0x12, length 1).
+        let after = [0x12, 0x01, 0x05, 0x10, 0x04, 0x81, 0x01, 0x02, 0x03, 0x00];
+        assert_eq!(screen(&xudt(&whole[..10], &after)), Screening::Segmented);
     }
 }

@@ -230,6 +230,22 @@ The `action` is one of:
 | `rewrite_cdpa_gt` | Rewrite the called-party GT digits on the egress SCCP before relay (combined with `route`). |
 | `screen` | `true` drops the message (counted per rule). |
 
+The rules are evaluated on a TCAP `Begin` or `Continue` that decodes in full. One
+that does not (a damaged transaction or dialogue portion, a component that cannot
+be read, octets after the end of the message) is **dropped** in a domain that has
+content rules, and counted in
+`sigtran_content_unscreened_total{reason="undecodable",action="dropped"}`: a
+message that cannot be inspected has not passed a rule, so damaging a message is
+not a way past `screen`. The drop takes the same path as any other, so a sender
+that asked for return on error gets its UDTS. Everything the rules do not look at
+(an `End`, an `Abort`, a payload that is not TCAP) is routed as before.
+
+One segment of a segmented XUDT / LUDT does not hold a whole TCAP message, and the
+node does not reassemble in transit: segments are **not** evaluated against the
+rules and are routed on, counted in
+`sigtran_content_unscreened_total{reason="segmented",action="passed"}`. Watch that
+counter if a `screen` rule matters to you.
+
 ## `isup_screening` { #isup-screening }
 
 Optional ISUP-aware screening on the SI=5 transit path. When the block is absent

@@ -304,6 +304,34 @@ pub fn aborts(source: AbortSource) -> u64 {
     ABORTS[source.index()].load(Ordering::Relaxed)
 }
 
+// ── Content rules: messages that could not be evaluated ──────────────────────
+
+static CONTENT_UNDECODABLE: AtomicU64 = AtomicU64::new(0);
+static CONTENT_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one TCAP `Begin` / `Continue` dropped in a domain with content rules
+/// because it could not be decoded in full.
+pub fn content_undecodable() {
+    CONTENT_UNDECODABLE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of messages dropped because the content layer could not decode
+/// them in full.
+pub fn content_undecodable_total() -> u64 {
+    CONTENT_UNDECODABLE.load(Ordering::Relaxed)
+}
+
+/// Count one segment of a segmented XUDT / LUDT that went through a domain with
+/// content rules without being evaluated against them.
+pub fn content_segment_unscreened() {
+    CONTENT_SEGMENTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of segments that passed a domain with content rules unevaluated.
+pub fn content_segments_unscreened() -> u64 {
+    CONTENT_SEGMENTS.load(Ordering::Relaxed)
+}
+
 // ── TCAP protocol counters (dialogue engine) ─────────────────────────────────
 
 /// What an Abort message carried, for [`tcap_abort`]. The set is closed: a
@@ -837,6 +865,24 @@ pub fn render() -> String {
 
     help(
         &mut out,
+        "sigtran_content_unscreened_total",
+        "Messages the content rules could not be evaluated on, by reason and what was done.",
+        "counter",
+    );
+    line(
+        &mut out,
+        "sigtran_content_unscreened_total",
+        &[("reason", "undecodable"), ("action", "dropped")],
+        content_undecodable_total(),
+    );
+    line(
+        &mut out,
+        "sigtran_content_unscreened_total",
+        &[("reason", "segmented"), ("action", "passed")],
+        content_segments_unscreened(),
+    );
+    help(
+        &mut out,
         "sigtran_tcap_abort_total",
         "TCAP Abort messages, by direction, kind (p-abort / u-abort) and cause.",
         "counter",
@@ -1119,6 +1165,7 @@ mod tests {
             "sigtran_active_dialogues",
             "sigtran_dialogue_timeouts_total",
             "sigtran_abort_total",
+            "sigtran_content_unscreened_total",
             "sigtran_tcap_abort_total",
             "sigtran_tcap_reject_total",
             "sigtran_tcap_discarded_total",

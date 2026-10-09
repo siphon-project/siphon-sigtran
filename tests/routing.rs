@@ -388,6 +388,7 @@ fn sri_sm_over_m3ua_addressed_to_us_routes_via_content_rule() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     // Non-home CdPA → falls through mt-sms-home-route to sri-sm-route (2000/6).
     match decision {
@@ -396,6 +397,49 @@ fn sri_sm_over_m3ua_addressed_to_us_routes_via_content_rule() {
             assert_eq!(ssn, 6);
         }
         other => panic!("expected RouteTo, got {other:?}"),
+    }
+}
+
+#[test]
+fn sri_sm_with_a_malformed_trailing_component_is_dropped_not_routed() {
+    use siphon_sigtran::content::{screen, Screening};
+    let r = router();
+    // The SRI-SM of the test above, with a second component appended to its
+    // component portion by hand: an Invoke that stops after its invoke id
+    // (`A1 03 02 01 02`). Both enclosing lengths grow by five.
+    let mut tcap = tcap_begin(
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        sri_sm_arg("19995550000"),
+    );
+    assert!(tcap[1] < 0x7A, "short-form lengths in this vector");
+    let portion = tcap
+        .windows(1)
+        .position(|w| w[0] == 0x6C)
+        .expect("the component portion tag");
+    tcap[1] += 5;
+    tcap[portion + 1] += 5;
+    tcap.extend_from_slice(&[0xA1, 0x03, 0x02, 0x01, 0x02]);
+
+    let sccp = sccp_udt("19995550000", SubsystemNumber::Hlr, &tcap);
+    let payload = m3ua_data(&sccp, 1000);
+    let (dpc, udt) = parse_m3ua(&payload);
+    let message = SccpMessage::Udt(udt.clone());
+    // The lenient decoder returned this message without its last component and
+    // the rules ran on the rest. It is now neither a view nor "nothing to
+    // screen".
+    assert_eq!(screen(&message), Screening::Undecodable);
+
+    let (called_ssn, cdpa, _) = view_from_udt(&udt);
+    let decision = r.route(&Inbound {
+        dpc,
+        cdpa,
+        called_ssn,
+        view: None,
+        content_undecodable: true,
+    });
+    match decision {
+        RouteDecision::Drop { reason } => assert!(reason.contains("content rules"), "{reason}"),
+        other => panic!("expected Drop, got {other:?}"),
     }
 }
 
@@ -418,6 +462,7 @@ fn sri_sm_for_home_sub_routes_to_group() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     match decision {
         RouteDecision::RouteTo { dpc, ssn, .. } => {
@@ -451,6 +496,7 @@ fn update_location_customer_a_routes_to_home_over_m2pa() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     match decision {
         RouteDecision::RouteTo { dpc, ssn, via, .. } => {
@@ -483,6 +529,7 @@ fn send_auth_info_customer_a_routes_to_home() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     assert!(matches!(
         decision,
@@ -513,6 +560,7 @@ fn cancel_location_customer_a_routes_to_home() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     assert!(matches!(
         decision,
@@ -555,6 +603,7 @@ fn mo_forward_sm_to_owned_ssn_terminates_local() {
         cdpa: None, // route-on-SSN, no GT to translate
         called_ssn,
         view: None,
+        ..Default::default()
     });
     assert_eq!(decision, RouteDecision::Local);
 }
@@ -575,6 +624,7 @@ fn mt_forward_sm_transits_to_serving_msc() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     // 2002 is not our PC → MTP3 transfer to AS msc.
     assert_eq!(
@@ -604,6 +654,7 @@ fn initial_dp_transits_to_scp() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     // 3000 is an m2pa adjacent → implicit route via linkset transit.
     assert_eq!(
@@ -634,6 +685,7 @@ fn gtt_route_on_gt_to_hlr() {
         cdpa,
         called_ssn,
         view: None,
+        ..Default::default()
     });
     match decision {
         RouteDecision::RouteTo { dpc, ssn, via, .. } => {
@@ -662,6 +714,7 @@ fn e214_mgt_converts_then_routes() {
         cdpa: Some(sel),
         called_ssn: Some(6),
         view: None,
+        ..Default::default()
     });
     match decision {
         RouteDecision::RouteTo { dpc, .. } => assert_eq!(dpc, 2000),

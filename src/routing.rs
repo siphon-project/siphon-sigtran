@@ -80,6 +80,11 @@ pub struct Inbound {
     pub called_ssn: Option<u8>,
     /// A decoded MAP/CAP view for content routing, if the layer was decoded.
     pub view: Option<MapView>,
+    /// The message is a TCAP `Begin` or `Continue` that could not be decoded in
+    /// full ([`Screening::Undecodable`](crate::content::Screening::Undecodable)).
+    /// In a domain with content rules it is dropped where the rules would have
+    /// been evaluated: a message that cannot be inspected has not passed them.
+    pub content_undecodable: bool,
 }
 
 /// The top-level router. Holds the compiled [`Tenancy`] and resolves inbound
@@ -279,7 +284,17 @@ impl Router {
             }
         }
 
-        // 2. Content routing overrides GTT when a decoded view is present, it
+        // 2. Content routing. A message the content layer could not decode in
+        //    full is not routed on: it fails closed, so appending a malformed
+        //    component (or any other damage) is not a way past a screening rule.
+        if msg.content_undecodable && rt.content.as_ref().is_some_and(|c| c.has_rules()) {
+            crate::metrics::content_undecodable();
+            return RouteDecision::Drop {
+                reason: "content rules: the TCAP message cannot be decoded in full".into(),
+            };
+        }
+
+        //    Content routing overrides GTT when a decoded view is present, it
         //    routes on the richer application layer.
         if let (Some(engine), Some(view)) = (rt.content.as_ref(), msg.view.as_ref()) {
             if let Some(hit) = engine.evaluate(view) {
@@ -534,6 +549,33 @@ mod tests {
             }
             other => panic!("expected RouteTo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_undecodable_message_is_dropped_where_content_rules_apply() {
+        let r = router();
+        // The same message that `content_rule_routes_sri_sm` routes by its
+        // content, but damaged: no view, and it must not fall through to GTT.
+        let inbound = Inbound {
+            dpc: 1000,
+            cdpa: Some(GttSelector::from_digits("15559999")),
+            content_undecodable: true,
+            ..Default::default()
+        };
+        let before = crate::metrics::content_undecodable_total();
+        match r.route(&inbound) {
+            RouteDecision::Drop { reason } => assert!(reason.contains("content rules"), "{reason}"),
+            other => panic!("expected Drop, got {other:?}"),
+        }
+        assert!(crate::metrics::content_undecodable_total() > before);
+
+        // Without the damage the GT alone routes it: the drop is the content
+        // layer's doing, not a missing translation.
+        let clean = Inbound {
+            content_undecodable: false,
+            ..inbound
+        };
+        assert!(!matches!(r.route(&clean), RouteDecision::Drop { .. }));
     }
 
     #[test]

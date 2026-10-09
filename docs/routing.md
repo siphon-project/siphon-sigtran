@@ -17,7 +17,9 @@ answer wins:
 2. **Content routing.** For a message addressed to us carrying SCCP + TCAP, the
    decoded MAP/CAP view is evaluated against the ordered content rules
    **first**, because they decide on the richest layer. A rule routes,
-   rewrites the called-party GT, screens, or defers to a hook.
+   rewrites the called-party GT, screens, or defers to a hook. A `Begin` or
+   `Continue` that cannot be decoded in full is dropped here instead of being
+   routed unseen ([details](configuration.md#content-routing)).
 3. **SCCP GTT.** Otherwise the called-party global title is translated (after
    an E.214 to E.164 pre-step) to a concrete `(dpc, ssn)`, a group member, or
    local termination.
@@ -161,6 +163,7 @@ call. The families:
 | `sigtran_gtt_translations_total` | counter | `selector`, `result` |
 | `sigtran_gtt_errors_total` | counter | `reason` |
 | `sigtran_content_rule_hits_total` | counter | `rule`, `action` |
+| `sigtran_content_unscreened_total` | counter | `reason`, `action` |
 | `sigtran_active_dialogues` | gauge | |
 | `sigtran_dialogue_timeouts_total` | counter | |
 | `sigtran_invoke_timeouts_total` | counter | `operation` |
