@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use rasn::types::{Any, Oid};
 
 use gsm_cap::operations::{ConnectArg, ReleaseCallArg, RequestReportBcsmEventArg};
-use gsm_cap::types::{BcsmEvent, EventTypeBcsm, MonitorMode};
+use gsm_cap::types::{BcsmEvent, EventTypeBcsm, LegId, MonitorMode};
 use gsm_map::operations::auth::{
     AuthenticationQuintuplet, AuthenticationSetList, SendAuthenticationInfoArg,
     SendAuthenticationInfoRes,
@@ -344,13 +344,7 @@ fn mt_forward_sm_arg(segment: u8, last: bool) -> Vec<u8> {
 }
 
 fn connect_arg() -> Vec<u8> {
-    let arg = ConnectArg {
-        destination_routing_address: vec![isdn("15550123").into()],
-        original_called_party_id: None,
-        calling_partys_category: None,
-        redirecting_party_id: None,
-        generic_numbers: None,
-    };
+    let arg = ConnectArg::new(isdn("15550123").into());
     gsm_cap::encode(&arg).expect("encode connect")
 }
 
@@ -369,20 +363,13 @@ fn send_auth_info_res() -> Vec<u8> {
 }
 
 fn rrbe_arg() -> Vec<u8> {
-    let arg = RequestReportBcsmEventArg {
-        bcsm_events: vec![
-            BcsmEvent {
-                event_type_bcsm: EventTypeBcsm::OAnswer,
-                monitor_mode: MonitorMode::Interrupted,
-                leg_id: None,
-            },
-            BcsmEvent {
-                event_type_bcsm: EventTypeBcsm::ODisconnect,
-                monitor_mode: MonitorMode::NotifyAndContinue,
-                leg_id: None,
-            },
-        ],
-    };
+    // oAnswer on the called leg, oDisconnect on the calling leg: `legID [2]` is
+    // an explicit tag around the LegID CHOICE.
+    let mut answer = BcsmEvent::new(EventTypeBcsm::OAnswer, MonitorMode::Interrupted);
+    answer.leg_id = Some(LegId::sending(2));
+    let mut disconnect = BcsmEvent::new(EventTypeBcsm::ODisconnect, MonitorMode::NotifyAndContinue);
+    disconnect.leg_id = Some(LegId::sending(1));
+    let arg = RequestReportBcsmEventArg::new(vec![answer, disconnect]);
     gsm_cap::encode(&arg).expect("encode rrbe")
 }
 
@@ -891,19 +878,10 @@ fn initial_dp_gets_connect_in_the_closing_end() {
     let engine = engine_with(146, gsm_cap::op_codes::INITIAL_DP, Arc::new(FakeScp));
     let otid = [0xDE, 0xAD, 0xBE, 0xEF];
     let arg = gsm_cap::encode(&gsm_cap::operations::InitialDpArg {
-        service_key: 100.into(),
         called_party_number: Some(isdn("15550123").into()),
         calling_party_number: Some(isdn(PEER_GT).into()),
-        calling_partys_category: None,
-        original_called_party_id: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
         imsi: Some(tbcd(IMSI).into()),
-        location_information: None,
-        call_reference_number: None,
-        msc_address: None,
-        called_party_bcd_number: None,
-        time_and_timezone: None,
+        ..gsm_cap::operations::InitialDpArg::new(100.into())
     })
     .unwrap();
 
@@ -982,19 +960,10 @@ fn initial_dp_gets_rrbe_and_connect_in_the_closing_end() {
     let engine = engine_with(146, gsm_cap::op_codes::INITIAL_DP, Arc::new(FakeScpFull));
     let otid = [0xC0, 0xFF, 0xEE, 0x01];
     let arg = gsm_cap::encode(&gsm_cap::operations::InitialDpArg {
-        service_key: 100.into(),
         called_party_number: Some(isdn("15550123").into()),
         calling_party_number: Some(isdn(PEER_GT).into()),
-        calling_partys_category: None,
-        original_called_party_id: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
         imsi: Some(tbcd(IMSI).into()),
-        location_information: None,
-        call_reference_number: None,
-        msc_address: None,
-        called_party_bcd_number: None,
-        time_and_timezone: None,
+        ..gsm_cap::operations::InitialDpArg::new(100.into())
     })
     .unwrap();
 
@@ -1037,19 +1006,10 @@ fn initial_dp_gets_release_call_for_a_barred_number() {
     let engine = engine_with(146, gsm_cap::op_codes::INITIAL_DP, Arc::new(FakeScpRelease));
     let otid = [0xBA, 0x88, 0xED, 0x00];
     let arg = gsm_cap::encode(&gsm_cap::operations::InitialDpArg {
-        service_key: 7.into(),
         called_party_number: Some(isdn("15550666").into()),
         calling_party_number: Some(isdn(PEER_GT).into()),
-        calling_partys_category: None,
-        original_called_party_id: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
         imsi: Some(tbcd(IMSI).into()),
-        location_information: None,
-        call_reference_number: None,
-        msc_address: None,
-        called_party_bcd_number: None,
-        time_and_timezone: None,
+        ..gsm_cap::operations::InitialDpArg::new(100.into())
     })
     .unwrap();
 

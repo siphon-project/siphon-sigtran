@@ -10,7 +10,9 @@ from siphon import gsm_cap
 
 @gsm_cap.on_operation("initial-dp")
 async def on_idp(dlg, idp):
-    target = reroute(idp.called_party_number)  # your routing logic
+    # What was dialled: the BCD number of a mobile-originated call, the called
+    # party number of a forwarded or terminating one.
+    target = reroute(idp.called_party_bcd_number or idp.called_party_number)
     dlg.invoke(gsm_cap.connect(destination_routing_address=[target]))
     dlg.end()  # connect in the closing dialogue
 

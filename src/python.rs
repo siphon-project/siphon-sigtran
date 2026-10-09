@@ -321,7 +321,7 @@ fn gt_address(digits: &str, ssn: Option<u8>) -> SccpAddress {
 #[derive(Clone)]
 pub struct StagedInvoke {
     op: i64,
-    arg: Option<Vec<u8>>,
+    arg: InvokeArg,
     /// The operation class (Q.774 Table 2), known to the builder: it decides
     /// which replies are valid and what the expiry of the invocation timer
     /// means.
@@ -330,7 +330,138 @@ pub struct StagedInvoke {
 
 impl StagedInvoke {
     fn new(op: i64, arg: Option<Vec<u8>>, class: OperationClass) -> Self {
+        let arg = arg.map_or(InvokeArg::None, InvokeArg::Encoded);
         Self { op, arg, class }
+    }
+
+    /// An invoke whose argument is encoded when the dialogue it is sent in is
+    /// known.
+    fn per_context(op: i64, arg: ContextualArg, class: OperationClass) -> Self {
+        Self {
+            op,
+            arg: InvokeArg::PerContext(arg),
+            class,
+        }
+    }
+}
+
+/// The argument of a staged invoke.
+#[derive(Clone)]
+enum InvokeArg {
+    /// The operation has no argument.
+    None,
+    /// The BER encoding of the argument.
+    Encoded(Vec<u8>),
+    /// An argument whose encoding depends on the application context of the
+    /// dialogue: it is encoded when the invoke is staged on one.
+    PerContext(ContextualArg),
+}
+
+impl InvokeArg {
+    /// The encoded argument for a dialogue under application context `ac`.
+    fn resolve(&self, ac: &[u32]) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Self::None => Ok(None),
+            Self::Encoded(bytes) => Ok(Some(bytes.clone())),
+            Self::PerContext(arg) => arg.encode(ac).map(Some),
+        }
+    }
+}
+
+/// An invoke argument that is not the same on the wire under every application
+/// context.
+#[derive(Clone)]
+enum ContextualArg {
+    /// CAP ApplyCharging with time-duration charging. TS 29.078 changed member
+    /// `[3]` of the `timeDurationCharging` inside
+    /// CAMEL-AChBillingChargingCharacteristics between phase 3 (`tone [3]
+    /// BOOLEAN`) and phase 4 (`audibleIndicator [3]`, an explicit CHOICE): the
+    /// two are different octets, and a gsmSSF reads the one of the phase its
+    /// dialogue runs under.
+    CapApplyCharging {
+        max_call_period_duration: u32,
+        release_if_duration_exceeded: Option<bool>,
+        tariff_switch_interval: Option<u32>,
+        tone: Option<bool>,
+        party_to_charge: Option<u8>,
+    },
+}
+
+/// The CAMEL phase of a CAP application context, for the phases whose types
+/// `gsm_cap` models: 3 or 4.
+fn cap_phase(ac: &[u32]) -> Option<u8> {
+    use gsm_cap::application_context as c;
+    let phase3 = [
+        c::CAP_V3_GSMSSF_SCF_GENERIC,
+        c::CAP_V3_GSMSSF_SCF_ASSIST_HANDOFF,
+        c::CAP_V3_GSMSRF_GSMSCF,
+    ];
+    let phase4 = [
+        c::CAP_V4_GSMSSF_SCF_GENERIC,
+        c::CAP_V4_GSMSSF_SCF_ASSIST_HANDOFF,
+        c::CAP_V4_SCF_GSMSSF_GENERIC,
+        c::CAP_V4_GSMSRF_GSMSCF,
+    ];
+    if phase3.iter().any(|known| known[..] == *ac) {
+        Some(3)
+    } else if phase4.iter().any(|known| known[..] == *ac) {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+impl ContextualArg {
+    fn encode(&self, ac: &[u32]) -> Result<Vec<u8>, String> {
+        match self {
+            Self::CapApplyCharging { .. } => {
+                let phase = cap_phase(ac).ok_or_else(|| {
+                    format!(
+                        "apply_charging: the dialogue's application context {ac:?} is not a CAP \
+                         phase 3 or phase 4 call-control context, so the charging characteristics \
+                         cannot be chosen for it; pass phase= or charging_characteristics="
+                    )
+                })?;
+                self.encode_for_phase(phase)
+            }
+        }
+    }
+
+    /// The encoding for an explicit CAMEL phase, 3 or 4.
+    fn encode_for_phase(&self, phase: u8) -> Result<Vec<u8>, String> {
+        use gsm_cap::operations::ApplyChargingArg;
+        use gsm_cap::types::{
+            AudibleIndicator, CamelAChBillingChargingCharacteristics as V4,
+            CamelAChBillingChargingCharacteristicsV3 as V3, SendingSideId, TimeDurationCharging,
+            TimeDurationChargingV3,
+        };
+        let Self::CapApplyCharging {
+            max_call_period_duration,
+            release_if_duration_exceeded,
+            tariff_switch_interval,
+            tone,
+            party_to_charge,
+        } = self;
+        let arg = match phase {
+            3 => {
+                let mut charging = TimeDurationChargingV3::new(*max_call_period_duration);
+                charging.release_if_duration_exceeded = *release_if_duration_exceeded;
+                charging.tariff_switch_interval = *tariff_switch_interval;
+                charging.tone = *tone;
+                ApplyChargingArg::with_characteristics(&V3::TimeDurationCharging(charging))
+            }
+            4 => {
+                let mut charging = TimeDurationCharging::new(*max_call_period_duration);
+                charging.release_if_duration_exceeded = *release_if_duration_exceeded;
+                charging.tariff_switch_interval = *tariff_switch_interval;
+                charging.audible_indicator = tone.map(AudibleIndicator::Tone);
+                ApplyChargingArg::with_characteristics(&V4::TimeDurationCharging(charging))
+            }
+            other => return Err(format!("apply_charging: CAMEL phase {other} is not 3 or 4")),
+        };
+        let mut arg = arg.map_err(|e| e.to_string())?;
+        arg.party_to_charge = party_to_charge.map(SendingSideId::leg);
+        gsm_cap::encode(&arg).map_err(|e| e.to_string())
     }
 }
 
@@ -425,13 +556,42 @@ impl PyIncomingOp {
         self.decode_mo_field(py, MoField::Ui)
     }
 
-    /// The `calledPartyNumber` of a CAMEL initialDP, if decoded.
+    /// The `calledPartyNumber` of a CAMEL initialDP: the dialled number of a
+    /// forwarded or terminating call. `None` when the argument carries none
+    /// (a mobile-originated call carries `called_party_bcd_number` instead), or
+    /// for another operation. Raises `MistypedParameter` when the argument
+    /// does not decode as a CAP InitialDPArg.
     #[getter]
-    fn called_party_number<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
-        let bytes = self.argument.as_ref()?;
-        let idp: gsm_cap::operations::InitialDpArg = gsm_cap::decode(bytes).ok()?;
-        idp.called_party_number
-            .map(|n| PyBytes::new(py, n.as_ref()))
+    fn called_party_number<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        Ok(self
+            .cap_initial_dp()?
+            .and_then(|idp| idp.called_party_number)
+            .map(|n| PyBytes::new(py, n.as_ref())))
+    }
+
+    /// The `calledPartyBCDNumber` of a CAMEL initialDP: what the subscriber
+    /// dialled on a mobile-originated call (type of number, numbering plan,
+    /// then TBCD digits). As `called_party_number`.
+    #[getter]
+    fn called_party_bcd_number<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        Ok(self
+            .cap_initial_dp()?
+            .and_then(|idp| idp.called_party_bcd_number)
+            .map(|n| PyBytes::new(py, n.as_ref())))
+    }
+
+    /// The `serviceKey` of a CAMEL initialDP. As `called_party_number`.
+    #[getter]
+    fn service_key(&self) -> PyResult<Option<i64>> {
+        let Some(idp) = self.cap_initial_dp()? else {
+            return Ok(None);
+        };
+        i64::try_from(&idp.service_key)
+            .map(Some)
+            .map_err(|_| mistyped("the InitialDP serviceKey", "it does not fit an integer"))
     }
 
     /// The `serviceKey` of an INAP CS-1 initialDP: the IN service logic the SSF
@@ -1048,6 +1208,24 @@ enum MoField {
 }
 
 impl PyIncomingOp {
+    /// The argument as a CAP InitialDPArg (TS 29.078), when the operation is
+    /// initialDP. The decode is `gsm_cap::decode`: a member on the wire that
+    /// cannot be read, a member the type does not have, and octets after the
+    /// argument are errors.
+    fn cap_initial_dp(&self) -> PyResult<Option<gsm_cap::operations::InitialDpArg>> {
+        if self.operation_code != gsm_cap::op_codes::INITIAL_DP {
+            return Ok(None);
+        }
+        let what = "the CAP InitialDP argument";
+        let bytes = self
+            .argument
+            .as_ref()
+            .ok_or_else(|| mistyped(what, "the Invoke carries no argument"))?;
+        gsm_cap::decode(bytes)
+            .map(Some)
+            .map_err(|e| mistyped(what, e))
+    }
+
     /// The argument as an INAP CS-1 InitialDPArg (ETS 300 374-1 / Q.1218), when
     /// the operation is initialDP. The decode is `inap::decode`: a member or a
     /// list element on the wire that cannot be read, a member the type does not
@@ -1125,7 +1303,7 @@ impl PyIncomingOp {
 enum DlgCmd {
     Invoke {
         op: i64,
-        arg: Option<Vec<u8>>,
+        arg: InvokeArg,
         class: OperationClass,
         timeout: Option<Duration>,
     },
@@ -1342,11 +1520,15 @@ fn hex(bytes: &[u8]) -> String {
 /// dialogue refuses cannot be raised into it. It is logged at error level with
 /// the dialogue's transaction ids (a flush that cannot be encoded is logged by
 /// the engine itself, which also counts it), and returned so the caller can
-/// surface it where there is somebody to surface it to. A dialogue left with
-/// nothing sent in answer to a Begin is aborted by the engine, so the peer is
-/// not left waiting on a reply that vanished.
+/// surface it where there is somebody to surface it to.
+///
+/// The replay stops at the first command that fails, and what was staged and
+/// not yet flushed is dropped: the commands of one turn are one answer, and an
+/// answer with a component missing (a call let through without the charging
+/// instruction that could not be built) is worse than none. A dialogue left
+/// with nothing sent in answer to a Begin is aborted by the engine, so the peer
+/// is not left waiting.
 fn replay(dlg: &mut CoreDialogue, cmds: Vec<DlgCmd>) -> Result<(), crate::dialogue::DialogueError> {
-    let mut first_error = None;
     for cmd in cmds {
         let (what, outcome) = match cmd {
             DlgCmd::Invoke {
@@ -1356,7 +1538,12 @@ fn replay(dlg: &mut CoreDialogue, cmds: Vec<DlgCmd>) -> Result<(), crate::dialog
                 timeout,
             } => (
                 "invoke",
-                dlg.invoke_with(op, arg, class, timeout).map(|_| ()),
+                // An argument that depends on the application context is
+                // encoded here, where the dialogue is known.
+                arg.resolve(dlg.application_context())
+                    .map_err(crate::dialogue::DialogueError::Argument)
+                    .and_then(|arg| dlg.invoke_with(op, arg, class, timeout))
+                    .map(|_| ()),
             ),
             DlgCmd::Reply { op, result } => {
                 dlg.reply(op, result);
@@ -1388,10 +1575,11 @@ fn replay(dlg: &mut CoreDialogue, cmds: Vec<DlgCmd>) -> Result<(), crate::dialog
                 hex(dlg.otid()),
                 hex(dlg.dtid())
             );
-            first_error.get_or_insert(e);
+            dlg.discard_staged();
+            return Err(e);
         }
     }
-    first_error.map_or(Ok(()), Err)
+    Ok(())
 }
 
 // ── The Python termination handler bridge ────────────────────────────────────
@@ -1772,7 +1960,7 @@ fn origination_begin<'py>(
     let (resp_tx, resp_rx) = oneshot::channel();
     let handler: Arc<dyn TerminationHandler> = Arc::new(OriginationHandler {
         op: invoke.op,
-        arg: invoke.arg.clone(),
+        arg: invoke.arg.resolve(&ac.arcs).map_err(err)?,
         class: invoke.class,
         responder: Mutex::new(Some(resp_tx)),
     });
@@ -2334,14 +2522,20 @@ pub struct CapAc;
 
 #[pymethods]
 impl CapAc {
-    /// gsmSSF-to-gsmSCF generic (call-control) application context, version 3
-    /// (`gsmSSF-scfGenericAC`). Binds the CAP dissector on the wire.
+    /// The gsmSSF-to-gsmSCF generic (call-control) application context of
+    /// CAMEL phase 3, `capssf-scfGenericAC` (`0.4.0.0.1.21.3.4`).
     #[getter]
     fn gsm_ssf_scf(&self) -> MapAcHandle {
-        // {itu-t(0) identified-organization(4) etsi(0) mobileDomain(0)
-        //  gsm-Network(1) applicationContext(21) gsmSSF-scfGenericAC(3) version3(4)}
         MapAcHandle {
-            arcs: vec![0, 4, 0, 0, 1, 21, 3, 4],
+            arcs: gsm_cap::application_context::CAP_V3_GSMSSF_SCF_GENERIC.to_vec(),
+        }
+    }
+
+    /// The same context of CAMEL phase 4 (`0.4.0.0.1.23.3.4`).
+    #[getter]
+    fn gsm_ssf_scf_phase4(&self) -> MapAcHandle {
+        MapAcHandle {
+            arcs: gsm_cap::application_context::CAP_V4_GSMSSF_SCF_GENERIC.to_vec(),
         }
     }
 }
@@ -2432,25 +2626,28 @@ impl GsmCap {
     }
 
     /// Stage a CAP Connect invoke: reroute the call to
-    /// `destination_routing_address` (a list of called-party numbers, each a digit
-    /// string or raw bytes).
-    #[pyo3(signature = (*, destination_routing_address))]
+    /// `destination_routing_address`, a list holding the one called-party number
+    /// TS 29.078 allows (`SEQUENCE SIZE (1) OF CalledPartyNumber`), as a digit
+    /// string or raw bytes. `original_called_party_id`, when given, preserves
+    /// the originally dialled number across the reroute.
+    #[pyo3(signature = (*, destination_routing_address, original_called_party_id=None))]
     fn connect(
         &self,
         destination_routing_address: Vec<Bound<'_, PyAny>>,
+        original_called_party_id: Option<Bound<'_, PyAny>>,
     ) -> PyResult<StagedInvoke> {
         use gsm_cap::operations::ConnectArg;
-        let dra = destination_routing_address
-            .iter()
-            .map(called_party)
-            .collect::<PyResult<Vec<_>>>()?;
-        let arg = ConnectArg {
-            destination_routing_address: dra.into_iter().map(Into::into).collect(),
-            original_called_party_id: None,
-            calling_partys_category: None,
-            redirecting_party_id: None,
-            generic_numbers: None,
+        let [destination] = destination_routing_address.as_slice() else {
+            return Err(err(
+                "connect: destination_routing_address holds exactly one number in CAP",
+            ));
         };
+        let mut arg = ConnectArg::new(called_party(destination)?.into());
+        arg.original_called_party_id = original_called_party_id
+            .as_ref()
+            .map(called_party)
+            .transpose()?
+            .map(Into::into);
         let bytes = gsm_cap::encode(&arg).map_err(err)?;
         Ok(StagedInvoke::new(
             gsm_cap::op_codes::CONNECT,
@@ -2463,8 +2660,8 @@ impl GsmCap {
     #[pyo3(signature = (*, cause))]
     fn release_call(&self, cause: Vec<u8>) -> PyResult<StagedInvoke> {
         use gsm_cap::operations::ReleaseCallArg;
-        // gsm_cap 1.2 encodes the CAP releaseCall argument as a bare `Cause` OCTET
-        // STRING (a delegate newtype), not a SEQUENCE.
+        // The CAP releaseCall argument is a bare `Cause` OCTET STRING, not a
+        // SEQUENCE.
         let arg = ReleaseCallArg(cause.into());
         let bytes = gsm_cap::encode(&arg).map_err(err)?;
         Ok(StagedInvoke::new(
@@ -2475,25 +2672,25 @@ impl GsmCap {
     }
 
     /// Stage a CAP RequestReportBCSMEvent invoke: arm the gsmSSF to report the
-    /// given BCSM detection points. `events` is a list of
-    /// `(event_type_bcsm, monitor_mode)` integer pairs (TS 29.078), e.g.
-    /// `(7, 0)` = oAnswer interrupted, `(9, 1)` = oDisconnect notifyAndContinue.
+    /// given BCSM detection points. `events` is a list of `(event_type_bcsm,
+    /// monitor_mode)` integer pairs (TS 29.078), e.g. `(7, 0)` = oAnswer
+    /// interrupted. A third element names the leg the event is armed on:
+    /// `(9, 1, 1)` = oDisconnect notifyAndContinue on leg 1. It goes out as
+    /// `legID [2] { sendingSideID [0] }`. A disconnect event is armed per leg.
     #[pyo3(signature = (events))]
-    fn request_report_bcsm_event(&self, events: Vec<(i64, i64)>) -> PyResult<StagedInvoke> {
+    fn request_report_bcsm_event(&self, events: Vec<Bound<'_, PyAny>>) -> PyResult<StagedInvoke> {
         use gsm_cap::operations::RequestReportBcsmEventArg;
-        use gsm_cap::types::BcsmEvent;
+        use gsm_cap::types::{BcsmEvent, LegId};
         let bcsm_events = events
-            .into_iter()
-            .map(|(et, mm)| {
-                Ok(BcsmEvent {
-                    event_type_bcsm: event_type_bcsm(et)?,
-                    monitor_mode: monitor_mode(mm)?,
-                    leg_id: None,
-                })
+            .iter()
+            .map(|event| {
+                let (et, mm, leg) = bcsm_event_arg(event)?;
+                let mut armed = BcsmEvent::new(event_type_bcsm(et)?, monitor_mode(mm)?);
+                armed.leg_id = leg.map(LegId::sending);
+                Ok(armed)
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let arg = RequestReportBcsmEventArg { bcsm_events };
-        let bytes = gsm_cap::encode(&arg).map_err(err)?;
+        let bytes = gsm_cap::encode(&RequestReportBcsmEventArg::new(bcsm_events)).map_err(err)?;
         Ok(StagedInvoke::new(
             gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT,
             Some(bytes),
@@ -2501,26 +2698,61 @@ impl GsmCap {
         ))
     }
 
-    /// Stage a CAP ApplyCharging invoke: hand the gsmSSF the encoded charging
-    /// characteristics (an online-charging control, e.g. a call-duration limit).
-    /// `party_to_charge` names the leg to meter.
-    #[pyo3(signature = (*, charging_characteristics, party_to_charge=None))]
+    /// Stage a CAP ApplyCharging invoke: give the gsmSSF a call period to
+    /// meter. `max_call_period_duration` is in units of 100 ms (TS 29.078);
+    /// `release_if_duration_exceeded` has the gsmSSF release the call when it
+    /// runs out, `tone` play a warning tone before that, and
+    /// `tariff_switch_interval` (seconds) announces a tariff switch.
+    /// `party_to_charge` is the leg to meter, as its number.
+    ///
+    /// The charging characteristics are not the same octets in CAMEL phase 3
+    /// and phase 4, so they are encoded when the invoke is staged on a
+    /// dialogue, from its application context. `phase=` (3 or 4) fixes the
+    /// phase instead. `charging_characteristics=` hands over an already
+    /// encoded CAMEL-AChBillingChargingCharacteristics value in place of the
+    /// typed keywords.
+    #[pyo3(signature = (*, max_call_period_duration=None, release_if_duration_exceeded=None, tariff_switch_interval=None, tone=None, party_to_charge=None, phase=None, charging_characteristics=None))]
+    #[allow(clippy::too_many_arguments)]
     fn apply_charging(
         &self,
-        charging_characteristics: Vec<u8>,
-        party_to_charge: Option<Vec<u8>>,
+        max_call_period_duration: Option<u32>,
+        release_if_duration_exceeded: Option<bool>,
+        tariff_switch_interval: Option<u32>,
+        tone: Option<bool>,
+        party_to_charge: Option<u8>,
+        phase: Option<u8>,
+        charging_characteristics: Option<Vec<u8>>,
     ) -> PyResult<StagedInvoke> {
         use gsm_cap::operations::ApplyChargingArg;
-        let arg = ApplyChargingArg {
-            ach_billing_charging_characteristics: charging_characteristics.into(),
-            party_to_charge: party_to_charge.map(Into::into),
-        };
-        let bytes = gsm_cap::encode(&arg).map_err(err)?;
-        Ok(StagedInvoke::new(
-            gsm_cap::op_codes::APPLY_CHARGING,
-            Some(bytes),
-            OperationClass::Two,
-        ))
+        use gsm_cap::types::SendingSideId;
+        let op = gsm_cap::op_codes::APPLY_CHARGING;
+        match (max_call_period_duration, charging_characteristics) {
+            (None, Some(encoded)) => {
+                let mut arg = ApplyChargingArg::new(encoded.into());
+                arg.party_to_charge = party_to_charge.map(SendingSideId::leg);
+                let bytes = gsm_cap::encode(&arg).map_err(err)?;
+                Ok(StagedInvoke::new(op, Some(bytes), OperationClass::Two))
+            }
+            (Some(max_call_period_duration), None) => {
+                let arg = ContextualArg::CapApplyCharging {
+                    max_call_period_duration,
+                    release_if_duration_exceeded,
+                    tariff_switch_interval,
+                    tone,
+                    party_to_charge,
+                };
+                match phase {
+                    Some(phase) => {
+                        let bytes = arg.encode_for_phase(phase).map_err(err)?;
+                        Ok(StagedInvoke::new(op, Some(bytes), OperationClass::Two))
+                    }
+                    None => Ok(StagedInvoke::per_context(op, arg, OperationClass::Two)),
+                }
+            }
+            _ => Err(err(
+                "apply_charging: give max_call_period_duration or charging_characteristics",
+            )),
+        }
     }
 
     /// Stage a CAP Continue invoke: let the gsmSSF resume normal call processing
@@ -2544,14 +2776,22 @@ fn event_type_bcsm(v: i64) -> PyResult<gsm_cap::types::EventTypeBcsm> {
         5 => E::OCalledPartyBusy,
         6 => E::ONoAnswer,
         7 => E::OAnswer,
+        8 => E::OMidCall,
         9 => E::ODisconnect,
         10 => E::OAbandon,
         12 => E::TermAttemptAuthorized,
         13 => E::TBusy,
         14 => E::TNoAnswer,
         15 => E::TAnswer,
+        16 => E::TMidCall,
         17 => E::TDisconnect,
         18 => E::TAbandon,
+        19 => E::OTermSeized,
+        27 => E::CallAccepted,
+        50 => E::OChangeOfPosition,
+        51 => E::TChangeOfPosition,
+        52 => E::OServiceChange,
+        53 => E::TServiceChange,
         _ => return Err(err(format!("unknown EventTypeBCSM {v}"))),
     })
 }
@@ -3587,7 +3827,11 @@ impl Node {
                 invoke_id,
                 linked_id: None,
                 operation_code: OperationCode::Local(inv.op),
-                parameter: inv.arg.clone().map(rasn::types::Any::new),
+                parameter: inv
+                    .arg
+                    .resolve(&[])
+                    .map_err(err)?
+                    .map(rasn::types::Any::new),
             })
         } else {
             return Err(err(
@@ -3637,7 +3881,11 @@ impl Node {
                         invoke_id,
                         linked_id: None,
                         operation_code: OperationCode::Local(inv.op),
-                        parameter: inv.arg.clone().map(rasn::types::Any::new),
+                        parameter: inv
+                            .arg
+                            .resolve(&[])
+                            .map_err(err)?
+                            .map(rasn::types::Any::new),
                     })
                 } else {
                     return Err(err("assemble_end: `staged` must be a Result or an Invoke"));
@@ -3700,7 +3948,7 @@ impl Node {
         };
         let handler: Arc<dyn TerminationHandler> = Arc::new(OriginationScriptHandler {
             op: invoke.op,
-            arg: invoke.arg.clone(),
+            arg: invoke.arg.resolve(&ac.arcs).map_err(err)?,
             class: invoke.class,
             on_reply,
         });

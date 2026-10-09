@@ -39,7 +39,7 @@ use tokio::time::{sleep, timeout};
 use async_sctp::{SctpAssociation, SctpConfig, SctpListener};
 
 use gsm_cap::operations::{EventReportBcsmArg, InitialDpArg, RequestReportBcsmEventArg};
-use gsm_cap::types::{BcsmEvent, EventTypeBcsm, MonitorMode};
+use gsm_cap::types::{BcsmEvent, EventTypeBcsm, LegId, MiscCallInfo, MonitorMode, ReceivingSideId};
 use gsm_map::operations::location::UpdateLocationArg;
 use gsm_map::operations::mo_forward_sm::MoForwardSmArg;
 use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
@@ -159,19 +159,10 @@ fn mt_forward_sm_arg() -> Vec<u8> {
 
 fn initial_dp_arg(imsi: &str) -> Vec<u8> {
     let arg = InitialDpArg {
-        service_key: 100.into(),
         called_party_number: Some(isdn("15550142").into()),
         calling_party_number: Some(isdn("15550101").into()),
-        calling_partys_category: None,
-        original_called_party_id: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
         imsi: Some(imsi_bytes(imsi).into()),
-        location_information: None,
-        call_reference_number: None,
-        msc_address: None,
-        called_party_bcd_number: None,
-        time_and_timezone: None,
+        ..InitialDpArg::new(100.into())
     };
     gsm_cap::encode(&arg).expect("encode idp")
 }
@@ -2057,22 +2048,19 @@ fn wire_full_dialogue_captures_encode_clean() {
     // A CAMEL session: the gsmSSF (4000) triggers a call at the SCP (1000) —
     // Begin(initialDP) → Continue(requestReportBCSMEvent + continue) →
     // Continue(eventReportBCSM: oDisconnect) → End(releaseCall), closing it.
+    // This capture is the clean-dissection gate for the hand-built frames; the
+    // flow driven through the dialogue engine, with the dissected fields
+    // asserted, is `tests/strict_decode.rs`.
     let ssf = [0xCCu8; 4];
     let scf = [0xDDu8; 4];
-    let rrbe = gsm_cap::encode(&RequestReportBcsmEventArg {
-        bcsm_events: vec![BcsmEvent {
-            event_type_bcsm: EventTypeBcsm::ODisconnect,
-            monitor_mode: MonitorMode::NotifyAndContinue,
-            leg_id: None,
-        }],
-    })
-    .expect("encode rrbe");
-    let erb = gsm_cap::encode(&EventReportBcsmArg {
-        event_type_bcsm: EventTypeBcsm::ODisconnect,
-        leg_id: None,
-        misc_call_info: None,
-    })
-    .expect("encode erb");
+    let mut disconnect = BcsmEvent::new(EventTypeBcsm::ODisconnect, MonitorMode::NotifyAndContinue);
+    disconnect.leg_id = Some(LegId::sending(1));
+    let rrbe =
+        gsm_cap::encode(&RequestReportBcsmEventArg::new(vec![disconnect])).expect("encode rrbe");
+    let mut report = EventReportBcsmArg::new(EventTypeBcsm::ODisconnect);
+    report.leg_id = Some(ReceivingSideId::leg(1));
+    report.misc_call_info = Some(MiscCallInfo::notification());
+    let erb = gsm_cap::encode(&report).expect("encode erb");
     let scp = SubsystemNumber::from_u8(146);
     let camel = [
         m3ua_sccp(

@@ -624,6 +624,79 @@ assert d.kind == "end" and d.rejects == [(1, "invoke", 2)] and d.invokes == []
 assert node.decode(inap_idp(tlv(0x30, b"\x82\x05\x91\x51\x55\x10\x24"))[0]).rejects == [(1, "invoke", 2)]
 assert node.decode(inap_idp(tlv(0x30, b"\x80\x01\x64" + b"\x9f\x2d\x01\x00"))[0]).rejects == [(1, "invoke", 2)]
 
+# ── CAP: strict InitialDP, legs, and charging by the dialogue's CAMEL phase ────
+# InitialDPArg by hand: serviceKey [0] 100, calledPartyBCDNumber [56] (unknown
+# type, ISDN plan, 15550142). Tag 56 takes the high tag number form, `9F 38`.
+CAP_IDP = tlv(0x30, b"\x80\x01\x64" + b"\x9f\x38\x05\x81\x51\x55\x10\x24")
+cap_seen = {}
+
+@gsm_cap.on_operation("initial-dp")
+def on_cap_prepaid(dlg, idp):
+    if idp.is_peer_turn:
+        return
+    cap_seen["key"] = idp.service_key                 # raises MistypedParameter if unreadable
+    cap_seen["dialled"] = bytes(idp.called_party_bcd_number)
+    assert idp.called_party_number is None            # not in this InitialDP
+    dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 1, 2), (9, 0, 1), (9, 0, 2)]))
+    dlg.invoke(gsm_cap.apply_charging(max_call_period_duration=600,
+                                      release_if_duration_exceeded=True, tone=True,
+                                      party_to_charge=1))
+    dlg.invoke(gsm_cap.continue_())
+    dlg.send()
+
+def cap_idp(argument, ac):
+    out = node.deliver(node.assemble_begin(
+        op="initial-dp", called_gt="15550100", called_ssn=6, calling_gt="15550170",
+        arg=argument, ac=ac,
+    ), opc=2000, dpc=1000)
+    d = node.decode(out[0])
+    if d.kind == "continue":   # release the dialogue the handler left open
+        node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, bytes(d.otid)))), opc=2000, dpc=1000)
+    return d
+
+assert list(gsm_cap.AC.gsm_ssf_scf.arcs) == [0, 4, 0, 0, 1, 21, 3, 4]
+assert list(gsm_cap.AC.gsm_ssf_scf_phase4.arcs) == [0, 4, 0, 0, 1, 23, 3, 4]
+
+# Under the phase 3 context the charging characteristics carry `tone [3]
+# BOOLEAN` (83 01 FF); under the phase 4 context `audibleIndicator [3]`, an
+# explicit choice (A3 03 01 01 FF). Same call, different octets, chosen by the
+# dialogue. partyToCharge [2] is explicit around sendingSideID [0].
+d3 = cap_idp(CAP_IDP, gsm_cap.AC.gsm_ssf_scf)
+assert d3.kind == "continue" and cap_seen == {"key": 100, "dialled": b"\x81\x51\x55\x10\x24"}
+ops = [op for (op, _) in d3.invokes]
+assert ops == [23, 35, 31]
+rrbe3, ach3 = bytes(d3.invokes[0][1]), bytes(d3.invokes[1][1])
+assert bytes.fromhex("300b800107810101a203800102") in rrbe3   # oAnswer, notify, leg 2
+assert bytes.fromhex("300b800109810100a203800101") in rrbe3   # oDisconnect, interrupted, leg 1
+assert ach3 == bytes.fromhex("3013" "800c" "a00a8002025881" "01ff8301ff" "a203800101")
+d4 = cap_idp(CAP_IDP, gsm_cap.AC.gsm_ssf_scf_phase4)
+ach4 = bytes(d4.invokes[1][1])
+assert ach4 == bytes.fromhex("3015" "800e" "a00c8002025881" "01ffa3030101ff" "a203800101")
+
+# A phase given explicitly needs no dialogue; one that is not 3 or 4 is refused.
+assert gsm_cap.apply_charging(max_call_period_duration=600, phase=4) is not None
+for bad in (lambda: gsm_cap.apply_charging(max_call_period_duration=600, phase=2),
+            lambda: gsm_cap.apply_charging(),
+            lambda: gsm_cap.connect(destination_routing_address=["15550199", "15550198"]),
+            lambda: gsm_cap.request_report_bcsm_event(events=[(1, 0)])):   # no such CAP event
+    try:
+        bad()
+        raise AssertionError("expected SigtranError")
+    except siphon.SigtranError:
+        pass
+
+# On a dialogue that is not under a CAP phase 3 or 4 context the phase cannot be
+# chosen, and nothing is guessed. The rest of the answer is not sent without the
+# charging instruction either (that would be a call let through unmetered): the
+# dialogue is aborted, and the gsmSSF falls back to its default call handling.
+d0 = cap_idp(CAP_IDP, None)
+assert (d0.kind, d0.abort_kind, d0.invokes) == ("abort", "u-abort", [])
+assert node.open_dialogues() == 0
+
+# An InitialDP that does not decode: Reject, invokeProblem mistypedParameter.
+d = cap_idp(tlv(0x30, b"\x80\x04\x64"), gsm_cap.AC.gsm_ssf_scf)
+assert d.kind == "end" and d.rejects == [(1, "invoke", 2)] and d.invokes == []
+
 # The new metric families are exposed.
 text = siphon.metrics()
 assert 'sigtran_tcap_abort_total{dir="rx",kind="p-abort",cause="resource-limitation"}' in text

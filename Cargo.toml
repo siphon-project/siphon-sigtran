@@ -45,7 +45,7 @@ tcap = "2"
 # GSM MAP (TS 29.002): operation codes + argument types (content routing view).
 gsm_map = "2"
 # CAMEL CAP (TS 29.078): operation codes (content routing view for SCP).
-gsm_cap = "1.2"
+gsm_cap = "2"
 # INAP CS-1 (ITU-T Q.1218 / ETSI EN 300 374-1): operation codes + argument types
 # for the SSF-SCF dialogue an IN SCP terminates (a TCAP-user peer to CAP).
 inap = "2"

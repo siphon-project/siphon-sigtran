@@ -54,6 +54,18 @@ pub fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A context-class element whose tag number is 31 or more: the high tag number
+/// form (X.690 8.1.2.4), `9F nn` primitive or `BF nn` constructed, for numbers
+/// up to 127.
+pub fn tlv_high(constructed: bool, number: u8, content: &[u8]) -> Vec<u8> {
+    assert!((31..128).contains(&number));
+    let mut out = vec![if constructed { 0xBF } else { 0x9F }, number];
+    assert!(content.len() < 128);
+    out.push(content.len() as u8);
+    out.extend_from_slice(content);
+    out
+}
+
 /// `Invoke ::= [1] SEQUENCE { invokeID INTEGER, operationCode INTEGER,
 /// parameter ANY OPTIONAL }` with a local operation code.
 pub fn invoke(invoke_id: i8, op: i64, parameter: Option<&[u8]>) -> Vec<u8> {

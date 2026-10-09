@@ -18,8 +18,9 @@ recipe is
 
 Register a handler for the CAMEL initialDP. The engine hands you the
 [`Dialogue`](../script-api.md#dialogue) and the decoded
-[`IncomingOp`](../script-api.md#incomingop); `idp.called_party_number` is the
-dialled number. Decide a new destination, stage a `Connect` invoke, and `end`
+[`IncomingOp`](../script-api.md#incomingop); `idp.called_party_bcd_number` is what
+was dialled on a mobile-originated call, `idp.called_party_number` the called
+party of a forwarded or terminating one. Decide a new destination, stage a `Connect` invoke, and `end`
 the dialogue so the Connect rides the closing message.
 
 ```python
@@ -27,7 +28,9 @@ from siphon import gsm_cap
 
 @gsm_cap.on_operation("initial-dp")
 async def on_idp(dlg, idp):
-    target = reroute(idp.called_party_number)      # your routing logic
+    # What was dialled: the BCD number of a mobile-originated call, the called
+    # party number of a forwarded or terminating one.
+    target = reroute(idp.called_party_bcd_number or idp.called_party_number)
     dlg.invoke(gsm_cap.connect(destination_routing_address=[target]))
     dlg.end()                                      # connect in the closing dialogue
 
@@ -84,9 +87,10 @@ async def on_idp(dlg, idp):
         dlg.invoke(gsm_cap.release_call(cause=b"\x90\x95"))   # Q.850 call rejected
         dlg.end()
         return
-    # Arm the answer / disconnect detection points, meter the call, then connect.
-    dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 0), (9, 1)]))
-    dlg.invoke(gsm_cap.apply_charging(charging_characteristics=budget(idp)))
+    # Arm the answer and the disconnect of both legs, meter the call, then connect.
+    dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 1, 2), (9, 0, 1), (9, 0, 2)]))
+    dlg.invoke(gsm_cap.apply_charging(max_call_period_duration=budget(idp),   # 100 ms units
+                                      release_if_duration_exceeded=True, party_to_charge=1))
     dlg.invoke(gsm_cap.connect(destination_routing_address=[reroute(idp.called_party_number)]))
     dlg.end()
 ```
@@ -94,10 +98,14 @@ async def on_idp(dlg, idp):
 - **`gsm_cap.release_call(cause=…)`** answers a barred call with a release instead
   of a Connect.
 - **`gsm_cap.request_report_bcsm_event(events=[…])`** arms detection points; each is
-  an `(event_type_bcsm, monitor_mode)` integer pair (TS 29.078), e.g. `(7, 0)` =
-  oAnswer interrupted, `(9, 1)` = oDisconnect notifyAndContinue.
-- **`gsm_cap.apply_charging(charging_characteristics=…)`** hands the gsmSSF an
-  online-charging control (a call-duration limit, say).
+  an `(event_type_bcsm, monitor_mode, leg)` integer triple (TS 29.078), e.g.
+  `(7, 1, 2)` = oAnswer notifyAndContinue on leg 2, `(9, 0, 1)` = oDisconnect
+  interrupted on leg 1. A disconnect is armed on each leg it should be reported
+  for; the leg can be left out for events that have none.
+- **`gsm_cap.apply_charging(max_call_period_duration=…)`** grants the gsmSSF a call
+  period to meter, in units of 100 ms. The characteristics are encoded for the
+  CAMEL phase of the dialogue (phase 3 and phase 4 differ on the wire), from its
+  application context; see [the script API](../script-api.md#gsm-cap).
 
 When you arm detection points and want the reports, keep the dialogue open
 (`dlg.send()` instead of `dlg.end()`): the gsmSSF reports each event with

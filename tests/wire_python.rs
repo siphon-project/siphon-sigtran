@@ -113,7 +113,7 @@ node.deliver(end, opc=2000, dpc=1000)                                  # drive t
 def scp(dlg, view):
     if view.is_peer_turn:            # the SSF closed the dialogue; nothing to do
         return
-    dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(9, 1)]))  # arm oDisconnect (notify+continue)
+    dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(9, 1, 1)]))  # arm oDisconnect on leg 1 (notify+continue)
     dlg.invoke(gsm_cap.continue_())                                 # let the call proceed
     dlg.send()                       # Continue, hold the dialogue open
 

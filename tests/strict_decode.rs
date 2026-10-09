@@ -625,3 +625,492 @@ mod inap_cs1 {
         assert!(inap::decode::<InitialDpArg>(&wire).is_err());
     }
 }
+
+// ── CAP (TS 29.078) ──────────────────────────────────────────────────────────
+
+mod cap {
+    use super::*;
+    use gsm_cap::operations::{
+        ApplyChargingArg, ApplyChargingReportArg, EventReportBcsmArg, InitialDpArg, ReleaseCallArg,
+        RequestReportBcsmEventArg,
+    };
+    use gsm_cap::types::{
+        BcsmEvent, CamelAChBillingChargingCharacteristicsV3, CamelCallResult, EventTypeBcsm, LegId,
+        MonitorMode, SendingSideId, TimeDurationChargingV3, TimeInformation,
+    };
+    use siphon_sigtran::dialogue::{DialogueEngine, OperationClass};
+
+    /// The CAP subsystem; Wireshark hands its TCAP components to the CAMEL
+    /// dissector.
+    const CAP: u8 = 146;
+    const INITIAL_DP: i64 = 0;
+    const EVENT_REPORT_BCSM: i64 = 24;
+    const APPLY_CHARGING_REPORT: i64 = 36;
+
+    /// `capssf-scfGenericAC`, CAMEL phase 3: `{ itu-t(0)
+    /// identified-organization(4) etsi(0) mobileDomain(0) gsm-Network(1)
+    /// cap3OE(21) ac(3) 4 }`, as OBJECT IDENTIFIER content octets.
+    const GENERIC_PHASE3: [u8; 7] = [0x04, 0x00, 0x00, 0x01, 0x15, 0x03, 0x04];
+
+    /// A mobile-originated InitialDP as a gsmSSF sends it, by hand from
+    /// `InitialDPArg` of TS 29.078, the members in the order the ASN.1 declares
+    /// them. Test PLMN 001/01, IMSI 001010000000042, dialled 15550142.
+    fn initial_dp() -> Vec<u8> {
+        // LocationInformation (TS 29.002): the age (untagged INTEGER), the VLR
+        // number [1], and the cell global id behind the explicit [3] of a
+        // CHOICE: cellGlobalIdOrServiceAreaIdFixedLength [0], MCC 001 MNC 01
+        // (`00 F1 10`), LAC 1, CI 1.
+        let location = [
+            &[0x02, 0x01, 0x00][..],
+            &tlv(0x81, &[0x91, 0x51, 0x55, 0x10, 0x08])[..],
+            &tlv(
+                0xA3,
+                &tlv(0x80, &[0x00, 0xF1, 0x10, 0x00, 0x01, 0x00, 0x01]),
+            )[..],
+        ]
+        .concat();
+        tlv(
+            0x30,
+            &[
+                // serviceKey [0]: 100
+                &[0x80, 0x01, 0x64][..],
+                // callingPartyNumber [3]: Q.763, international, ISDN plan,
+                // presentation allowed, network provided; 15550101
+                &tlv(0x83, &[0x04, 0x13, 0x51, 0x55, 0x10, 0x10])[..],
+                // callingPartysCategory [5]: ordinary subscriber
+                &[0x85, 0x01, 0x0A][..],
+                // bearerCapability [27], explicit: bearerCap [0], speech
+                &tlv(0xBB, &tlv(0x80, &[0x80, 0x90, 0xA3]))[..],
+                // eventTypeBCSM [28]: collectedInfo (2)
+                &[0x9C, 0x01, 0x02][..],
+                // iMSI [50]
+                &tlv_high(false, 50, &RES[2..])[..],
+                // subscriberState [51], explicit: assumedIdle [0] NULL
+                &tlv_high(true, 51, &[0x80, 0x00])[..],
+                // locationInformation [52]
+                &tlv_high(true, 52, &location)[..],
+                // ext-basicServiceCode [53], explicit: ext-Teleservice [3], telephony
+                &tlv_high(true, 53, &[0x83, 0x01, 0x11])[..],
+                // callReferenceNumber [54]
+                &tlv_high(false, 54, &[0x01, 0x02, 0x03, 0x04])[..],
+                // mscAddress [55]: 15550180
+                &tlv_high(false, 55, &[0x91, 0x51, 0x55, 0x10, 0x08])[..],
+                // calledPartyBCDNumber [56]: unknown type, ISDN plan; 15550142
+                &tlv_high(false, 56, &[0x81, 0x51, 0x55, 0x10, 0x24])[..],
+                // timeAndTimezone [57]: 2026-10-09 12:34:56, zone 0
+                &tlv_high(false, 57, &[0x02, 0x62, 0x01, 0x90, 0x21, 0x43, 0x65, 0x00])[..],
+            ]
+            .concat(),
+        )
+    }
+
+    /// EventReportBCSM for oAnswer on leg 2: `SEQUENCE { eventTypeBCSM [0] 7,
+    /// eventSpecificInformationBCSM [2] { oAnswerSpecificInfo [5] {} }, legID
+    /// [3] { receivingSideID [1] 02 }, miscCallInfo [4] { messageType [0]
+    /// notification (1) } }`.
+    fn event_report_answer() -> Vec<u8> {
+        tlv(
+            0x30,
+            &[
+                &[0x80, 0x01, 0x07][..],
+                &[0xA2, 0x02, 0xA5, 0x00][..],
+                &[0xA3, 0x03, 0x81, 0x01, 0x02][..],
+                &[0xA4, 0x03, 0x80, 0x01, 0x01][..],
+            ]
+            .concat(),
+        )
+    }
+
+    /// ApplyChargingReport: an OCTET STRING holding CAMEL-CallResult,
+    /// `timeDurationChargingResult [0] { partyToCharge [0] { receivingSideID
+    /// [1] 01 }, timeInformation [1] { timeIfNoTariffSwitch [0] 600 },
+    /// legActive [2] FALSE }`: 60 seconds used, the leg released.
+    fn apply_charging_report() -> Vec<u8> {
+        let result = tlv(
+            0xA0,
+            &[
+                &[0xA0, 0x03, 0x81, 0x01, 0x01][..],
+                &[0xA1, 0x04, 0x80, 0x02, 0x02, 0x58][..],
+                &[0x82, 0x01, 0x00][..],
+            ]
+            .concat(),
+        );
+        tlv(0x04, &result)
+    }
+
+    /// What the SCP read from the gsmSSF, for the assertions.
+    #[derive(Default)]
+    struct Seen {
+        imsi: Option<Vec<u8>>,
+        dialled: Option<Vec<u8>>,
+        answered_on: Option<Vec<u8>>,
+        used: Option<u32>,
+    }
+
+    /// An SCP for a prepaid call: on InitialDP it arms the answer and the
+    /// disconnect of both legs, grants a call period and lets the call proceed;
+    /// it notes the answer; on the charging report it releases the call.
+    fn scp(seen: Arc<Mutex<Seen>>) -> DialogueEngine {
+        let on_begin = seen.clone();
+        let probe = Probe::new()
+            .on_begin(move |dlg, op| {
+                let argument = op.argument.as_deref().unwrap_or_default();
+                let Ok(idp) = gsm_cap::decode::<InitialDpArg>(argument) else {
+                    let (invoke_id, problem) = op.mistyped_parameter();
+                    dlg.reject(invoke_id, problem);
+                    dlg.end().expect("end");
+                    return;
+                };
+                {
+                    let mut seen = on_begin.lock().unwrap();
+                    seen.imsi = idp.imsi.map(|i| i.to_vec());
+                    seen.dialled = idp.called_party_bcd_number.map(|n| n.to_vec());
+                }
+                // The call may last an hour before the next message.
+                dlg.set_idle_timeout(Some(std::time::Duration::from_secs(3_600)));
+
+                let event = |event, mode, leg| {
+                    let mut armed = BcsmEvent::new(event, mode);
+                    armed.leg_id = Some(LegId::sending(leg));
+                    armed
+                };
+                let rrbe = RequestReportBcsmEventArg::new(vec![
+                    event(EventTypeBcsm::OAnswer, MonitorMode::NotifyAndContinue, 2),
+                    event(EventTypeBcsm::ODisconnect, MonitorMode::Interrupted, 1),
+                    event(EventTypeBcsm::ODisconnect, MonitorMode::Interrupted, 2),
+                ]);
+                // The dialogue runs under the phase 3 context, so the charging
+                // characteristics are the phase 3 type: 60 s, release at the
+                // end, a warning tone.
+                assert_eq!(dlg.application_context(), [0, 4, 0, 0, 1, 21, 3, 4]);
+                let mut charging = TimeDurationChargingV3::new(600);
+                charging.release_if_duration_exceeded = Some(true);
+                charging.tone = Some(true);
+                let mut apply = ApplyChargingArg::with_characteristics(
+                    &CamelAChBillingChargingCharacteristicsV3::TimeDurationCharging(charging),
+                )
+                .expect("encode the characteristics");
+                apply.party_to_charge = Some(SendingSideId::leg(1));
+
+                // RequestReportBCSMEvent and ApplyCharging are class 2, Continue
+                // is class 4 (TS 29.078).
+                for (code, argument, class) in [
+                    (
+                        gsm_cap::op_codes::REQUEST_REPORT_BCSM_EVENT,
+                        Some(gsm_cap::encode(&rrbe).expect("encode")),
+                        OperationClass::Two,
+                    ),
+                    (
+                        gsm_cap::op_codes::APPLY_CHARGING,
+                        Some(gsm_cap::encode(&apply).expect("encode")),
+                        OperationClass::Two,
+                    ),
+                    (gsm_cap::op_codes::CONTINUE, None, OperationClass::Four),
+                ] {
+                    dlg.invoke_with(code, argument, class, None)
+                        .expect("invoke");
+                }
+                dlg.send().expect("send");
+            })
+            .on_turn(move |dlg, peer| {
+                for component in &peer.components {
+                    let PeerComponent::Invoke {
+                        operation_code,
+                        argument,
+                        ..
+                    } = component
+                    else {
+                        continue;
+                    };
+                    let argument = argument.as_deref().unwrap_or_default();
+                    let mut seen = seen.lock().unwrap();
+                    let read = match *operation_code {
+                        EVENT_REPORT_BCSM => {
+                            gsm_cap::decode::<EventReportBcsmArg>(argument).map(|report| {
+                                seen.answered_on = report.leg_id.map(|leg| leg.leg_type().to_vec());
+                            })
+                        }
+                        APPLY_CHARGING_REPORT => {
+                            gsm_cap::decode::<ApplyChargingReportArg>(argument)
+                                .and_then(|report| report.call_result())
+                                .map(|CamelCallResult::TimeDurationChargingResult(result)| {
+                                    if let TimeInformation::TimeIfNoTariffSwitch(used) =
+                                        result.time_information
+                                    {
+                                        seen.used = Some(used);
+                                    }
+                                    // The period is used up: release, normal call
+                                    // clearing (Q.850 cause 16, coded ITU-T,
+                                    // location user).
+                                    let release = ReleaseCallArg(vec![0x80, 0x90].into());
+                                    dlg.invoke_with(
+                                        gsm_cap::op_codes::RELEASE_CALL,
+                                        Some(gsm_cap::encode(&release).expect("encode")),
+                                        OperationClass::Four,
+                                        None,
+                                    )
+                                    .expect("invoke");
+                                    dlg.end().expect("end");
+                                })
+                        }
+                        _ => Ok(()),
+                    };
+                    if read.is_err() {
+                        if let Some((invoke_id, problem)) = component.mistyped_parameter() {
+                            dlg.reject(invoke_id, problem);
+                            dlg.end().expect("end");
+                        }
+                    }
+                }
+            })
+            .arc();
+        let mut engine = DialogueEngine::new(Default::default());
+        engine.register(CAP, INITIAL_DP, probe);
+        engine
+    }
+
+    fn from_ssf(tcap_bytes: &[u8]) -> siphon_sigtran::transport::Msu {
+        inbound_between(CAP, CAP, tcap_bytes)
+    }
+
+    /// A prepaid call from trigger to release, through the engine: a realistic
+    /// InitialDP under the phase 3 generic context; a Continue carrying
+    /// RequestReportBCSMEvent with legs, ApplyCharging and Continue; the answer
+    /// reported; the charging report; ReleaseCall with a cause in the End.
+    /// Wireshark reads every frame as CAMEL, and the fields are asserted.
+    #[test]
+    fn a_prepaid_call_dissects_as_camel_field_by_field() {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let engine = scp(seen.clone());
+        let ssf = [0x2A, 0x2B, 0x2C, 0x2D];
+
+        let trigger = from_ssf(&begin(
+            &ssf,
+            Some(&aarq(&GENERIC_PHASE3)),
+            &[invoke(1, INITIAL_DP, Some(&initial_dp()))],
+        ));
+        let instructions = engine.deliver(&trigger, "ingress");
+        assert_eq!(instructions.len(), 1);
+        let TcapMessage::Continue(c) = decode(&instructions[0]) else {
+            panic!("expected a Continue");
+        };
+        let scf = c.otid.to_vec();
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.imsi.as_deref(), Some(&RES[2..]));
+            assert_eq!(
+                seen.dialled.as_deref(),
+                Some(&[0x81, 0x51, 0x55, 0x10, 0x24][..])
+            );
+        }
+
+        // The call is answered ten minutes of ringing and routing later.
+        assert!(engine
+            .sweep(std::time::Instant::now() + std::time::Duration::from_secs(600))
+            .is_empty());
+        let answer = from_ssf(&cont(
+            &ssf,
+            &scf,
+            &[invoke(2, EVENT_REPORT_BCSM, Some(&event_report_answer()))],
+        ));
+        assert!(
+            engine.deliver(&answer, "ingress").is_empty(),
+            "a notification needs no answer, and none is an abort"
+        );
+        assert_eq!(
+            seen.lock().unwrap().answered_on.as_deref(),
+            Some(&[0x02][..])
+        );
+        assert_eq!(engine.open_dialogues(), 1);
+
+        let report = from_ssf(&cont(
+            &ssf,
+            &scf,
+            &[invoke(
+                3,
+                APPLY_CHARGING_REPORT,
+                Some(&apply_charging_report()),
+            )],
+        ));
+        let release = engine.deliver(&report, "ingress");
+        assert_eq!(release.len(), 1);
+        assert!(matches!(decode(&release[0]), TcapMessage::End(_)));
+        assert_eq!(seen.lock().unwrap().used, Some(600));
+        assert_eq!(engine.open_dialogues(), 0);
+
+        // The charging characteristics on the wire, against the ASN.1 by hand:
+        // phase 3 has `tone [3] BOOLEAN` (`83 01 FF`), where phase 4 would
+        // have the explicit `audibleIndicator [3]` (`A3 03 01 01 FF`).
+        let characteristics = [
+            0xA0, 0x0A, 0x80, 0x02, 0x02, 0x58, 0x81, 0x01, 0xFF, 0x83, 0x01, 0xFF,
+        ];
+        let apply_charging = [
+            &tlv(0x80, &characteristics)[..],
+            // partyToCharge [2], explicit: sendingSideID [0] leg 1
+            &[0xA2, 0x03, 0x80, 0x01, 0x01][..],
+        ]
+        .concat();
+        assert!(contains(
+            &tcap_bytes(&instructions[0]),
+            &tlv(0x30, &apply_charging)
+        ));
+
+        if let Some(d) = dissect_all(&[&trigger, &instructions[0], &answer, &report, &release[0]]) {
+            d.present("camel")
+                .show_all(
+                    "camel.local",
+                    // InitialDP; RequestReportBCSMEvent, ApplyCharging, Continue;
+                    // EventReportBCSM; ApplyChargingReport; ReleaseCall.
+                    &["0", "23", "35", "31", "24", "36", "22"],
+                )
+                // The Begin.
+                .show("tcap.aarq_application_context_name", "0.4.0.0.1.21.3.4")
+                .present("camel.InitialDPArg_element")
+                .show("camel.serviceKey", "100")
+                .show("camel.callingPartyNumber", "04:13:51:55:10:10")
+                .show("camel.bearerCap", "80:90:a3")
+                .show("camel.iMSI", "00:01:01:00:00:00:40:f2")
+                .present("gsm_map.ms.assumedIdle_element")
+                .show("gsm_map.ms.vlr_number", "91:51:55:10:08")
+                .show(
+                    "gsm_map.cellGlobalIdOrServiceAreaIdFixedLength",
+                    "00:f1:10:00:01:00:01",
+                )
+                .show("gsm_map.ext_Teleservice", "17")
+                .show("camel.callReferenceNumber", "01:02:03:04")
+                .show("camel.mscAddress", "91:51:55:10:08")
+                .show("camel.calledPartyBCDNumber", "81:51:55:10:24")
+                .show("camel.timeandtimezone.time", "20261009123456")
+                // The SCP's Continue.
+                .show("tcap.aare_application_context_name", "0.4.0.0.1.21.3.4")
+                .present("camel.RequestReportBCSMEventArg_element")
+                .show("camel.bcsmEvents", "3")
+                .show_all("camel.monitorMode", &["1", "0", "0"])
+                .show_all("inap.sendingSideID", &["02", "01", "02"])
+                .present("camel.ApplyChargingArg_element")
+                .show("camel.maxCallPeriodDuration", "600")
+                .show("camel.releaseIfdurationExceeded", "True")
+                .show("camel.sendingSideID", "01")
+                // The gsmSSF's reports.
+                .present("camel.EventReportBCSMArg_element")
+                .show_all("camel.eventTypeBCSM", &["2", "7", "9", "9", "7"])
+                .present("camel.oAnswerSpecificInfo_element")
+                .show_all("camel.receivingSideID", &["02", "01"])
+                .show("inap.messageType", "1")
+                .present("camel.timeDurationChargingResult_element")
+                .show("camel.timeIfNoTariffSwitch", "600")
+                .show("camel.legActive", "False")
+                // The End.
+                .present("tcap.end_element")
+                .show("camel.allCallSegments", "80:90")
+                .show("camel.cause_indicator", "16");
+        }
+    }
+
+    /// An InitialDP that does not decode is rejected: Reject, invokeProblem,
+    /// mistypedParameter, in an End.
+    #[test]
+    fn an_initial_dp_that_does_not_decode_is_rejected() {
+        let engine = scp(Arc::default());
+        let whole = initial_dp();
+        for damaged in [
+            // serviceKey [0] announces four octets and holds one.
+            tlv(0x30, &[0x80, 0x04, 0x64]),
+            // No serviceKey.
+            tlv(0x30, &[0x85, 0x01, 0x0A]),
+            // subscriberState [51] holding an alternative it does not have
+            // ([7]): behind an explicit tag, where the plain decoder returned
+            // the InitialDP without the member.
+            tlv(
+                0x30,
+                &[
+                    &[0x80, 0x01, 0x64][..],
+                    &tlv_high(true, 51, &[0x87, 0x00])[..],
+                ]
+                .concat(),
+            ),
+            // The whole argument with its last member cut off mid-value.
+            {
+                let mut cut = whole[..whole.len() - 3].to_vec();
+                cut[1] -= 3;
+                cut
+            },
+        ] {
+            let request = from_ssf(&begin(
+                &[0x2E],
+                Some(&aarq(&GENERIC_PHASE3)),
+                &[invoke(5, INITIAL_DP, Some(&damaged))],
+            ));
+            let out = engine.deliver(&request, "ingress");
+            assert_eq!(out.len(), 1, "{damaged:02x?}");
+            assert!(matches!(decode(&out[0]), TcapMessage::End(_)));
+            assert_eq!(
+                rejects_of(&out[0]),
+                vec![Reject::invoke(5, tcap::InvokeProblem::MISTYPED_PARAMETER)],
+                "{damaged:02x?}"
+            );
+            assert_eq!(engine.open_dialogues(), 0);
+            if let Some(d) = dissect(&out[0]) {
+                d.present("tcap.end_element")
+                    .hex("tcap.dtid", "2e")
+                    .present("camel.reject_element")
+                    .show("camel.present", "5")
+                    .show("camel.invokeProblem", "2");
+            }
+        }
+    }
+
+    /// A report whose argument does not decode, on the established dialogue: the
+    /// Invoke is rejected and the SCP ends the dialogue.
+    #[test]
+    fn an_event_report_that_does_not_decode_is_rejected() {
+        let engine = scp(Arc::default());
+        let ssf = [0x2F];
+        let out = engine.deliver(
+            &from_ssf(&begin(
+                &ssf,
+                Some(&aarq(&GENERIC_PHASE3)),
+                &[invoke(1, INITIAL_DP, Some(&initial_dp()))],
+            )),
+            "ingress",
+        );
+        let TcapMessage::Continue(c) = decode(&out[0]) else {
+            panic!("expected a Continue");
+        };
+        // legID [3] as the earlier encoding had it, a primitive [2] holding the
+        // leg octet: not an EventReportBCSMArg.
+        let old_form = tlv(0x30, &[0x80, 0x01, 0x07, 0x82, 0x01, 0x02]);
+        let out = engine.deliver(
+            &from_ssf(&cont(
+                &ssf,
+                &c.otid,
+                &[invoke(7, EVENT_REPORT_BCSM, Some(&old_form))],
+            )),
+            "ingress",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            rejects_of(&out[0]),
+            vec![Reject::invoke(7, tcap::InvokeProblem::MISTYPED_PARAMETER)]
+        );
+        assert!(matches!(decode(&out[0]), TcapMessage::End(_)));
+    }
+
+    /// The lenient decoder took an InitialDP with an unreadable member behind
+    /// an explicit tag for one without that member.
+    #[test]
+    fn the_lenient_decoder_returns_the_initial_dp_without_the_unreadable_member() {
+        let wire = tlv(
+            0x30,
+            &[
+                &[0x80, 0x01, 0x64][..],
+                &tlv_high(true, 51, &[0x87, 0x00])[..],
+            ]
+            .concat(),
+        );
+        let lenient: InitialDpArg =
+            rasn::ber::decode(&wire).expect("the lenient decoder accepts it");
+        assert_eq!(lenient.subscriber_state, None);
+        assert!(gsm_cap::decode::<InitialDpArg>(&wire).is_err());
+    }
+}

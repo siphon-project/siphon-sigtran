@@ -24,10 +24,13 @@ doing three things that were wrong on the wire.
   was wrong with it. A `Continue` for a transaction the node did not know was
   discarded too. And a message whose last component was malformed was not even
   seen as damaged: it was processed without that component.
-- **A reply without a result parameter was never sent.** `dlg.reply(...)` with a
-  result that carries no parameter (`mo_forward_sm_res()`, `mt_forward_sm_res()`)
-  staged a result sequence Q.773 does not allow. On `tcap` 2 that is refused by
-  the encoder, and the send path swallowed the refusal: the reply vanished.
+- **A reply without a result parameter was not a valid ReturnResult.**
+  `dlg.reply(...)` with a result that carries no parameter
+  (`mo_forward_sm_res()`, `mt_forward_sm_res()`) went out with a result sequence
+  holding the operation code alone (`30 03 02 01 2E`), which Q.773 does not
+  have: the sequence is there with its parameter or not at all. And the send
+  path swallowed encode errors, so the day the encoder refused that (it does in
+  `tcap` 2) the reply would have vanished without a trace.
 
 ### Fixed
 
@@ -53,7 +56,7 @@ doing three things that were wrong on the wire.
   An AARQ that does not list version 1 of the dialogue portion is refused with the
   AARE of Q.774 3.2.3.
 - **A reply without a result parameter is a `ReturnResult` with no result
-  sequence**, and it is sent.
+  sequence.**
 - **Nothing on the send path fails silently.** A message the encoder refuses is
   logged at error level with the dialogue's transaction ids, counted in
   `sigtran_tcap_send_errors_total`, and returned to the caller (`Dialogue::send` /
@@ -122,6 +125,25 @@ doing three things that were wrong on the wire.
   Reject as for MAP. An InitialDP carrying the members a real SSF sends
   (`bearerCapability`, `extensions`, `redirectionInformation`, …) used to be
   refused as a whole, and decodes.
+- **CAP encodings that a conforming gsmSSF rejects are gone**, on `gsm_cap` 2.
+  `partyToCharge` in ApplyCharging went out as a primitive `[2]` where it is an
+  explicit tag around `sendingSideID` (`A2 03 80 01 01`); a leg could not be
+  given in RequestReportBCSMEvent at all, though a disconnect event needs one;
+  Connect had its optional members on the wrong tags. See the `gsm_cap` 2.0.0
+  changelog for the full list, which also covers what this crate decodes: an
+  InitialDP as real equipment sends it (`bearerCapability`, `subscriberState`,
+  `locationInformation` with a cell id, …) used to be refused as a whole.
+- **ApplyCharging is encoded for the CAMEL phase of its dialogue.** The charging
+  characteristics of phase 3 and phase 4 are different octets. The typed
+  `gsm_cap.apply_charging(...)` is encoded when it is staged on a dialogue, from
+  the dialogue's application context, and is not sent at all (nor is the rest of
+  that turn's answer) when the context is neither.
+- **A CAP InitialDP that does not decode is a mistyped parameter.**
+  `arg.called_party_number` returned `None`; it raises `siphon.MistypedParameter`,
+  answered with a Reject as for MAP and INAP.
+- **A turn whose answer cannot be staged in full is not sent in part.** When one
+  of the commands a Python handler staged fails, the ones staged before it in the
+  same flush are dropped with it.
 - **The MAP results and arguments the builders stage have the encodings `gsm_map`
   2 corrected.** `send_authentication_info_res` now carries the `[3]` tag of
   `SendAuthenticationInfoRes`; it went out as a bare SEQUENCE, which is the
@@ -136,7 +158,10 @@ doing three things that were wrong on the wire.
 
 ### Changed
 
-- `tcap` 2 (was 1), `gsm_map` 2 (was 1.1), `inap` 2 (was 1.1).
+- `tcap` 2 (was 1), `gsm_map` 2 (was 1.1), `inap` 2 (was 1.1), `gsm_cap` 2 (was
+  1.2). `gsm_map` 2.0.0 still depends on `tcap` 1 and `gsm_cap` 2.0.0 on `inap`
+  1, so the graph holds two versions of each until those are released against
+  the new majors; no type of one version crosses to the other in this crate.
 - `content::MapView` has `imsi_unreadable`; `content::Action` has `Unevaluable`.
 - A Python handler that raises has what it staged before the exception discarded
   (an `async def` handler used to have it sent).
@@ -168,6 +193,11 @@ doing three things that were wrong on the wire.
 - `dialogue::PeerComponent::mistyped_parameter` and
   `IncomingOp::mistyped_parameter`: the invoke id and problem to `reject` a
   component with when its parameter does not decode.
+- `dialogue::Dialogue::discard_staged`; `dialogue::DialogueError::Argument`.
+- Python: `arg.service_key` and `arg.called_party_bcd_number` for a CAP
+  InitialDP; `gsm_cap.AC.gsm_ssf_scf_phase4`; a leg in
+  `gsm_cap.request_report_bcsm_event` events; the CAP event types 8, 16, 19, 27
+  and 50 to 53; `original_called_party_id=` on `gsm_cap.connect`.
 - Python: `siphon.MistypedParameter`; `inap.AC.assist_handoff_ssp_to_scp` and
   `inap.AC.ip_to_scp`; a leg in `inap.request_report_bcsm_event` events; INAP
   event types 1, 8 and 16.
@@ -198,6 +228,16 @@ doing three things that were wrong on the wire.
   than MO-ForwardSM (46) and MT-ForwardSM (44). A handler that tested them for
   `None` to detect a bad argument has to catch the exception, or let it propagate
   to have the Invoke rejected.
+- **`gsm_cap.apply_charging` takes the charging as typed keywords**
+  (`max_call_period_duration=` in units of 100 ms, `release_if_duration_exceeded=`,
+  `tone=`, `tariff_switch_interval=`), and `party_to_charge=` is the leg number,
+  not octets. `charging_characteristics=` still takes an already encoded value,
+  which now has to be a CAMEL-AChBillingChargingCharacteristics value of the
+  right phase for the gsmSSF to read it.
+- **`gsm_cap.connect` takes exactly one destination**, as TS 29.078 has it.
+- **`arg.called_party_number` raises `siphon.MistypedParameter`** for an InitialDP
+  that does not decode, and is `None` for a mobile-originated call, which carries
+  what was dialled in `arg.called_party_bcd_number`.
 - **`inap.play_announcement` and `inap.prompt_and_collect_user_information` take
   typed arguments.** `information_to_send=` used to be opaque octets put on the
   wire as given; it is now the BER of an `InformationToSend` value and is refused

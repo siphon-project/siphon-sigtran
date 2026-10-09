@@ -185,6 +185,11 @@ pub enum DialogueError {
     /// UDT, for instance).
     #[error("the SCCP message could not be encoded: {0}")]
     Sccp(String),
+    /// The argument of an invoke could not be built for this dialogue (it
+    /// depends on the application context, and the dialogue has none it can be
+    /// built for).
+    #[error("the invoke argument could not be built: {0}")]
+    Argument(String),
 }
 
 /// The decoded opening operation handed to [`TerminationHandler::on_begin`].
@@ -727,6 +732,15 @@ impl Dialogue {
     pub fn reject(&mut self, invoke_id: Option<InvokeId>, problem: Problem) {
         self.pending
             .push(Component::Reject(Reject { invoke_id, problem }));
+    }
+
+    /// Drop the components staged since the last flush, without sending them.
+    /// For a caller that stages several components as one answer and finds it
+    /// cannot stage them all: the part it did stage must not go out alone.
+    /// Rejects the component sub-layer built are kept.
+    pub fn discard_staged(&mut self) {
+        self.pending.clear();
+        self.staged.clear();
     }
 
     /// Flush the staged components as a `Continue` (or, on the initiator's first

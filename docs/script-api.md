@@ -140,19 +140,41 @@ an SCP stages toward the gsmSSF.
 
 | Name | Operation | Op code |
 |---|---|---|
-| `initial-dp` | A CAMEL initialDP. Handler is `def on(dlg, idp)`, `idp` a decoded [`IncomingOp`](#incomingop) (with `.called_party_number`). | 0 |
+| `initial-dp` | A CAMEL initialDP. Handler is `def on(dlg, idp)`, `idp` a decoded [`IncomingOp`](#incomingop) (with `.service_key`, `.called_party_bcd_number`, `.called_party_number`). | 0 |
 | `event-report-bcsm` | An EventReportBCSM the gsmSSF sends when an armed detection point fires. | 24 |
 
 | Invoke builder | Stages |
 |---|---|
-| `gsm_cap.connect(destination_routing_address=[…])` | Connect: reroute the call to a list of called-party numbers (each an E.164 digit string or raw bytes). |
+| `gsm_cap.connect(destination_routing_address=[…], original_called_party_id=None)` | Connect: reroute the call. The list holds the one called-party number TS 29.078 allows, an E.164 digit string or raw bytes. |
 | `gsm_cap.release_call(cause=…)` | ReleaseCall: tear the call down with a Q.850 cause. |
-| `gsm_cap.request_report_bcsm_event(events=[(event_type, monitor_mode), …])` | RequestReportBCSMEvent: arm detection points (integers per TS 29.078). |
-| `gsm_cap.apply_charging(charging_characteristics=…, party_to_charge=None)` | ApplyCharging: an online-charging control. |
+| `gsm_cap.request_report_bcsm_event(events=[…])` | RequestReportBCSMEvent: arm detection points. Each event is `(event_type, monitor_mode)` or `(event_type, monitor_mode, leg)` (integers per TS 29.078); the leg goes out as `legID [2] { sendingSideID [0] }`. A disconnect is armed per leg. |
+| `gsm_cap.apply_charging(max_call_period_duration=…, release_if_duration_exceeded=None, tariff_switch_interval=None, tone=None, party_to_charge=None, phase=None)` | ApplyCharging with time-duration charging: a call period in units of 100 ms, metered on leg `party_to_charge`. See below for the CAMEL phase. `charging_characteristics=` takes an already encoded CAMEL-AChBillingChargingCharacteristics value in place of the typed keywords. |
+| `gsm_cap.continue_()` | Continue: let the call proceed. |
 
 Stage several in one dialogue (a RequestReportBCSMEvent then a Connect) with
 repeated `dlg.invoke(...)`, then `dlg.end()`. See
 [Building a CAMEL SCP](cookbook/scp.md#beyond-a-fixed-connect).
+
+**ApplyCharging and the CAMEL phase.** The charging characteristics are not the
+same octets in CAMEL phase 3 and phase 4 (the warning tone is `tone [3] BOOLEAN`
+in one and `audibleIndicator [3]`, a constructed choice, in the other), and a
+gsmSSF reads the form of the phase its dialogue runs under. So the typed
+`apply_charging` is encoded when it is staged on a dialogue, from that dialogue's
+application context: phase 3 under `0.4.0.0.1.21.3.x`, phase 4 under
+`0.4.0.0.1.23.3.x`. Under any other context (phase 1 and 2 have another form
+again, which is not modelled) it cannot be encoded: the turn's answer is dropped
+as a whole, logged as an error, and a `Begin` left unanswered that way is
+aborted, so a call is not let through without its charging instruction. `phase=3`
+or `phase=4` fixes the phase regardless of the context.
+
+`gsm_cap.AC.gsm_ssf_scf` is the phase 3 generic context (`0.4.0.0.1.21.3.4`),
+`gsm_cap.AC.gsm_ssf_scf_phase4` the phase 4 one (`0.4.0.0.1.23.3.4`).
+
+The InitialDP getters (`service_key`, `called_party_bcd_number`,
+`called_party_number`) decode the argument strictly and raise
+[`MistypedParameter`](#mistyped) when it does not decode. A mobile-originated
+call carries what was dialled in `called_party_bcd_number`; `called_party_number`
+is there on forwarded and terminating calls.
 
 ## `inap` { #inap }
 
@@ -261,7 +283,7 @@ argument (`arg` / `idp`).
 | `argument` | The raw BER argument bytes, if the Invoke carried a parameter. |
 | `further` | Every other component of the `Begin`, in order, as [`Component`](#component) objects. Empty for the usual single Invoke. |
 | `sm_rp_oa` / `sm_rp_da` / `sm_rp_ui` | For MO-ForwardSM (46) and MT-ForwardSM (44): the originating address, destination address, and TPDU bytes. `None` for any other operation. Raise [`MistypedParameter`](#mistyped) when the argument does not decode. |
-| `called_party_number` | For a CAMEL initialDP: the dialled number bytes. |
+| `service_key` / `called_party_bcd_number` / `called_party_number` | For a CAMEL initialDP: the service key, the dialled number of a mobile-originated call (type of number and plan, then TBCD digits), and the called party number of a forwarded or terminating call. `None` for any other operation, or when the InitialDP carries none. Raise [`MistypedParameter`](#mistyped) when the argument does not decode. |
 
 !!! note "`sm_rp_ui` is an opaque SMS TPDU"
     siphon-sigtran handles the MAP and transaction layers; it does not decode

@@ -173,19 +173,10 @@ fn mt_forward_sm_arg() -> Vec<u8> {
 
 fn initial_dp_arg(imsi: &str) -> Vec<u8> {
     let arg = InitialDpArg {
-        service_key: 100.into(),
         called_party_number: Some(isdn("15550142").into()),
         calling_party_number: Some(isdn("15550101").into()),
-        calling_partys_category: None,
-        original_called_party_id: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
         imsi: Some(imsi_bytes(imsi).into()),
-        location_information: None,
-        call_reference_number: None,
-        msc_address: None,
-        called_party_bcd_number: None,
-        time_and_timezone: None,
+        ..InitialDpArg::new(100.into())
     };
     gsm_cap::encode(&arg).expect("encode idp")
 }
