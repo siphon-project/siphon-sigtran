@@ -7,6 +7,12 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Moved to `gsm_map` 3 and `gsm_cap` 3, which depend on `tcap` 2 and `inap` 2.
+  The dependency graph now holds one `tcap` and one `inap`; 2.0.0 carried
+  both majors of each. No emitted octet and no public item changes.
+
 ## [2.0.0] — 2026-10-10
 
 A major release: public items of the dialogue engine change type, and the
