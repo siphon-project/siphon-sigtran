@@ -8,8 +8,7 @@
 //! pyo3 nor siphon. Two seams a composing siphon binary calls at startup: it
 //! reads its `extensions.sigtran` config and calls [`configure_from`] to build
 //! the process-wide node, and it calls [`register`] to mount the `ss7` /
-//! `gsm_map` / `gsm_cap` / `inap` namespaces (plus `metrics` and the shared
-//! types) onto the `siphon` package module, so scripts import them with
+//! `gsm_map` / `gsm_cap` / `inap` namespaces (plus the shared types) onto the `siphon` package module, so scripts import them with
 //! `from siphon import ss7, gsm_map, gsm_cap, inap`.
 //!
 //! # The model
@@ -2047,6 +2046,12 @@ impl Ss7 {
         }
     }
 
+    /// The node's Prometheus text exposition (`ss7.metrics()`). It lives on this
+    /// namespace and not on the `siphon` module, where `metrics` is the host's.
+    fn metrics(&self) -> String {
+        crate::metrics::render()
+    }
+
     fn __repr__(&self) -> String {
         "ss7".to_string()
     }
@@ -4059,12 +4064,6 @@ pub fn task(cfg: Config) -> impl FnOnce(ScriptHandle) + Send + 'static {
     }
 }
 
-/// Render the Prometheus metrics text-exposition for the whole node.
-#[pyfunction]
-fn metrics() -> String {
-    crate::metrics::render()
-}
-
 // ── Module wiring ────────────────────────────────────────────────────────────
 
 fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -4090,15 +4089,18 @@ fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StagedResult>()?;
 
     // Module functions.
+    // Nothing here may carry a name the host gives one of its own namespaces:
+    // this runs after the host has filled the module, and `add` replaces.
     m.add_function(wrap_pyfunction!(configure, m)?)?;
-    m.add_function(wrap_pyfunction!(metrics, m)?)?;
     Ok(())
 }
 
 /// The siphon namespace-mount seam. A composing siphon binary calls this once at
 /// startup with the `siphon` package module as `parent`; it mounts the `ss7` /
-/// `gsm_map` / `gsm_cap` / `inap` namespace singletons, the `metrics` function,
-/// the `SigtranError` exception, and the shared types onto it. A hot-reloaded
+/// `gsm_map` / `gsm_cap` / `inap` namespace singletons, the `SigtranError`
+/// exception, and the shared types onto it. It adds no name the host uses for a
+/// namespace of its own (`metrics` among them): the node's Prometheus text is
+/// `ss7.metrics()`. A hot-reloaded
 /// script then reaches them with `from siphon import ss7, gsm_map, gsm_cap, inap`,
 /// programs the Rust routing tables live, and registers MAP/CAP/INAP termination
 /// handlers. The binary builds the live node those namespaces drive with

@@ -147,9 +147,10 @@ siphon_sigtran::python::register(py, parent)?;
 ```
 
 `register` mounts the `ss7` / `gsm_map` / `gsm_cap` / `inap` namespaces (plus
-`metrics` and the shared types) onto `siphon`, so scripts import them with
-`from siphon import ...`. The script never configures the node; it just programs
-it:
+the shared types) onto `siphon`, so scripts import them with
+`from siphon import ...`. It leaves the host's own names alone, `metrics`
+included: the node's Prometheus text is `ss7.metrics()`. The script never
+configures the node; it just programs it:
 
 ```python
 from siphon import ss7, gsm_map
