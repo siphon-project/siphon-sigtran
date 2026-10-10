@@ -128,7 +128,7 @@ jobs:
         run: cargo test --test abnormal --test strict_decode
 
       - name: Wire tests (siphon extension)
-        run: cargo test --features python --test wire_python
+        run: cargo test --features python --test wire_python --test wire_global_title
 
   # ── Deterministic dependency-graph policy: the PR gate ──────────────────────
   # bans / licenses / sources are a pure function of the checked-in tree, so

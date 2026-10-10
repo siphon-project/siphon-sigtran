@@ -2766,9 +2766,9 @@ dependencies = [
 
 [[package]]
 name = "sccp"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3e9d3ce21fee346de7ec34ecf5897699e1c6693b6184b3d1bcfa13854f9b809"
+checksum = "f368d458b6c1421119b8e8130a5c930e4e1df7d2600046088333595404bfbebe"
 dependencies = [
  "thiserror 2.0.21",
 ]
