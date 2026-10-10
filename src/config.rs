@@ -62,12 +62,30 @@ impl From<NetworkIndicator> for mtp3::NetworkIndicator {
     }
 }
 
+/// Read an SS7 variant: `itu`, `ansi` or `china`, as every other keyword of the
+/// file is written, in lower case. The codec crate's own spelling is upper case,
+/// so the letter case is not significant here.
+fn variant<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Variant, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    match name.to_ascii_lowercase().as_str() {
+        "itu" => Ok(Variant::Itu),
+        "ansi" => Ok(Variant::Ansi),
+        "china" => Ok(Variant::China),
+        _ => Err(serde::de::Error::custom(format!(
+            "unknown variant `{name}`, expected itu, ansi or china"
+        ))),
+    }
+}
+
 /// The `node:` block: our point code, variant, and network indicator.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Node {
     /// Our point code (decimal, resolved under [`Node::variant`]).
     pub point_code: RawPc,
     /// SS7 variant (fixes the point-code width).
+    #[serde(deserialize_with = "variant")]
     pub variant: Variant,
     /// The default network indicator for messages we originate.
     #[serde(default = "default_ni")]
@@ -539,6 +557,7 @@ pub struct Tenant {
     /// The tenant's own point code (decimal).
     pub point_code: RawPc,
     /// The tenant's SS7 variant.
+    #[serde(deserialize_with = "variant")]
     pub variant: Variant,
     /// Default network indicator.
     #[serde(default = "default_ni")]
@@ -1105,6 +1124,29 @@ content_routing:
       match:  { operation: sri-sm }
       action: { route: {dpc: 2000, ssn: 6} }
 "#;
+
+    #[test]
+    fn the_variant_is_read_in_lower_case_as_documented() {
+        // The reference and every example write `variant: itu`. The upper-case
+        // spelling of the codec crate stays accepted.
+        for (spelling, variant) in [
+            ("itu", Variant::Itu),
+            ("ansi", Variant::Ansi),
+            ("china", Variant::China),
+            ("ITU", Variant::Itu),
+            ("Ansi", Variant::Ansi),
+        ] {
+            let cfg = Config::parse(&format!(
+                "node: {{ point_code: 1000, variant: {spelling} }}\nsccp: {{ local_ssns: [6] }}\n"
+            ))
+            .unwrap_or_else(|e| panic!("variant: {spelling} does not load: {e}"));
+            assert_eq!(cfg.tenant("default").unwrap().variant, variant);
+        }
+        let error = Config::parse("node: { point_code: 1000, variant: etsi }\n")
+            .expect_err("an unknown variant is refused")
+            .to_string();
+        assert!(error.contains("itu, ansi or china"), "{error}");
+    }
 
     #[test]
     fn parses_the_sample() {

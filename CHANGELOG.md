@@ -7,6 +7,14 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`variant: itu` did not load.** The reference, the quickstart and every
+  cookbook write the variant in lower case, like every other keyword of
+  `sigtran.yaml`, and the file was refused with ``unknown variant `itu`, expected
+  one of `ITU`, `ANSI`, `CHINA` ``. The variant is now read whatever its letter
+  case, so a file that says `ITU` loads as before.
+
 ### Changed
 
 - Moved to `gsm_map` 3 and `gsm_cap` 3, which depend on `tcap` 2 and `inap` 2.
