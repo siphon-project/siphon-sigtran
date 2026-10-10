@@ -21,8 +21,10 @@ siphon_sigtran::python::register(py, parent)?;
 ```
 
 `register` mounts the `ss7` / `gsm_map` / `gsm_cap` / `inap` namespace singletons,
-the `metrics` function, the `SigtranError` exception, and the shared types onto
-the `siphon` module, so a hot-reloaded script reaches them with:
+the `SigtranError` exception, and the shared types onto the `siphon` module. It
+adds no name SIPhon uses for a namespace of its own, so `from siphon import
+metrics` stays SIPhon's; the node's Prometheus text is `ss7.metrics()`. A
+hot-reloaded script reaches the namespaces with:
 
 ```python
 from siphon import ss7, gsm_map, gsm_cap, inap

@@ -147,7 +147,7 @@ Invoke and dialogue timers, and the dialogue ceiling, come from the
 ## Metrics { #metrics }
 
 The node maintains a Prometheus family set in Rust and renders it with
-`siphon.metrics()` (or `node.metrics()`); it is never a per-message Python
+`ss7.metrics()` (or `node.metrics()`); it is never a per-message Python
 call. The families:
 
 | Family | Kind | Labels |

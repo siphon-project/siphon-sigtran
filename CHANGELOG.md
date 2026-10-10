@@ -14,6 +14,20 @@ All notable changes are documented here. The format follows
   and drops before routing is counted, with a line on stderr that names the
   association and says why.
 
+### Changed
+
+- Moved to `gsm_map` 3 and `gsm_cap` 3, which depend on `tcap` 2 and `inap` 2.
+  The dependency graph now holds one `tcap` and one `inap`; 2.0.0 carried
+  both majors of each. No emitted octet and no public item changes.
+- **`siphon.metrics()` is now `ss7.metrics()`** (breaking for a script that
+  called it). `python::register` put a function named `metrics` on the `siphon`
+  module, where `metrics` is the host's own namespace, and it ran after the host
+  had filled the module: every script doing `from siphon import metrics;
+  metrics.counter(...)` failed at import in a binary that called `register`. The
+  node's Prometheus text is now a method of the addon's `ss7` namespace, so it is
+  also there for a binary that mounts the namespaces one by one. `node.metrics()`
+  is unchanged.
+
 ### Fixed
 
 - **A received message was dropped without a count or a log line** in these
@@ -30,18 +44,14 @@ All notable changes are documented here. The format follows
 
 A test now runs two nodes of this crate against each other over kernel SCTP:
 the ASP side begins and the SG side ends, then the reverse, twice each.
-
 - **`variant: itu` did not load.** The reference, the quickstart and every
   cookbook write the variant in lower case, like every other keyword of
   `sigtran.yaml`, and the file was refused with ``unknown variant `itu`, expected
   one of `ITU`, `ANSI`, `CHINA` ``. The variant is now read whatever its letter
   case, so a file that says `ITU` loads as before.
-
-### Changed
-
-- Moved to `gsm_map` 3 and `gsm_cap` 3, which depend on `tcap` 2 and `inap` 2.
-  The dependency graph now holds one `tcap` and one `inap`; 2.0.0 carried
-  both majors of each. No emitted octet and no public item changes.
+- **`python::register` no longer replaces a name the host owns.** A test plants
+  every built-in namespace name of the host on the module before `register` and
+  requires each to be the same object afterwards.
 
 ## [2.0.0] — 2026-10-10
 

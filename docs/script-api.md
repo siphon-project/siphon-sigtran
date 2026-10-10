@@ -23,8 +23,9 @@ script (see [Using it in a SIPhon build](integration.md)). A script **does not**
 configure the node; it just imports the namespaces and programs them. The config
 is [`sigtran.yaml`](configuration.md).
 
-`siphon.metrics()` renders the Prometheus text exposition for the whole node
-(see [Routing model & coverage](routing.md#metrics)).
+`ss7.metrics()` renders the Prometheus text exposition for the whole node
+(see [Routing model & coverage](routing.md#metrics)). It is on the `ss7`
+namespace because `siphon.metrics` is SIPhon's own.
 
 ## `ss7` { #ss7 }
 
@@ -40,6 +41,7 @@ The routing namespace. It programs the Rust routing tables live.
 | `ss7.content.add_rule(name, match={…}, action={…})` | Prepend a content rule (config [`content_routing`](configuration.md#content-routing) schema). |
 | `ss7.content.address_table(name).add(gt)` | Add a GT digit string to an address table live, creating it if absent. Idempotent. |
 | `ss7.gt(digits, ssn=None)` | Build an SCCP [`Address`](#address) (E.164, GTI-4). |
+| `ss7.metrics()` | The Prometheus text exposition for the whole node. |
 
 Prepending means a live rule wins over the static config rules (first match
 wins). Programming a table at script load keeps every subsequent decision in Rust

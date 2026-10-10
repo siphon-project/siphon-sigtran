@@ -58,9 +58,9 @@ assert hasattr(siphon, "gsm_map")
 assert hasattr(siphon, "gsm_cap")
 assert hasattr(siphon, "inap")
 assert callable(siphon.configure)
-assert callable(siphon.metrics)
+assert not hasattr(siphon, "metrics")   # the host's name, not the addon's
 assert issubclass(siphon.SigtranError, Exception)
-assert "sigtran_active_dialogues" in siphon.metrics()
+assert "sigtran_active_dialogues" in ss7.metrics()
 
 # ── configure builds the node ─────────────────────────────────────────────────
 node = siphon.configure(CONFIG)
@@ -698,7 +698,7 @@ d = cap_idp(tlv(0x30, b"\x80\x04\x64"), gsm_cap.AC.gsm_ssf_scf)
 assert d.kind == "end" and d.rejects == [(1, "invoke", 2)] and d.invokes == []
 
 # The new metric families are exposed.
-text = siphon.metrics()
+text = ss7.metrics()
 assert 'sigtran_tcap_abort_total{dir="rx",kind="p-abort",cause="resource-limitation"}' in text
 assert 'sigtran_tcap_reject_total{dir="rx",problem="invoke"}' in text
 
@@ -739,4 +739,45 @@ fn addon_links_against_siphon_sip() {
         handle.contains("ScriptHandle"),
         "unexpected type name: {handle}"
     );
+}
+
+/// `register` adds to a module the host owns and has already filled: it must not
+/// replace a name the host put there. Every built-in namespace name of the host
+/// is planted before `register` runs and has to be the same object afterwards,
+/// and the node's Prometheus text is reached under a namespace of the addon.
+#[test]
+fn register_leaves_the_names_of_the_host_alone() {
+    Python::attach(|py| {
+        let module = PyModule::new(py, "siphon").expect("module");
+        let builtins = siphon::script::api::BUILT_IN_NAMESPACE_NAMES;
+        assert!(builtins.contains(&"metrics"));
+        for name in builtins {
+            let host_namespace = PyDict::new(py);
+            host_namespace.set_item("owner", "host").expect("mark");
+            module.setattr(*name, host_namespace).expect("plant");
+        }
+
+        siphon_sigtran::python::register(py, &module).expect("register");
+
+        for name in builtins {
+            let after = module.getattr(*name).expect("still there");
+            let owner = after
+                .cast::<PyDict>()
+                .ok()
+                .and_then(|d| d.get_item("owner").ok().flatten())
+                .map(|o| o.to_string());
+            assert_eq!(
+                owner.as_deref(),
+                Some("host"),
+                "register replaced the host's `{name}`"
+            );
+        }
+
+        let text: String = module
+            .getattr("ss7")
+            .and_then(|ss7| ss7.call_method0("metrics"))
+            .and_then(|text| text.extract())
+            .expect("ss7.metrics() renders the exposition");
+        assert!(text.contains("sigtran_active_dialogues"), "{text}");
+    });
 }
