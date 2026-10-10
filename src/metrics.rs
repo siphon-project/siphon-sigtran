@@ -526,6 +526,58 @@ pub fn tcap_discards(reason: TcapDiscard) -> u64 {
     TCAP_DISCARDS[reason as usize].load(Ordering::Relaxed)
 }
 
+/// Why a message received on an association was dropped before it was routed,
+/// for [`rx_discard`]. Each is logged where it is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxDiscard {
+    /// The SCTP payload protocol identifier is not the adaptation layer's.
+    Ppid,
+    /// The octets do not decode as a message of the adaptation layer.
+    Undecodable,
+    /// Traffic on an association that is not carrying any: the ASP is not
+    /// active (RFC 4666 4.3.4.3), or the link is not in service.
+    OutOfState,
+    /// A data message without the user part it exists to carry (an M3UA DATA
+    /// without Protocol Data, RFC 4666 3.3.1).
+    NoPayload,
+    /// Addressed to a subsystem of this node, and not a unitdata message the
+    /// dialogue engine reads.
+    NotUnitdata,
+}
+
+impl RxDiscard {
+    const ALL: [RxDiscard; 5] = [
+        Self::Ppid,
+        Self::Undecodable,
+        Self::OutOfState,
+        Self::NoPayload,
+        Self::NotUnitdata,
+    ];
+
+    /// The `reason` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ppid => "ppid",
+            Self::Undecodable => "undecodable",
+            Self::OutOfState => "out-of-state",
+            Self::NoPayload => "no-payload",
+            Self::NotUnitdata => "not-unitdata",
+        }
+    }
+}
+
+static RX_DISCARDS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Count one received message dropped before routing.
+pub fn rx_discard(reason: RxDiscard) {
+    RX_DISCARDS[reason as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of received messages dropped before routing for the given reason.
+pub fn rx_discards(reason: RxDiscard) -> u64 {
+    RX_DISCARDS[reason as usize].load(Ordering::Relaxed)
+}
+
 static TCAP_SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 /// Count one TCAP message the dialogue engine could not encode, and therefore
@@ -933,6 +985,20 @@ pub fn render() -> String {
     }
     help(
         &mut out,
+        "sigtran_rx_discarded_total",
+        "Messages received on an association and dropped before routing, by reason.",
+        "counter",
+    );
+    for reason in RxDiscard::ALL {
+        line(
+            &mut out,
+            "sigtran_rx_discarded_total",
+            &[("reason", reason.label())],
+            rx_discards(reason),
+        );
+    }
+    help(
+        &mut out,
         "sigtran_tcap_send_errors_total",
         "TCAP messages the dialogue engine could not encode and did not send.",
         "counter",
@@ -1170,6 +1236,7 @@ mod tests {
             "sigtran_tcap_reject_total",
             "sigtran_tcap_discarded_total",
             "sigtran_tcap_send_errors_total",
+            "sigtran_rx_discarded_total",
             "sigtran_association_state",
             "sigtran_asp_state",
             "sigtran_linkset_available",

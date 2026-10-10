@@ -1793,6 +1793,259 @@ async fn wire_originates_sri_sm_and_correlates_the_response() {
     handle.shutdown();
 }
 
+// ── Scenario 8b-2: two nodes of this crate, each starting a dialogue toward ───
+//     the other over one association. The ASP side (`role: client`) begins and
+//     the SG side ends, then the SG side begins and the ASP side ends: the
+//     answer to a dialogue a node starts comes back on the association the
+//     Begin left on, in both roles.
+
+/// The SG side: PC 2000, owns the HLR subsystem, reaches PC 1000 over the
+/// association the other node opens.
+const PAIR_SG: &str = r#"
+node: { point_code: 2000, variant: ITU, network_indicator: international }
+associations:
+  - { id: asp, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+application_servers:
+  - { name: asp, traffic_mode: override, routing_context: 100, asps: [asp] }
+mtp3_routes:
+  - { dpc: 1000, as: asp, priority: 1 }
+sccp:
+  local_ssns: [6]
+"#;
+
+/// The ASP side: PC 1000, owns the MSC subsystem, connects to the SG.
+fn pair_asp(port: u16) -> String {
+    format!(
+        r#"
+node: {{ point_code: 1000, variant: ITU, network_indicator: international }}
+associations:
+  - {{ id: sg, adaptation: m3ua, role: client, addrs: [127.0.0.1], port: {port} }}
+application_servers:
+  - {{ name: sg, traffic_mode: override, routing_context: 100, asps: [sg] }}
+mtp3_routes:
+  - {{ dpc: 2000, as: sg, priority: 1 }}
+sccp:
+  local_ssns: [8]
+"#
+    )
+}
+
+/// Begin an SRI-SM from `from` (point code, subsystem) to `to` and return the
+/// peer's turn, or `None` if no answer came in five seconds.
+async fn begin_and_await(
+    handle: &TransportHandle,
+    from: (u32, SubsystemNumber),
+    to: (u32, SubsystemNumber),
+) -> Option<PeerTurn> {
+    let (done_tx, done_rx) = oneshot::channel();
+    let handler = Arc::new(WireOriginator {
+        op: gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        arg: sri_sm_arg("15559999"),
+        responder: std::sync::Mutex::new(Some(done_tx)),
+    });
+    let req = OutgoingBegin {
+        application_context: AC_SRI_SM.to_vec(),
+        called: SccpAddress::with_ssn(to.1, Some(to.0 as u16)),
+        calling: SccpAddress::with_ssn(from.1, Some(from.0 as u16)),
+        opc: from.0,
+        dpc: to.0,
+        ni: NetworkIndicator::International.bits(),
+        sls: 0,
+        ingress_assoc: String::new(),
+    };
+    handle
+        .origin_sender()
+        .send(Origination { req, handler })
+        .ok()?;
+    timeout(Duration::from_secs(5), done_rx).await.ok()?.ok()
+}
+
+/// The turn is an End carrying the SRI-SM result of [`WireHlr`].
+fn assert_sri_sm_answer(turn: &PeerTurn, who: &str) {
+    assert!(turn.is_end, "{who}: the answer is an End");
+    let imsi = turn.components.iter().find_map(|c| match c {
+        PeerComponent::Result { parameter, .. } => {
+            let res: RoutingInfoForSmRes = gsm_map::decode(parameter.as_ref()?.as_slice()).ok()?;
+            Some(res.imsi.to_vec())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        imsi,
+        Some(imsi_bytes(HLR_IMSI)),
+        "{who}: the result came back"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_two_nodes_answer_the_dialogues_each_starts() {
+    let Some(mut sg) = start_node(PAIR_SG, "wire_pair (sg)").await else {
+        return;
+    };
+    let mut sg_engine = DialogueEngine::new(Tcap::default());
+    sg_engine.register(
+        6,
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        Arc::new(WireHlr),
+    );
+    let sg_engine = Arc::new(sg_engine);
+    sg.serve_dialogues(sg_engine.clone());
+    sg.serve_originations(sg_engine.clone());
+
+    let port = sg.bound_addr("asp").expect("sg bound").port();
+    let Some(mut asp) = start_node(&pair_asp(port), "wire_pair (asp)").await else {
+        return;
+    };
+    let mut asp_engine = DialogueEngine::new(Tcap::default());
+    asp_engine.register(
+        8,
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        Arc::new(WireHlr),
+    );
+    let asp_engine = Arc::new(asp_engine);
+    asp.serve_dialogues(asp_engine.clone());
+    asp.serve_originations(asp_engine.clone());
+
+    assert!(
+        wait_route(
+            asp.router(),
+            2000,
+            &Destination::ApplicationServer("sg".into())
+        )
+        .await,
+        "the ASP side never went active"
+    );
+    assert!(
+        wait_route(
+            sg.router(),
+            1000,
+            &Destination::ApplicationServer("asp".into())
+        )
+        .await,
+        "the SG side never saw the ASP active"
+    );
+
+    let rx_before = metrics::msu_total(metrics::Dir::Rx, SI_SCCP);
+    let msc = (1000, SubsystemNumber::Msc);
+    let hlr = (2000, SubsystemNumber::Hlr);
+
+    // The ASP side begins, the SG side ends.
+    let turn = begin_and_await(&asp, msc, hlr)
+        .await
+        .expect("the ASP side got the answer to the dialogue it started");
+    assert_sri_sm_answer(&turn, "asp");
+
+    // The SG side begins on the same association, the ASP side ends. The pause
+    // puts the answer in an SCTP packet of its own, after the acknowledgement
+    // of the Begin has gone.
+    sleep(Duration::from_millis(400)).await;
+    let turn = begin_and_await(&sg, hlr, msc)
+        .await
+        .expect("the SG side got the answer to the dialogue it started");
+    assert_sri_sm_answer(&turn, "sg");
+
+    // And once more from each side: a second dialogue on a used association.
+    let turn = begin_and_await(&asp, msc, hlr).await.expect("asp, again");
+    assert_sri_sm_answer(&turn, "asp, again");
+    let turn = begin_and_await(&sg, hlr, msc).await.expect("sg, again");
+    assert_sri_sm_answer(&turn, "sg, again");
+
+    assert_eq!(asp_engine.open_dialogues(), 0);
+    assert_eq!(sg_engine.open_dialogues(), 0);
+    // Four Begins and four Ends were received, and every one was counted.
+    assert!(metrics::msu_total(metrics::Dir::Rx, SI_SCCP) >= rx_before + 8);
+
+    asp.shutdown();
+    sg.shutdown();
+}
+
+// ── Scenario 8b-3: what an association drops before routing is counted ────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_counts_what_it_drops_before_routing() {
+    use siphon_sigtran::metrics::RxDiscard;
+
+    let Some(handle) = start_node(TERMINATION_NODE, "wire_discards").await else {
+        return;
+    };
+    let ingress = handle.bound_addr("ingress").expect("ingress bound");
+    let Ok(assoc) = SctpAssociation::connect_with(ingress, &SctpConfig::new().nodelay(true)).await
+    else {
+        eprintln!("SKIP wire_discards: connect failed");
+        return;
+    };
+    let before = |reason| metrics::rx_discards(reason);
+    let (ppid, undecodable, out_of_state, no_payload) = (
+        before(RxDiscard::Ppid),
+        before(RxDiscard::Undecodable),
+        before(RxDiscard::OutOfState),
+        before(RxDiscard::NoPayload),
+    );
+
+    // DATA before the ASP is active (RFC 4666 4.3.4.3: the SG does not accept
+    // traffic from an ASP that is not ASP-ACTIVE).
+    let data = m3ua_sccp(&[0x09, 0x00], OPC_UPSTREAM, NODE_PC, 0);
+    assoc.send(&data, 1, PPID_M3UA).await.expect("send");
+
+    assoc
+        .send(&M3uaMessage::asp_up(None, None).encode(), 0, PPID_M3UA)
+        .await
+        .expect("send");
+    wait_m3ua(&assoc, MessageType::AspUpAck).await.expect("up");
+    assoc
+        .send(&M3uaMessage::asp_active(None, None).encode(), 0, PPID_M3UA)
+        .await
+        .expect("send");
+    wait_m3ua(&assoc, MessageType::AspActiveAck)
+        .await
+        .expect("active");
+
+    // A payload protocol identifier that is not M3UA's.
+    assoc.send(&data, 1, 99).await.expect("send");
+    // Octets that are not an M3UA message.
+    assoc
+        .send(&[0x01, 0x00, 0x01], 1, PPID_M3UA)
+        .await
+        .expect("send");
+    // A DATA message without the Protocol Data parameter (RFC 4666 3.3.1 makes
+    // it mandatory): common header, then a routing context alone.
+    let bare = [
+        0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x06, 0x00, 0x08, 0x00, 0x00, 0x00,
+        0x64,
+    ];
+    assoc.send(&bare, 1, PPID_M3UA).await.expect("send");
+
+    let counted = || {
+        metrics::rx_discards(RxDiscard::Ppid) > ppid
+            && metrics::rx_discards(RxDiscard::Undecodable) > undecodable
+            && metrics::rx_discards(RxDiscard::OutOfState) > out_of_state
+            && metrics::rx_discards(RxDiscard::NoPayload) > no_payload
+    };
+    for _ in 0..100 {
+        if counted() {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        metrics::rx_discards(RxDiscard::OutOfState) > out_of_state,
+        "DATA from an ASP that is not active"
+    );
+    assert!(metrics::rx_discards(RxDiscard::Ppid) > ppid, "foreign PPID");
+    assert!(
+        metrics::rx_discards(RxDiscard::Undecodable) > undecodable,
+        "not an M3UA message"
+    );
+    assert!(
+        metrics::rx_discards(RxDiscard::NoPayload) > no_payload,
+        "DATA without Protocol Data"
+    );
+    assert!(metrics::render().contains("sigtran_rx_discarded_total{reason=\"ppid\"}"));
+
+    drop(assoc);
+    handle.shutdown();
+}
+
 // ── Scenario 8c: full-flow sample captures (a concatenated SMS + a CAMEL ──────
 //     session). Assembled with the crate's own SS7 codecs — the same encoders a
 //     live node emits — so each dissects clean in Wireshark and shows the whole

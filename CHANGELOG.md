@@ -7,7 +7,29 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`sigtran_rx_discarded_total{reason}`**, and `metrics::RxDiscard` /
+  `rx_discard` / `rx_discards` behind it: every message an association receives
+  and drops before routing is counted, with a line on stderr that names the
+  association and says why.
+
 ### Fixed
+
+- **A received message was dropped without a count or a log line** in these
+  cases: a payload protocol identifier that is not the adaptation layer's, octets
+  that do not decode (M3UA, SUA, M2PA), DATA or a CLDT from an ASP that is not
+  active (RFC 4666 4.3.4.3) or user data on a link that is not in service, an
+  M3UA DATA without Protocol Data (RFC 4666 3.3.1), and an MSU for a local
+  subsystem that is not a UDT (an XUDT or LUDT among them: the dialogue engine
+  reads only a UDT). None of them is answered yet; all of them now show.
+- **An End or an Abort for a transaction that is not open** was counted
+  (`sigtran_tcap_discarded_total{reason="unknown-transaction"}`) and not logged.
+  It is the answer that arrives after an invoke timer has ended the dialogue, so
+  the line names the transaction.
+
+A test now runs two nodes of this crate against each other over kernel SCTP:
+the ASP side begins and the SG side ends, then the reverse, twice each.
 
 - **`variant: itu` did not load.** The reference, the quickstart and every
   cookbook write the variant in lower case, like every other keyword of

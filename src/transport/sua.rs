@@ -49,8 +49,9 @@ use tokio::sync::watch;
 use super::forward::dispatch;
 use super::framing::{self, PPID_SUA};
 use super::registry::AssocSlot;
-use super::TaskCtx;
+use super::{discard, TaskCtx};
 use crate::config::TrafficMode;
+use crate::metrics::RxDiscard;
 
 const CTRL_STREAM: u16 = 0;
 
@@ -92,11 +93,19 @@ pub async fn run_sg(
                     Err(_) => break,
                 };
                 if info.ppid != PPID_SUA {
+                    discard(
+                        RxDiscard::Ppid,
+                        &slot.id,
+                        format_args!("payload protocol identifier {}, not SUA", info.ppid),
+                    );
                     continue;
                 }
                 let msg = match SuaMessage::decode(&data) {
                     Ok(m) => m,
-                    Err(_) => continue,
+                    Err(error) => {
+                        discard(RxDiscard::Undecodable, &slot.id, error);
+                        continue;
+                    }
                 };
                 // SSNM is not part of the ASP state machine; handle it directly.
                 if is_ssnm(msg.message_type) {
@@ -132,11 +141,14 @@ pub async fn run_sg(
                             .send(&SuaMessage::heartbeat_ack(None).encode(), CTRL_STREAM, PPID_SUA)
                             .await;
                     }
-                    MessageType::Cldt | MessageType::Cldr => {
-                        if state == AspState::Active {
-                            deliver(&data, &ctx, &slot).await;
-                        }
+                    MessageType::Cldt | MessageType::Cldr if state == AspState::Active => {
+                        deliver(&data, &ctx, &slot).await;
                     }
+                    MessageType::Cldt | MessageType::Cldr => discard(
+                        RxDiscard::OutOfState,
+                        &slot.id,
+                        format_args!("{} while the ASP is {state:?}", msg.message_type),
+                    ),
                     MessageType::Error | MessageType::Notify => {
                         // Peer management notification; no state change here.
                     }
@@ -178,11 +190,19 @@ pub async fn run_asp(
                     Err(_) => break,
                 };
                 if info.ppid != PPID_SUA {
+                    discard(
+                        RxDiscard::Ppid,
+                        &slot.id,
+                        format_args!("payload protocol identifier {}, not SUA", info.ppid),
+                    );
                     continue;
                 }
                 let msg = match SuaMessage::decode(&data) {
                     Ok(m) => m,
-                    Err(_) => continue,
+                    Err(error) => {
+                        discard(RxDiscard::Undecodable, &slot.id, error);
+                        continue;
+                    }
                 };
                 match msg.message_type {
                     MessageType::AspUpAck => {
@@ -211,11 +231,14 @@ pub async fn run_asp(
                             .await;
                     }
                     MessageType::HeartbeatAck => {}
-                    MessageType::Cldt | MessageType::Cldr => {
-                        if slot.is_carrying() {
-                            deliver(&data, &ctx, &slot).await;
-                        }
+                    MessageType::Cldt | MessageType::Cldr if slot.is_carrying() => {
+                        deliver(&data, &ctx, &slot).await;
                     }
+                    MessageType::Cldt | MessageType::Cldr => discard(
+                        RxDiscard::OutOfState,
+                        &slot.id,
+                        format_args!("{} before the ASP is active", msg.message_type),
+                    ),
                     MessageType::Notify => {
                         // Status notification from the SG; no state change here.
                     }
@@ -232,18 +255,13 @@ pub async fn run_asp(
 
 /// Bridge an inbound CLDT/CLDR to an [`Msu`](super::Msu) carrying the equivalent
 /// SCCP message and route it through the shared dispatch. A decode failure is
-/// logged, never silently dropped.
+/// counted and logged, never silently dropped.
 async fn deliver(data: &[u8], ctx: &TaskCtx, slot: &Arc<AssocSlot>) {
     let node_pc = ctx.router.node_point_code(&ctx.tenant).unwrap_or(0);
     let node_ni = ctx.router.node_network_indicator(&ctx.tenant);
     match framing::extract_sua(data, node_pc, node_ni) {
         Ok(msu) => dispatch(msu, ctx, &slot.id).await,
-        Err(e) => {
-            eprintln!(
-                "siphon-sigtran: sua CLDT/CLDR decode failed on `{}`: {e}",
-                slot.id
-            );
-        }
+        Err(error) => discard(RxDiscard::NoPayload, &slot.id, error),
     }
 }
 

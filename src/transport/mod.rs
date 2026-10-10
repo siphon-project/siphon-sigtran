@@ -453,6 +453,16 @@ async fn accept_loop(
     }
 }
 
+/// Count and log one message received on `assoc` and dropped before routing. A
+/// received message is never dropped without both.
+pub(crate) fn discard(reason: metrics::RxDiscard, assoc: &str, detail: impl std::fmt::Display) {
+    metrics::rx_discard(reason);
+    eprintln!(
+        "siphon-sigtran: dropped a message received on `{assoc}` ({}): {detail}",
+        reason.label()
+    );
+}
+
 /// Parse an association's `addrs` + `port` into socket addresses.
 fn socket_addrs(a: &Association) -> Result<Vec<SocketAddr>> {
     a.addrs

@@ -1477,3 +1477,45 @@ fn dialogue_timer_ages_out_an_idle_dialogue() {
     );
     assert_eq!(e.open_dialogues(), 0);
 }
+
+/// What the engine is handed and does not read is counted, never dropped in
+/// silence: an XUDT for a local subsystem (only a UDT is read), octets that are
+/// not SCCP, and an MSU of another user part.
+#[test]
+fn a_local_message_the_engine_does_not_read_is_counted() {
+    use siphon_sigtran::metrics::RxDiscard;
+
+    let e = DialogueEngine::new(Tcap::default());
+    let before = metrics::rx_discards(RxDiscard::NotUnitdata);
+
+    let called = SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Hlr));
+    let calling = SccpAddress::with_gt(gt(PEER_GT), Some(SubsystemNumber::Msc));
+    let xudt = SccpMessage::Xudt(sccp::ExtendedUnitData::new(
+        called,
+        calling,
+        vec![0x62, 0x00],
+    ))
+    .encode()
+    .expect("encode xudt");
+    assert!(e.deliver(&msu(xudt), "peer").is_empty());
+    assert!(e.deliver(&msu(vec![0xFF, 0x00]), "peer").is_empty());
+    let mut isup = msu(vec![0x00, 0x01]);
+    isup.si = 5;
+    assert!(e.deliver(&isup, "peer").is_empty());
+
+    assert!(metrics::rx_discards(RxDiscard::NotUnitdata) >= before + 3);
+}
+
+/// An End for a transaction that is not open (the answer that arrives after the
+/// dialogue timed out) is discarded as Table 7/Q.774 has it, and counted.
+#[test]
+fn an_end_for_a_transaction_that_is_not_open_is_counted() {
+    let e = DialogueEngine::new(Tcap::default());
+    let before = metrics::tcap_discards(metrics::TcapDiscard::UnknownTransaction);
+    let late = end_msu(
+        &[0x80, 0x00, 0x00, 0x03],
+        vec![return_result(46, mo_forward_sm_res(), 1)],
+    );
+    assert!(e.deliver(&late, "peer").is_empty());
+    assert!(metrics::tcap_discards(metrics::TcapDiscard::UnknownTransaction) > before);
+}
