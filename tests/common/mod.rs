@@ -547,8 +547,32 @@ pub struct Dissection {
 }
 
 impl Dissection {
+    /// Every occurrence of `name`. A few fields were renamed between Wireshark
+    /// 4.2 and 4.6; when the newer name is not in the dissection, the name the
+    /// older release gives the same field is looked up instead.
     fn all(&self, name: &str) -> Vec<&Field> {
-        self.fields.iter().filter(|f| f.name == name).collect()
+        let named = |wanted: &str| -> Vec<&Field> {
+            self.fields.iter().filter(|f| f.name == wanted).collect()
+        };
+        let found = named(name);
+        if !found.is_empty() {
+            return found;
+        }
+        match Self::name_before_4_6(name) {
+            Some(older) => named(older),
+            None => found,
+        }
+    }
+
+    fn name_before_4_6(name: &str) -> Option<&'static str> {
+        match name {
+            "tcap.aarq_application_context_name" | "tcap.aare_application_context_name" => {
+                Some("tcap.application_context_name")
+            }
+            "camel.invokeProblem" => Some("camel.invoke"),
+            "inap.invokeProblem" => Some("inap.invoke"),
+            _ => None,
+        }
     }
 
     /// The field is present at least once.
