@@ -1038,25 +1038,25 @@ dependencies = [
 
 [[package]]
 name = "gsm_cap"
-version = "2.0.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "727ac70a6dbf9a2e0fd96f8fdf63fb0cd04fe52d1ab90ecadcb337f1934c9110"
+checksum = "6c6cc4e0d6df2c2a825f65c5a8c31759203f309fa2a823c13c4b81828663e7f3"
 dependencies = [
- "inap 1.1.0",
+ "inap",
  "rasn",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "gsm_map"
-version = "2.0.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c33c2052de75938b6264f14a5e7ba714ccae4411ed070ddf6fcf89e8c79041e"
+checksum = "e5f4a773ade83f2cf0dde54e5c6b7faf3b2a70edb451dbd891f79d60656c87f5"
 dependencies = [
  "hex",
  "rasn",
  "sccp",
- "tcap 1.0.0",
+ "tcap",
  "thiserror 2.0.20",
 ]
 
@@ -1404,16 +1404,6 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
-]
-
-[[package]]
-name = "inap"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d377252b44d8202a736736b49896653055903646d14c33bec33824af01476729"
-dependencies = [
- "rasn",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3027,7 +3017,7 @@ dependencies = [
  "criterion",
  "gsm_cap",
  "gsm_map",
- "inap 2.0.0",
+ "inap",
  "itu-isup",
  "m2pa",
  "m3ua",
@@ -3040,7 +3030,7 @@ dependencies = [
  "serde_yaml",
  "siphon-sip",
  "sua",
- "tcap 2.0.0",
+ "tcap",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -3317,17 +3307,6 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
-
-[[package]]
-name = "tcap"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b0b3ae9ef7e1f435857ee51059c1db6a30f512b450ad232bf63e4ad84b3090a"
-dependencies = [
- "hex",
- "rasn",
- "thiserror 2.0.20",
-]
 
 [[package]]
 name = "tcap"
