@@ -7,7 +7,9 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
-This will be **2.0.0**: public items of the dialogue engine change type, and the
+## [2.0.0] — 2026-10-10
+
+A major release: public items of the dialogue engine change type, and the
 Python layer changes with them. The engine moves to `tcap` 2, whose decoder no
 longer returns a message that lost part of itself, and with that this crate stops
 doing three things that were wrong on the wire.
