@@ -714,4 +714,83 @@ mod tests {
             other => panic!("expected a UDT, got {other:?}"),
         }
     }
+
+    // The octets in the two tests below are written out by hand from Q.713
+    // 3.4.2.3: two address signals per octet, the earlier one in the low half,
+    // encoding scheme 1 (odd) or 2 (even), filler 0000 after an odd count.
+
+    /// The called party address of a UDT, as it is on the wire.
+    fn called_octets(payload: &[u8]) -> &[u8] {
+        let start = 2 + usize::from(payload[2]);
+        let len = usize::from(payload[start]);
+        &payload[start + 1..start + 1 + len]
+    }
+
+    #[test]
+    fn a_rewritten_title_says_how_many_digits_it_has() {
+        // rewrite_cdpa_gt puts a title of another length in place of the one that
+        // came in: the odd/even indication has to follow the new digits, or the
+        // next node reads the title one digit short.
+        let udt = UnitData::new(
+            SccpAddress::with_gt(gt("15550100123"), Some(SubsystemNumber::Hlr)),
+            SccpAddress::with_gt(gt("15550170"), Some(SubsystemNumber::Msc)),
+            vec![0xAA],
+        );
+        let payload = SccpMessage::Udt(udt).encode().unwrap();
+        assert_eq!(
+            called_octets(&payload),
+            [0x12, 0x06, 0x00, 0x11, 0x04, 0x51, 0x55, 0x10, 0x00, 0x21, 0x03],
+            "eleven digits: scheme 1, filler 0"
+        );
+
+        let even = rewrite_called_gt(&payload, "155501001234").expect("rewrite applies");
+        assert_eq!(
+            called_octets(&even),
+            [0x12, 0x06, 0x00, 0x12, 0x04, 0x51, 0x55, 0x10, 0x00, 0x21, 0x43],
+            "twelve digits: scheme 2, every half octet a digit"
+        );
+        let odd = rewrite_called_gt(&even, "15550100123").expect("rewrite applies");
+        assert_eq!(called_octets(&odd), called_octets(&payload));
+    }
+
+    #[test]
+    fn a_received_title_is_read_by_its_odd_even_indication() {
+        // Global title translation matches on these digits: a filler must not
+        // become a digit, and the last digit of an even title must not be lost.
+        let msu = |called: &[u8]| {
+            let mut payload = vec![0x09, 0x00, 0x03, 0x00, 0x00];
+            payload[3] = 3 + called.len() as u8;
+            payload[4] = 5 + called.len() as u8;
+            payload.push(called.len() as u8);
+            payload.extend_from_slice(called);
+            payload.extend_from_slice(&[0x02, 0x42, 0x08, 0x01, 0xAA]);
+            Msu {
+                opc: 4000,
+                dpc: 1000,
+                si: framing::SI_SCCP,
+                ni: 0,
+                mp: 0,
+                sls: 0,
+                payload,
+            }
+        };
+        let digits = |called: &[u8]| {
+            inbound_from_msu(&msu(called))
+                .cdpa
+                .expect("a called global title")
+                .digits
+        };
+        assert_eq!(
+            digits(&[0x12, 0x06, 0x00, 0x12, 0x04, 0x51, 0x55, 0x10, 0x00, 0x21]),
+            "1555010012"
+        );
+        assert_eq!(
+            digits(&[0x12, 0x06, 0x00, 0x11, 0x04, 0x51, 0x55, 0x10, 0x00, 0x21, 0x03]),
+            "15550100123"
+        );
+        assert_eq!(
+            digits(&[0x12, 0x06, 0x00, 0x12, 0x04, 0x51, 0x55, 0x10, 0x00, 0x21, 0x43]),
+            "155501001234"
+        );
+    }
 }

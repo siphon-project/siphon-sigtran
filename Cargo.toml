@@ -30,7 +30,7 @@ m3ua = "1"
 # M2PA (RFC 4165): MTP3 over SCTP. Phase-2 transport.
 m2pa = "1"
 # SCCP (Q.71x): global titles, addresses, UDT. Drives the GTT resolver.
-sccp = "1"
+sccp = "1.1.1"
 # SUA (RFC 3868): IP adaptation of the SCCP user (TCAP) with GT/SSN/PC addressing.
 # The connectionless set (CLDT/CLDR) bridges one-for-one to SCCP UDT/UDTS, so a
 # `sua` Application Server routes through the same GTT / content / termination

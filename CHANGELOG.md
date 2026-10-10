@@ -30,6 +30,22 @@ All notable changes are documented here. The format follows
 
 ### Fixed
 
+- **A global title with an even number of digits lost its last digit on the
+  wire.** Every title the node built (`gsm_map.begin` / `gsm_cap.begin` /
+  `inap.begin`, `node.originate`, `ss7.gt()`) and every title a content rule
+  rewrote with `rewrite_cdpa_gt` went out with the odd/even indication it was
+  constructed or received with, not the one its digits have, so a title of ten or
+  twelve digits was marked odd and the next node read it one digit short
+  (ITU-T Q.713 3.4.2.3). The fault and the fix are in the `sccp` codec, 1.1.1:
+  the indication follows the digit count, and the filler after an odd count is
+  `0000`.
+- **A received title with an odd number of digits gained a trailing `0`** when
+  the peer wrote the filler as Q.713 has it, so global title translation and
+  content rules matched on a digit that was never sent. Fixed by the same `sccp`
+  release, which reads the title by its odd/even indication.
+
+A node on this release and a node on 2.0.0 disagree about an odd title by that
+one `0`, in the direction of the older node.
 - **A received message was dropped without a count or a log line** in these
   cases: a payload protocol identifier that is not the adaptation layer's, octets
   that do not decode (M3UA, SUA, M2PA), DATA or a CLDT from an ASP that is not
