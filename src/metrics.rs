@@ -239,15 +239,17 @@ pub fn gtt_errors(reason: GttError) -> u64 {
 static ACTIVE_DIALOGUES: AtomicI64 = AtomicI64::new(0);
 static DIALOGUE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
-/// A source that aborted a dialogue, for [`abort`].
+/// Who aborted a dialogue, for [`abort`]: the coarse view (the detailed one is
+/// [`tcap_abort`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortSource {
-    /// The dialogue user aborted (ABRT, dialogue-service-user).
+    /// The peer's TC-user aborted (an Abort with user abort information, or
+    /// with no reason at all).
     User,
-    /// The dialogue provider aborted (ABRT, dialogue-service-provider), or a
-    /// TCAP P-Abort.
+    /// The peer's TCAP aborted: a P-Abort from its transaction sub-layer, or an
+    /// ABRT / refusing AARE its component sub-layer built.
     Provider,
-    /// The node itself aborted (no handler, over the dialogue ceiling, malformed).
+    /// This node aborted, whatever the kind of Abort it sent.
     Local,
 }
 
@@ -300,6 +302,241 @@ pub fn abort(source: AbortSource) {
 /// The count of aborts from the given source.
 pub fn aborts(source: AbortSource) -> u64 {
     ABORTS[source.index()].load(Ordering::Relaxed)
+}
+
+// ── Content rules: messages that could not be evaluated ──────────────────────
+
+static CONTENT_UNDECODABLE: AtomicU64 = AtomicU64::new(0);
+static CONTENT_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one TCAP `Begin` / `Continue` dropped in a domain with content rules
+/// because it could not be decoded in full.
+pub fn content_undecodable() {
+    CONTENT_UNDECODABLE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of messages dropped because the content layer could not decode
+/// them in full.
+pub fn content_undecodable_total() -> u64 {
+    CONTENT_UNDECODABLE.load(Ordering::Relaxed)
+}
+
+/// Count one segment of a segmented XUDT / LUDT that went through a domain with
+/// content rules without being evaluated against them.
+pub fn content_segment_unscreened() {
+    CONTENT_SEGMENTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of segments that passed a domain with content rules unevaluated.
+pub fn content_segments_unscreened() -> u64 {
+    CONTENT_SEGMENTS.load(Ordering::Relaxed)
+}
+
+// ── TCAP protocol counters (dialogue engine) ─────────────────────────────────
+
+/// What an Abort message carried, for [`tcap_abort`]. The set is closed: a
+/// P-Abort cause Q.773 does not name counts as [`OtherPAbort`](Self::OtherPAbort)
+/// and user abort information in a user-defined syntax as
+/// [`UserDefined`](Self::UserDefined), so a peer cannot grow the label space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortCause {
+    /// P-Abort, unrecognizedMessageType (0).
+    UnrecognizedMessageType,
+    /// P-Abort, unrecognizedTransactionID (1).
+    UnrecognizedTransactionId,
+    /// P-Abort, badlyFormattedTransactionPortion (2).
+    BadlyFormattedTransactionPortion,
+    /// P-Abort, incorrectTransactionPortion (3).
+    IncorrectTransactionPortion,
+    /// P-Abort, resourceLimitation (4).
+    ResourceLimitation,
+    /// P-Abort with a cause value Q.773 does not name.
+    OtherPAbort,
+    /// U-Abort without user abort information.
+    NoInformation,
+    /// U-Abort carrying an ABRT APDU, abort-source dialogue-service-user.
+    AbrtUser,
+    /// U-Abort carrying an ABRT APDU, abort-source dialogue-service-provider
+    /// (an abnormal dialogue, Q.774 3.2.2.1).
+    AbrtProvider,
+    /// U-Abort carrying a refusing AARE APDU.
+    AareReject,
+    /// U-Abort carrying information in a user-defined abstract syntax.
+    UserDefined,
+}
+
+impl AbortCause {
+    const ALL: [AbortCause; 11] = [
+        Self::UnrecognizedMessageType,
+        Self::UnrecognizedTransactionId,
+        Self::BadlyFormattedTransactionPortion,
+        Self::IncorrectTransactionPortion,
+        Self::ResourceLimitation,
+        Self::OtherPAbort,
+        Self::NoInformation,
+        Self::AbrtUser,
+        Self::AbrtProvider,
+        Self::AareReject,
+        Self::UserDefined,
+    ];
+
+    /// The cause for a P-Abort cause value (Table 12/Q.773).
+    pub fn from_p_abort(value: i64) -> Self {
+        match value {
+            0 => Self::UnrecognizedMessageType,
+            1 => Self::UnrecognizedTransactionId,
+            2 => Self::BadlyFormattedTransactionPortion,
+            3 => Self::IncorrectTransactionPortion,
+            4 => Self::ResourceLimitation,
+            _ => Self::OtherPAbort,
+        }
+    }
+
+    /// Whether this is a P-Abort (the transaction sub-layer aborted) as opposed
+    /// to a U-Abort (the component sub-layer or the TC-user did).
+    pub fn is_p_abort(self) -> bool {
+        (self as usize) <= (Self::OtherPAbort as usize)
+    }
+
+    /// The `kind` label value: `p-abort` or `u-abort`.
+    pub fn kind(self) -> &'static str {
+        if self.is_p_abort() {
+            "p-abort"
+        } else {
+            "u-abort"
+        }
+    }
+
+    /// The `cause` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnrecognizedMessageType => "unrecognized-message-type",
+            Self::UnrecognizedTransactionId => "unrecognized-transaction-id",
+            Self::BadlyFormattedTransactionPortion => "badly-formatted-transaction-portion",
+            Self::IncorrectTransactionPortion => "incorrect-transaction-portion",
+            Self::ResourceLimitation => "resource-limitation",
+            Self::OtherPAbort => "other",
+            Self::NoInformation => "none",
+            Self::AbrtUser => "abrt-user",
+            Self::AbrtProvider => "abrt-provider",
+            Self::AareReject => "aare-reject",
+            Self::UserDefined => "user-defined",
+        }
+    }
+}
+
+// [dir][cause]
+static TCAP_ABORTS: [[AtomicU64; 11]; 2] = [
+    [const { AtomicU64::new(0) }; 11],
+    [const { AtomicU64::new(0) }; 11],
+];
+
+/// Count one Abort message received (`Rx`) or sent (`Tx`), by what it carried.
+pub fn tcap_abort(dir: Dir, cause: AbortCause) {
+    TCAP_ABORTS[dir as usize][cause as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of Abort messages in a direction with the given cause.
+pub fn tcap_aborts(dir: Dir, cause: AbortCause) -> u64 {
+    TCAP_ABORTS[dir as usize][cause as usize].load(Ordering::Relaxed)
+}
+
+/// The problem class of a Reject component (Table 25/Q.773), for
+/// [`tcap_reject`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectClass {
+    /// generalProblem.
+    General,
+    /// invokeProblem.
+    Invoke,
+    /// returnResultProblem.
+    ReturnResult,
+    /// returnErrorProblem.
+    ReturnError,
+}
+
+impl RejectClass {
+    const ALL: [RejectClass; 4] = [
+        Self::General,
+        Self::Invoke,
+        Self::ReturnResult,
+        Self::ReturnError,
+    ];
+
+    /// The `problem` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Invoke => "invoke",
+            Self::ReturnResult => "return-result",
+            Self::ReturnError => "return-error",
+        }
+    }
+}
+
+// [dir][class]
+static TCAP_REJECTS: [[AtomicU64; 4]; 2] = [
+    [const { AtomicU64::new(0) }; 4],
+    [const { AtomicU64::new(0) }; 4],
+];
+
+/// Count one Reject component received (`Rx`) or sent (`Tx`).
+pub fn tcap_reject(dir: Dir, class: RejectClass) {
+    TCAP_REJECTS[dir as usize][class as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of Reject components in a direction with the given problem class.
+pub fn tcap_rejects(dir: Dir, class: RejectClass) -> u64 {
+    TCAP_REJECTS[dir as usize][class as usize].load(Ordering::Relaxed)
+}
+
+/// Why a received TCAP message was discarded without an answer, for
+/// [`tcap_discard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcapDiscard {
+    /// The message could not be decoded and Q.774 calls for no response (the
+    /// originating transaction ID is not derivable, or it is an End, an Abort
+    /// or a Unidirectional).
+    Undecodable,
+    /// An End or an Abort for a transaction ID that is not assigned here.
+    UnknownTransaction,
+}
+
+impl TcapDiscard {
+    const ALL: [TcapDiscard; 2] = [Self::Undecodable, Self::UnknownTransaction];
+
+    /// The `reason` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Undecodable => "undecodable",
+            Self::UnknownTransaction => "unknown-transaction",
+        }
+    }
+}
+
+static TCAP_DISCARDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Count one received TCAP message discarded without an answer.
+pub fn tcap_discard(reason: TcapDiscard) {
+    TCAP_DISCARDS[reason as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of received TCAP messages discarded for the given reason.
+pub fn tcap_discards(reason: TcapDiscard) -> u64 {
+    TCAP_DISCARDS[reason as usize].load(Ordering::Relaxed)
+}
+
+static TCAP_SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one TCAP message the dialogue engine could not encode, and therefore
+/// did not send.
+pub fn tcap_send_error() {
+    TCAP_SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of TCAP messages that could not be encoded.
+pub fn tcap_send_errors() -> u64 {
+    TCAP_SEND_ERRORS.load(Ordering::Relaxed)
 }
 
 // ── Labelled, low-frequency families (mutex-guarded maps) ────────────────────
@@ -626,6 +863,87 @@ pub fn render() -> String {
         );
     }
 
+    help(
+        &mut out,
+        "sigtran_content_unscreened_total",
+        "Messages the content rules could not be evaluated on, by reason and what was done.",
+        "counter",
+    );
+    line(
+        &mut out,
+        "sigtran_content_unscreened_total",
+        &[("reason", "undecodable"), ("action", "dropped")],
+        content_undecodable_total(),
+    );
+    line(
+        &mut out,
+        "sigtran_content_unscreened_total",
+        &[("reason", "segmented"), ("action", "passed")],
+        content_segments_unscreened(),
+    );
+    help(
+        &mut out,
+        "sigtran_tcap_abort_total",
+        "TCAP Abort messages, by direction, kind (p-abort / u-abort) and cause.",
+        "counter",
+    );
+    for dir in [Dir::Rx, Dir::Tx] {
+        for cause in AbortCause::ALL {
+            line(
+                &mut out,
+                "sigtran_tcap_abort_total",
+                &[
+                    ("dir", dir.label()),
+                    ("kind", cause.kind()),
+                    ("cause", cause.label()),
+                ],
+                tcap_aborts(dir, cause),
+            );
+        }
+    }
+    help(
+        &mut out,
+        "sigtran_tcap_reject_total",
+        "TCAP Reject components, by direction and problem class.",
+        "counter",
+    );
+    for dir in [Dir::Rx, Dir::Tx] {
+        for class in RejectClass::ALL {
+            line(
+                &mut out,
+                "sigtran_tcap_reject_total",
+                &[("dir", dir.label()), ("problem", class.label())],
+                tcap_rejects(dir, class),
+            );
+        }
+    }
+    help(
+        &mut out,
+        "sigtran_tcap_discarded_total",
+        "Received TCAP messages discarded without an answer, by reason.",
+        "counter",
+    );
+    for reason in TcapDiscard::ALL {
+        line(
+            &mut out,
+            "sigtran_tcap_discarded_total",
+            &[("reason", reason.label())],
+            tcap_discards(reason),
+        );
+    }
+    help(
+        &mut out,
+        "sigtran_tcap_send_errors_total",
+        "TCAP messages the dialogue engine could not encode and did not send.",
+        "counter",
+    );
+    line(
+        &mut out,
+        "sigtran_tcap_send_errors_total",
+        &[],
+        tcap_send_errors(),
+    );
+
     // Labelled families.
     let guard = labelled();
     if let Some(m) = guard.as_ref() {
@@ -847,6 +1165,11 @@ mod tests {
             "sigtran_active_dialogues",
             "sigtran_dialogue_timeouts_total",
             "sigtran_abort_total",
+            "sigtran_content_unscreened_total",
+            "sigtran_tcap_abort_total",
+            "sigtran_tcap_reject_total",
+            "sigtran_tcap_discarded_total",
+            "sigtran_tcap_send_errors_total",
             "sigtran_association_state",
             "sigtran_asp_state",
             "sigtran_linkset_available",
@@ -862,6 +1185,36 @@ mod tests {
                 "missing family {family}"
             );
         }
+    }
+
+    #[test]
+    fn abort_causes_split_into_p_abort_and_u_abort_with_a_closed_label_set() {
+        assert_eq!(AbortCause::from_p_abort(4), AbortCause::ResourceLimitation);
+        // A cause value Q.773 does not name never becomes a label of its own.
+        assert_eq!(AbortCause::from_p_abort(99), AbortCause::OtherPAbort);
+        assert_eq!(AbortCause::from_p_abort(-1).label(), "other");
+        for cause in AbortCause::ALL {
+            let p = matches!(
+                cause,
+                AbortCause::UnrecognizedMessageType
+                    | AbortCause::UnrecognizedTransactionId
+                    | AbortCause::BadlyFormattedTransactionPortion
+                    | AbortCause::IncorrectTransactionPortion
+                    | AbortCause::ResourceLimitation
+                    | AbortCause::OtherPAbort
+            );
+            assert_eq!(cause.kind(), if p { "p-abort" } else { "u-abort" });
+        }
+        let before = tcap_aborts(Dir::Rx, AbortCause::AbrtUser);
+        tcap_abort(Dir::Rx, AbortCause::AbrtUser);
+        assert_eq!(tcap_aborts(Dir::Rx, AbortCause::AbrtUser), before + 1);
+        let text = render();
+        assert!(text
+            .contains("sigtran_tcap_abort_total{dir=\"rx\",kind=\"u-abort\",cause=\"abrt-user\"}"));
+        assert!(text.contains(
+            "sigtran_tcap_abort_total{dir=\"tx\",kind=\"p-abort\",cause=\"resource-limitation\"}"
+        ));
+        assert!(text.contains("sigtran_tcap_reject_total{dir=\"tx\",problem=\"general\"}"));
     }
 
     #[test]

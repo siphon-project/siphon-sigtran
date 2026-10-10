@@ -140,19 +140,41 @@ an SCP stages toward the gsmSSF.
 
 | Name | Operation | Op code |
 |---|---|---|
-| `initial-dp` | A CAMEL initialDP. Handler is `def on(dlg, idp)`, `idp` a decoded [`IncomingOp`](#incomingop) (with `.called_party_number`). | 0 |
+| `initial-dp` | A CAMEL initialDP. Handler is `def on(dlg, idp)`, `idp` a decoded [`IncomingOp`](#incomingop) (with `.service_key`, `.called_party_bcd_number`, `.called_party_number`). | 0 |
 | `event-report-bcsm` | An EventReportBCSM the gsmSSF sends when an armed detection point fires. | 24 |
 
 | Invoke builder | Stages |
 |---|---|
-| `gsm_cap.connect(destination_routing_address=[…])` | Connect: reroute the call to a list of called-party numbers (each an E.164 digit string or raw bytes). |
+| `gsm_cap.connect(destination_routing_address=[…], original_called_party_id=None)` | Connect: reroute the call. The list holds the one called-party number TS 29.078 allows, an E.164 digit string or raw bytes. |
 | `gsm_cap.release_call(cause=…)` | ReleaseCall: tear the call down with a Q.850 cause. |
-| `gsm_cap.request_report_bcsm_event(events=[(event_type, monitor_mode), …])` | RequestReportBCSMEvent: arm detection points (integers per TS 29.078). |
-| `gsm_cap.apply_charging(charging_characteristics=…, party_to_charge=None)` | ApplyCharging: an online-charging control. |
+| `gsm_cap.request_report_bcsm_event(events=[…])` | RequestReportBCSMEvent: arm detection points. Each event is `(event_type, monitor_mode)` or `(event_type, monitor_mode, leg)` (integers per TS 29.078); the leg goes out as `legID [2] { sendingSideID [0] }`. A disconnect is armed per leg. |
+| `gsm_cap.apply_charging(max_call_period_duration=…, release_if_duration_exceeded=None, tariff_switch_interval=None, tone=None, party_to_charge=None, phase=None)` | ApplyCharging with time-duration charging: a call period in units of 100 ms, metered on leg `party_to_charge`. See below for the CAMEL phase. `charging_characteristics=` takes an already encoded CAMEL-AChBillingChargingCharacteristics value in place of the typed keywords. |
+| `gsm_cap.continue_()` | Continue: let the call proceed. |
 
 Stage several in one dialogue (a RequestReportBCSMEvent then a Connect) with
 repeated `dlg.invoke(...)`, then `dlg.end()`. See
 [Building a CAMEL SCP](cookbook/scp.md#beyond-a-fixed-connect).
+
+**ApplyCharging and the CAMEL phase.** The charging characteristics are not the
+same octets in CAMEL phase 3 and phase 4 (the warning tone is `tone [3] BOOLEAN`
+in one and `audibleIndicator [3]`, a constructed choice, in the other), and a
+gsmSSF reads the form of the phase its dialogue runs under. So the typed
+`apply_charging` is encoded when it is staged on a dialogue, from that dialogue's
+application context: phase 3 under `0.4.0.0.1.21.3.x`, phase 4 under
+`0.4.0.0.1.23.3.x`. Under any other context (phase 1 and 2 have another form
+again, which is not modelled) it cannot be encoded: the turn's answer is dropped
+as a whole, logged as an error, and a `Begin` left unanswered that way is
+aborted, so a call is not let through without its charging instruction. `phase=3`
+or `phase=4` fixes the phase regardless of the context.
+
+`gsm_cap.AC.gsm_ssf_scf` is the phase 3 generic context (`0.4.0.0.1.21.3.4`),
+`gsm_cap.AC.gsm_ssf_scf_phase4` the phase 4 one (`0.4.0.0.1.23.3.4`).
+
+The InitialDP getters (`service_key`, `called_party_bcd_number`,
+`called_party_number`) decode the argument strictly and raise
+[`MistypedParameter`](#mistyped) when it does not decode. A mobile-originated
+call carries what was dialled in `called_party_bcd_number`; `called_party_number`
+is there on forwarded and terminating calls.
 
 ## `inap` { #inap }
 
@@ -171,11 +193,28 @@ argument off the [`IncomingOp`](#incomingop) `inap_*` getters (`inap_service_key
 | `call-information-report` | CallInformationReport | 44 |
 | `specialized-resource-report` | SpecializedResourceReport | 49 |
 
-The SCF invoke builders an SCP stages toward the SSF (`inap.connect`,
-`inap.request_report_bcsm_event`, `inap.apply_charging`, `inap.release_call`,
-`inap.play_announcement`, `inap.prompt_and_collect_user_information`,
-`inap.connect_to_resource`, `inap.continue_()`) stage the same way as `gsm_cap`'s,
-with `inap.AC` supplying the application contexts.
+The SCF invoke builders an SCP stages toward the SSF stage the same way as
+`gsm_cap`'s:
+
+| Call | Stages |
+|---|---|
+| `inap.connect(destination_routing_address=[…], original_called_party_id=None)` | Connect. ETS 300 374-1 allows one destination, Q.1218 up to three. |
+| `inap.request_report_bcsm_event(events=[…])` | RequestReportBCSMEvent. Each event is `(event_type_bcsm, monitor_mode)` or `(event_type_bcsm, monitor_mode, leg)`; the leg goes out as `legID [2] { sendingSideID [0] }`. Event types 1 to 18 of Q.1218, including `origAttemptAuthorized` (1), `oMidCall` (8) and `tMidCall` (16). |
+| `inap.apply_charging(charging_characteristics=…, party_to_charge=None)` | ApplyCharging. |
+| `inap.release_call(cause=…)` | ReleaseCall with a Q.850 cause. |
+| `inap.continue_()` | Continue. |
+| `inap.play_announcement(message_id=… \| tone_id=…, tone_duration=… \| information_to_send=…)` | PlayAnnouncement. What to send is a typed choice: an elementary announcement id, a tone, or the BER of an `InformationToSend` value (decoded and refused if it is not one). |
+| `inap.prompt_and_collect_user_information(maximum_digits=…, minimum_digits=None \| collected_info=…, …)` | PromptAndCollectUserInformation, with an optional prompt given as for `play_announcement`. |
+| `inap.connect_to_resource(ip_routing_address=None)` | ConnectToResource, to that address or to the SRF colocated with the SSF. |
+
+`inap.AC` supplies the application contexts of ETS 300 374-1 clause 6.5:
+`inap.AC.ssp_to_scp` (`0.4.0.1.1.1.0.0`), `inap.AC.assist_handoff_ssp_to_scp`
+(`0.4.0.1.1.1.1.0`) and `inap.AC.ip_to_scp` (`0.4.0.1.1.1.2.0`). A terminated
+dialogue answers with the context the SSF proposed.
+
+The `inap_*` getters decode the InitialDP strictly and raise
+[`MistypedParameter`](#mistyped) when it does not decode: a member that cannot be
+read, a member the argument does not have, a missing `serviceKey`.
 
 ## The `Dialogue` handle { #dialogue }
 
@@ -186,17 +225,48 @@ encoding stays in Rust.
 
 | Method | Stages / does |
 |---|---|
-| `dlg.invoke(staged)` | Stage an `Invoke` from an invoke builder (`gsm_map.insert_subscriber_data(...)`, `gsm_cap.connect(...)`), e.g. the ISD leg of a held-open updateLocation. |
+| `dlg.invoke(staged, *, operation_class=None, timeout=None)` | Stage an `Invoke` from an invoke builder (`gsm_map.insert_subscriber_data(...)`, `gsm_cap.connect(...)`), e.g. the ISD leg of a held-open updateLocation. The builder knows the class of its operation (`staged.operation_class`); `operation_class=` (1 to 4) overrides it, `timeout=` is the invocation timer in seconds (default `tcap.invoke_timer_ms`). |
 | `dlg.reply(result)` | Stage a `ReturnResultLast` answering the opening invoke. |
 | `dlg.reply_to(invoke_id, result)` | Stage a result answering a specific invoke id. |
-| `dlg.error(invoke_id, error_code)` | Stage a `ReturnError`. |
+| `dlg.error(invoke_id, error_code)` | Stage a `ReturnError`: the operation failed. |
+| `dlg.reject(invoke_id, problem_class, problem_code)` | Stage a `Reject`: the component the peer sent is a protocol error. `problem_class` is `general` / `invoke` / `return-result` / `return-error`, `problem_code` the code within it (Q.773 Tables 26 to 29). An Invoke whose argument does not decode is `dlg.reject(arg.invoke_id, "invoke", 2)`, mistyped parameter. |
+| `dlg.set_idle_timeout(seconds)` | How long this dialogue may go without a message before the node aborts it, overriding `tcap.dialogue_timer_ms`. `None` waits until the peer ends it. |
 | `dlg.send()` | Flush as a `Continue` (dialogue stays open). |
 | `dlg.end()` | Flush as an `End` (dialogue closes). |
-| `dlg.abort()` | Abort (a dialogue-service-user abort). |
+| `dlg.abort()` | Abort as the dialogue's user: a U-Abort, carrying an ABRT (dialogue-service-user) when the dialogue has an application context. |
 
 `dlg.otid` and `dlg.dtid` expose the originating and peer transaction ids as
 bytes. In-process termination (reply / invoke / send / end) needs no transport and
 is exercised by [`node.deliver`](#testing).
+
+Invoke ids are `INTEGER (-128..127)`: `reply_to`, `error` and `reject` raise
+`SigtranError` for anything else. A flush the encoder refuses (a parameter that is
+not one BER element, say) is logged at error level with the dialogue's transaction
+ids and counted in `sigtran_tcap_send_errors_total`; when that leaves a `Begin`
+unanswered the node aborts the dialogue, so the peer is told instead of waiting.
+
+### Operation classes and timers { #operation-classes }
+
+Every invoke has a class (Q.774 Table 2) that says which outcomes its performer
+reports, and an invocation timer.
+
+| Class | Reports | When the timer expires |
+|---|---|---|
+| 1 | success and failure | No reply came: an abnormal situation. The handler is called with a `PeerTurn` whose `is_timeout` is true. If it stages nothing the node aborts the dialogue (a U-Abort); staging an answer (`dlg.error(...)`, `dlg.end()`, `dlg.send()`) keeps or closes it as the script decides. |
+| 2 | failure only | The operation succeeded. The handler is told (`is_timeout`, `operation_class == 2`) and the dialogue goes on. |
+| 3 | success only | The operation failed. Told the same way; the dialogue goes on. |
+| 4 | nothing | Nothing is reported. |
+
+The MAP builders are class 1. The CAP and INAP builders carry the class of their
+operation: `connect`, `request_report_bcsm_event`, `apply_charging`,
+`play_announcement` and `connect_to_resource` are class 2,
+`prompt_and_collect_user_information` is class 1, `continue_` and `release_call`
+are class 4.
+
+A handler that stages nothing on a follow-up leg leaves the dialogue open: an SCP
+that armed a detection point simply waits for the next event. Give such a dialogue
+the idle timeout the call can last (`dlg.set_idle_timeout(...)`); the default
+`tcap.dialogue_timer_ms` is sized for request / response dialogues.
 
 ## Decoded views { #views }
 
@@ -211,8 +281,9 @@ argument (`arg` / `idp`).
 | `invoke_id` | The invoke id the peer used. |
 | `calling_gt` / `called_gt` | Calling / called global-title digits, if present. |
 | `argument` | The raw BER argument bytes, if the Invoke carried a parameter. |
-| `sm_rp_oa` / `sm_rp_da` / `sm_rp_ui` | For MO/MT-ForwardSM: the originating address, destination address, and TPDU bytes, decoded where present. |
-| `called_party_number` | For a CAMEL initialDP: the dialled number bytes. |
+| `further` | Every other component of the `Begin`, in order, as [`Component`](#component) objects. Empty for the usual single Invoke. |
+| `sm_rp_oa` / `sm_rp_da` / `sm_rp_ui` | For MO-ForwardSM (46) and MT-ForwardSM (44): the originating address, destination address, and TPDU bytes. `None` for any other operation. Raise [`MistypedParameter`](#mistyped) when the argument does not decode. |
+| `service_key` / `called_party_bcd_number` / `called_party_number` | For a CAMEL initialDP: the service key, the dialled number of a mobile-originated call (type of number and plan, then TBCD digits), and the called party number of a forwarded or terminating call. `None` for any other operation, or when the InitialDP carries none. Raise [`MistypedParameter`](#mistyped) when the argument does not decode. |
 
 !!! note "`sm_rp_ui` is an opaque SMS TPDU"
     siphon-sigtran handles the MAP and transaction layers; it does not decode
@@ -222,6 +293,35 @@ argument (`arg` / `idp`).
     TS 23.038, the User-Data-Header for concatenation, TON/NPI addresses), use
     the sibling [`tpdu`](https://crates.io/crates/tpdu) crate, which also ships
     as a Python wheel. See [Building an SMSC](cookbook/smsc.md).
+
+### An argument that does not decode { #mistyped }
+
+The decoded getters read the argument strictly. A member that is on the wire and
+cannot be read, a list element that cannot be read, or a missing mandatory member
+is an error, never a field that reads as absent; a member a later release of the
+protocol added after an extension marker is skipped, as TS 29.002 17.1.4 requires
+of a receiver. When the argument does not decode the getter raises
+`siphon.MistypedParameter` (a `SigtranError`).
+
+Let it propagate and the node answers for the script: the component is rejected
+(`Reject`, mistyped parameter: `invoke` problem 2 for an Invoke, `return-result`
+problem 2 for a result) in an `End`, and whatever the handler had staged is
+discarded. Catch it to decide otherwise:
+
+```python
+@gsm_map.on_operation("mo-forward-sm")
+async def on_mo(dlg, arg):
+    try:
+        tpdu = arg.sm_rp_ui
+    except siphon.MistypedParameter:
+        dlg.reject(arg.invoke_id, "invoke", 2)   # what the node does by default
+        dlg.end()
+        return
+    ...
+```
+
+A handler that raises anything else has staged nothing, and a `Begin` left
+unanswered that way is aborted.
 
 ### `PeerTurn` { #peerturn }
 
@@ -234,13 +334,42 @@ what the peer sent back (its `Continue` or `End`). Tell the two apart with
 | Field / getter | Meaning |
 |---|---|
 | `is_peer_turn` | Always `True` (the opening `IncomingOp` is `False`). |
-| `is_end` | The peer closed the dialogue with a TCAP `End`. |
-| `is_result` / `is_invoke` / `is_error` | What the first component is. |
+| `is_end` | The dialogue is over: the peer closed it with a TCAP `End`, or it ended otherwise (`closed`). |
+| `is_result` / `is_invoke` / `is_error` | Whether the turn carries a result, an invoke, a `returnError`. |
 | `operation_code` | The operation code of the first component (a result echoes the one it answers). |
 | `invoke_id` | The invoke id of the first component. |
 | `error_code` | The MAP/CAP error code, if the peer sent a `returnError`. |
 | `result` | The raw BER result parameter of the first `returnResultLast`, if present. |
 | `argument` | The raw BER argument of the first `Invoke` the peer sent, if present. |
+| `components` | Every component of the turn, in order, as [`Component`](#component) objects. |
+| `is_reject` | The turn carries a `Reject`. A Reject is a protocol error, not a MAP/CAP error: `is_error` is false and `error_code` is `None`. |
+| `reject_is_local` | The Reject was raised by this node for a component of the peer's that could not be read or did not fit the dialogue. It is sent with the next `send()` / `end()`; components after an unreadable one were discarded. |
+| `reject_invoke_id` | The invoke id the Reject names, `None` if it could not be derived. |
+| `reject_problem_class` / `reject_problem_code` / `reject_problem_name` | The typed problem: the class (`general` / `invoke` / `return-result` / `return-error`), the code within it, and the name Q.773 gives it (`mistypedParameter`). |
+| `is_timeout` | Not a message: the invocation timer of one of our invokes expired. `invoke_id`, `operation_code` and `operation_class` name it. See [operation classes](#operation-classes). |
+| `closed` | Not a message: the dialogue ended without the script ending it. `peer-abort`, `provider-abort` (a damaged message arrived for it), `abnormal-dialogue`, `invoke-timeout`, `idle-timeout`, `no-answer` (the handler answered nothing to a `Begin`) or `not-sent`. Told exactly once; nothing can be sent any more. |
+| `is_abort` | `closed` is set. |
+| `abort_kind` | `p-abort` (a transaction sub-layer aborted) or `u-abort` (a TC-user or a component sub-layer did); `None` if no Abort message was involved. |
+| `p_abort_cause` | The P-Abort cause value (0 unrecognized message type, 1 unrecognized transaction ID, 2 badly formatted transaction portion, 3 incorrect transaction portion, 4 resource limitation). |
+| `abort_cause` | What the abort carried, as a fixed label: a P-Abort cause name, or `none`, `dialogue-service-user`, `abnormal-dialogue`, `no-common-dialogue-portion`, `application-context-not-supported`, `dialogue-refused`, `user-defined`. |
+
+A handler written before these existed keeps working: a turn that is a timeout or
+a closure has no components, so `is_result` / `is_invoke` / `is_error` are all
+false. Release whatever the script tied to the dialogue (a charging session, a
+pending delivery) when `closed` is set or `is_end` is true.
+
+### `Component` { #component }
+
+One component of a turn (`turn.components`, `arg.further`).
+
+| Field | Meaning |
+|---|---|
+| `kind` | `invoke`, `result`, `error`, `reject` (from the peer) or `local-reject` (raised here). |
+| `invoke_id` | The invoke id; `None` only for a reject whose invoke id could not be derived. |
+| `operation_code` | Of an invoke, or the one a result echoes. |
+| `parameter` | The raw BER argument of an invoke or parameter of a result. |
+| `error_code` | Of an error. |
+| `problem_class` / `problem_code` / `problem_name` | Of a reject. |
 
 ### `Address` { #address }
 
@@ -251,7 +380,8 @@ Built with `ss7.gt(digits, ssn=…)`: an SCCP address (E.164, GTI-4). Exposes
 
 `Invoke` and `Result` are opaque staged components produced by the builders
 above and consumed by `dlg.invoke(...)` / `dlg.reply(...)`. You do not
-construct them directly.
+construct them directly. An `Invoke` exposes `operation_code` and
+`operation_class`.
 
 ## Testing your handlers { #testing }
 
@@ -279,8 +409,10 @@ assert node.decode(replies[0]).kind == "end"        # the closing End your handl
 | `node.metrics()` | The Prometheus text exposition. |
 | `node.assemble_begin(op, called_gt, called_ssn, calling_gt, arg=None, ac=None)` | Build a genuine inbound `Begin(AARQ, Invoke)` SCCP payload for `op` (a kebab-case operation name). Returns the SCCP bytes. |
 | `node.assemble_continue(dtid, staged, invoke_id=1, otid=None)` | Build an inbound `Continue` for a held-open dialogue keyed to `dtid` (read off the first reply with `decode`), carrying a staged [`Result`](#staged) or [`Invoke`](#staged). |
+| `node.assemble_tcap(tcap, called_ssn=6)` | Wrap raw TCAP octets in an inbound SCCP UDT, for what the other helpers cannot build: a damaged message, a `Reject`, an `Abort`. |
 | `node.deliver(payload, opc=…, dpc=…)` | Deliver one inbound SCCP payload to the dialogue engine and return the SCCP payloads to send back. |
-| `node.decode(payload)` | Decode an outbound SCCP payload into a read-only `Decoded` view: `.kind`, `.otid` / `.dtid`, `.app_context`, `.invoke` / `.invokes`, `.result`, `.error`. |
+| `node.sweep(ahead=0.0)` | Run the dialogue timers as the live node does once a second, with the clock moved `ahead` seconds forward, and return the SCCP payloads to send. |
+| `node.decode(payload)` | Decode an outbound SCCP payload into a read-only `Decoded` view: `.kind`, `.otid` / `.dtid`, `.app_context`, `.invoke` / `.invokes`, `.result`, `.result_invoke_id`, `.error`, `.rejects` (a list of `(invoke_id, problem_class, problem_code)`), and for an abort `.abort_kind`, `.p_abort_cause`, `.abort_source`. |
 
 ## Hot reload, restated
 

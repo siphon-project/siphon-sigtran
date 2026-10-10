@@ -111,6 +111,10 @@ frames = node.deliver(begin, opc=2000, dpc=1000)
 assert replied["op"] == 46          # MO-ForwardSM operation code
 assert len(frames) == 1             # a single closing End
 assert node.open_dialogues() == 0   # the End closed it
+# MO-ForwardSM returns nothing: the ack is a ReturnResultLast with the invoke id
+# and no result sequence (Q.773), and it is on the wire.
+mo_end = node.decode(frames[0])
+assert mo_end.kind == "end" and mo_end.result is None and mo_end.result_invoke_id == 1
 
 # ── Full HLR: updateLocation held open for an insertSubscriberData leg ─────────
 # The engine terminates updateLocation; the HLR pushes subscriber data to the
@@ -246,10 +250,29 @@ assert inap.continue_() is not None
 assert inap.release_call(cause=b"\x90\x03") is not None
 assert inap.apply_charging(charging_characteristics=b"\x01\x02\x03") is not None
 assert inap.apply_charging(charging_characteristics=b"\x01", party_to_charge=b"\x01") is not None
-assert inap.play_announcement(information_to_send=b"\x0a\x0b") is not None
-assert inap.prompt_and_collect_user_information(collected_info=b"\x01\x02") is not None
 assert inap.connect_to_resource() is not None
-assert list(inap.AC.ssp_to_scp.arcs) == [0, 4, 0, 1, 1, 0, 3, 0]
+# What the SRF is told to send is a typed choice, built from keywords or handed
+# over as the BER of an InformationToSend value (here a tone: [1] { [0] 7 }).
+assert inap.play_announcement(message_id=7) is not None
+assert inap.play_announcement(tone_id=3, tone_duration=10) is not None
+assert inap.play_announcement(information_to_send=b"\xa1\x03\x80\x01\x07") is not None
+assert inap.prompt_and_collect_user_information(maximum_digits=4) is not None
+assert inap.prompt_and_collect_user_information(maximum_digits=4, minimum_digits=4, message_id=9) is not None
+for bad in (lambda: inap.play_announcement(),
+            lambda: inap.play_announcement(information_to_send=b"\x0a\x0b"),
+            lambda: inap.play_announcement(message_id=1, tone_id=2),
+            lambda: inap.prompt_and_collect_user_information(),
+            lambda: inap.prompt_and_collect_user_information(collected_info=b"\x01\x02"),
+            lambda: inap.connect(destination_routing_address=[]),
+            lambda: inap.request_report_bcsm_event(events=[(7,)])):
+    try:
+        bad()
+        raise AssertionError("expected SigtranError")
+    except siphon.SigtranError:
+        pass
+assert list(inap.AC.ssp_to_scp.arcs) == [0, 4, 0, 1, 1, 1, 0, 0]
+assert list(inap.AC.assist_handoff_ssp_to_scp.arcs) == [0, 4, 0, 1, 1, 1, 1, 0]
+assert list(inap.AC.ip_to_scp.arcs) == [0, 4, 0, 1, 1, 1, 2, 0]
 
 inap_begin = node.assemble_begin(
     op="initial-dp",
@@ -263,7 +286,7 @@ inap_out = node.deliver(inap_begin, opc=2000, dpc=1000)
 assert len(inap_out) == 1
 dinap = node.decode(inap_out[0])
 assert dinap.kind == "end"                            # both invokes ride the closing End
-assert list(dinap.app_context) == [0, 4, 0, 1, 1, 0, 3, 0]  # IN AC echoed in the AARE, not a CAMEL one
+assert list(dinap.app_context) == [0, 4, 0, 1, 1, 1, 0, 0]  # IN AC echoed in the AARE, not a CAMEL one
 inap_ops = [op for (op, _) in dinap.invokes]
 assert 23 in inap_ops and 20 in inap_ops              # RequestReportBCSMEvent + Connect
 assert inap_seen["service_key"] == 100                # the decoded INAP serviceKey
@@ -320,6 +343,364 @@ async def on_late(dlg, arg):
 catchall_ops.clear()
 drive("report-sm-delivery-status")
 assert late_ops == [47] and catchall_ops == []      # specific beats the earlier catch-all
+
+# ── Abnormal procedures reach the script as what they are ──────────────────────
+# A handler that holds the dialogue open with a class 1 invoke (ISD) and records
+# every later call. TCAP is assembled by hand below: tag, length, content.
+def tlv(tag, content):
+    assert len(content) < 128
+    return bytes([tag, len(content)]) + bytes(content)
+
+events = []
+
+@gsm_map.on_operation("cancel-location")
+def on_cl(dlg, event):
+    if not event.is_peer_turn:
+        assert event.further == []
+        dlg.invoke(gsm_map.insert_subscriber_data(imsi=UL_IMSI, msisdn=UL_MSISDN))
+        dlg.send()
+        return
+    events.append(event)
+    if event.is_reject and not event.reject_is_local:
+        dlg.end()
+
+def open_cl():
+    events.clear()
+    out = node.deliver(node.assemble_begin(
+        op="cancel-location", called_gt="15550100", called_ssn=6, calling_gt="15550180",
+    ), opc=2000, dpc=1000)
+    d = node.decode(out[0])
+    assert d.kind == "continue"
+    return bytes(d.otid)
+
+def cont(dtid, components):
+    return node.assemble_tcap(tlv(0x65, tlv(0x48, b"\x22\x22\x22\x22") + tlv(0x49, dtid)
+                                  + tlv(0x6C, components)))
+
+# The builders know the class of their operation.
+assert gsm_map.insert_subscriber_data(imsi=UL_IMSI, msisdn=UL_MSISDN).operation_class == 1
+assert gsm_cap.release_call(cause=b"\x90\x03").operation_class == 4
+assert gsm_cap.continue_().operation_class == 4
+assert inap.continue_().operation_class == 4
+assert inap.connect_to_resource().operation_class == 2
+
+# A Reject from the peer is a reject, not an error with code -1: the invoke id and
+# the typed problem. `A4 { 02 01 01, 81 01 02 }` = invoke 1, invokeProblem,
+# mistypedParameter (2).
+tid = open_cl()
+out = node.deliver(cont(tid, tlv(0xA4, b"\x02\x01\x01" + b"\x81\x01\x02")), opc=2000, dpc=1000)
+turn = events[0]
+assert turn.is_reject and not turn.reject_is_local and not turn.is_error
+assert turn.error_code is None
+assert turn.reject_invoke_id == 1
+assert (turn.reject_problem_class, turn.reject_problem_code) == ("invoke", 2)
+assert turn.reject_problem_name == "mistypedParameter"
+comp = turn.components[0]
+assert (comp.kind, comp.invoke_id, comp.problem_class, comp.problem_code) == ("reject", 1, "invoke", 2)
+assert node.decode(out[0]).kind == "end"
+assert node.open_dialogues() == 0
+
+# A Reject whose invoke id the peer could not derive (NULL): `A4 { 05 00, 80 01 02 }`.
+tid = open_cl()
+node.deliver(cont(tid, tlv(0xA4, b"\x05\x00" + b"\x80\x01\x02")), opc=2000, dpc=1000)
+assert events[0].is_reject and events[0].reject_invoke_id is None
+assert (events[0].reject_problem_class, events[0].reject_problem_name) == ("general", "badlyStructuredComponent")
+
+# A component this node cannot read (an Invoke that stops after its invoke id) is
+# rejected here: the handler is told, and the Reject leaves with its next flush.
+tid = open_cl()
+out = node.deliver(cont(tid, tlv(0xA1, b"\x02\x01\x09")), opc=2000, dpc=1000)
+assert out == [] and node.open_dialogues() == 1     # the handler said nothing: it waits
+assert events[0].is_reject and events[0].reject_is_local
+assert (events[0].reject_invoke_id, events[0].reject_problem_class, events[0].reject_problem_code) == (9, "general", 1)
+out = node.deliver(cont(tid, tlv(0xA4, b"\x02\x01\x01" + b"\x81\x01\x02")), opc=2000, dpc=1000)
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [(9, "general", 1)]
+
+# A P-Abort from the peer: `67 { 49 dtid, 4A 01 04 }`, resource limitation.
+tid = open_cl()
+out = node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, tid) + b"\x4a\x01\x04")), opc=2000, dpc=1000)
+assert out == [] and node.open_dialogues() == 0
+assert len(events) == 1                              # told once
+e = events[0]
+assert e.is_peer_turn and e.is_end and e.is_abort and e.components == []
+assert (e.closed, e.abort_kind, e.p_abort_cause, e.abort_cause) == ("peer-abort", "p-abort", 4, "resource-limitation")
+
+# A U-Abort with no information, and one with an ABRT from the dialogue-service-user.
+tid = open_cl()
+node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, tid))), opc=2000, dpc=1000)
+assert (events[0].closed, events[0].abort_kind, events[0].p_abort_cause, events[0].abort_cause) == ("peer-abort", "u-abort", None, "none")
+tid = open_cl()
+abrt = tlv(0x28, tlv(0x06, b"\x00\x11\x86\x05\x01\x01\x01") + tlv(0xA0, tlv(0x64, b"\x80\x01\x00")))
+node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, tid) + tlv(0x6B, abrt))), opc=2000, dpc=1000)
+assert (events[0].abort_kind, events[0].abort_cause) == ("u-abort", "dialogue-service-user")
+
+# A damaged Continue for the dialogue (one octet after the message): the node
+# answers with a P-Abort and tells the handler the dialogue is gone.
+tid = open_cl()
+damaged = bytes(node.assemble_tcap(tlv(0x65, tlv(0x48, b"\x22\x22") + tlv(0x49, tid)) + b"\x00"))
+out = node.deliver(damaged, opc=2000, dpc=1000)
+d = node.decode(out[0])
+assert (d.kind, d.abort_kind, d.p_abort_cause) == ("abort", "p-abort", 2)
+assert bytes(d.dtid) == b"\x22\x22"
+assert (events[0].closed, events[0].abort_kind, events[0].abort_cause) == ("provider-abort", "p-abort", "badly-formatted-transaction-portion")
+assert node.open_dialogues() == 0
+
+# A Continue for a transaction id the node does not know is answered, not dropped.
+out = node.deliver(node.assemble_tcap(tlv(0x65, tlv(0x48, b"\x33") + tlv(0x49, b"\x80\x00\x7f\x7f"))), opc=2000, dpc=1000)
+d = node.decode(out[0])
+assert (d.kind, d.abort_kind, d.p_abort_cause, bytes(d.dtid)) == ("abort", "p-abort", 1, b"\x33")
+
+# The class 1 invoke gets no reply: the handler is told (is_timeout), and since it
+# stages nothing the node aborts as the dialogue's user and says why.
+tid = open_cl()
+out = node.sweep(ahead=20)
+assert len(events) == 2
+assert events[0].is_timeout and not events[0].is_abort
+assert (events[0].invoke_id, events[0].operation_code, events[0].operation_class) == (1, 7, 1)
+assert (events[1].closed, events[1].abort_kind) == ("invoke-timeout", "u-abort")
+d = node.decode(out[0])
+assert (d.kind, d.abort_kind, d.p_abort_cause) == ("abort", "u-abort", None)
+assert node.open_dialogues() == 0
+
+# A class 2 operation (CAP RequestReportBCSMEvent) answered by silence succeeded:
+# the handler is told and the dialogue lives on, for as long as it says it may.
+scp_events = []
+
+@gsm_cap.on_operation("initial-dp")
+def on_idp_held(dlg, event):
+    if not event.is_peer_turn:
+        dlg.set_idle_timeout(7200)
+        dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 1)]))
+        dlg.send()
+        return
+    scp_events.append(event)
+
+out = node.deliver(node.assemble_begin(
+    op="initial-dp", called_gt="15550100", called_ssn=6, calling_gt="15550142",
+    arg=bytes.fromhex("3003800101"),
+), opc=2000, dpc=1000)
+assert node.decode(out[0]).kind == "continue" and node.open_dialogues() == 1
+assert node.sweep(ahead=3600) == []                  # an hour later: no abort
+assert node.open_dialogues() == 1
+assert len(scp_events) == 1 and scp_events[0].is_timeout
+assert scp_events[0].operation_class == 2 and scp_events[0].operation_code == 23
+out = node.sweep(ahead=7300)                         # past its own idle timeout
+assert node.decode(out[0]).abort_kind == "u-abort"
+assert scp_events[-1].closed == "idle-timeout" and node.open_dialogues() == 0
+
+# A handler rejects an Invoke whose argument it cannot use: Reject, invokeProblem,
+# mistypedParameter, in the closing End.
+@gsm_map.on_operation("report-sm-delivery-status")
+def on_rsds(dlg, op):
+    dlg.reject(op.invoke_id, "invoke", 2)
+    dlg.end()
+
+out = node.deliver(node.assemble_begin(
+    op="report-sm-delivery-status", called_gt="15550100", called_ssn=6, calling_gt="15550180",
+), opc=2000, dpc=1000)
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [(1, "invoke", 2)]
+
+# Invoke ids are INTEGER (-128..127), and an unknown problem class is refused, at
+# the call that passes them.
+class _Probe:
+    seen = None
+@gsm_map.on_operation("ready-for-sm")
+def on_rfs(dlg, op):
+    errors = []
+    for call in (lambda: dlg.reply_to(300, gsm_map.ready_for_sm_res()),
+                 lambda: dlg.error(-129, 34),
+                 lambda: dlg.reject(1, "bogus", 0),
+                 lambda: dlg.invoke(gsm_map.insert_subscriber_data(imsi=UL_IMSI, msisdn=UL_MSISDN), operation_class=5)):
+        try:
+            call()
+        except siphon.SigtranError as e:
+            errors.append(str(e))
+    _Probe.seen = errors
+    dlg.reply(gsm_map.ready_for_sm_res())
+    dlg.end()
+
+out = drive("ready-for-sm")
+assert len(_Probe.seen) == 4, _Probe.seen
+assert node.decode(out[0]).kind == "end"
+
+# ── An argument that does not decode is a mistyped parameter ──────────────────
+# MO-ForwardSM-Arg ::= SEQUENCE { sm-RP-DA, sm-RP-OA, sm-RP-UI, ... }, by hand:
+# serviceCentreAddressDA [4] 15550100, msisdn [2] 15550142, a two-octet TPDU.
+MO_DA = tlv(0x84, b"\x91\x51\x55\x10\x00")
+MO_OA = tlv(0x82, b"\x91\x51\x55\x10\x24")
+MO_UI = tlv(0x04, b"\xaa\xbb")
+mo_seen = {}
+
+@gsm_map.on_operation("mo-forward-sm")
+def on_mo_strict(dlg, arg):
+    mo_seen["ui"] = bytes(arg.sm_rp_ui)        # raises MistypedParameter if unreadable
+    dlg.reply(gsm_map.mo_forward_sm_res())
+    dlg.end()
+
+def mo(argument):
+    return node.deliver(node.assemble_begin(
+        op="mo-forward-sm", called_gt="15550100", called_ssn=8, calling_gt="15550142",
+        arg=argument,
+    ), opc=2000, dpc=1000)
+
+assert issubclass(siphon.MistypedParameter, siphon.SigtranError)
+
+# A member this node does not model, after the ones it does, is skipped
+# (TS 29.002 17.1.4): the argument is read.
+out = mo(tlv(0x30, MO_DA + MO_OA + MO_UI + b"\x9d\x01\x2a"))
+assert mo_seen.pop("ui") == b"\xaa\xbb"
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [] and d.result_invoke_id == 1
+
+# Without its sm-RP-UI the argument does not decode. The getter raises instead of
+# answering None, and the uncaught exception becomes the Reject it stands for:
+# invokeProblem, mistypedParameter, in an End.
+out = mo(tlv(0x30, MO_DA + MO_OA))
+assert "ui" not in mo_seen
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [(1, "invoke", 2)] and d.result_invoke_id is None
+assert node.open_dialogues() == 0
+
+# A handler that catches the exception decides for itself.
+@gsm_map.on_operation("mo-forward-sm")
+def on_mo_catching(dlg, arg):
+    try:
+        _ = arg.sm_rp_da
+    except siphon.MistypedParameter:
+        dlg.error(arg.invoke_id, 36)           # unexpectedDataValue, its own choice
+    dlg.end()
+
+d = node.decode(mo(tlv(0x30, MO_DA + MO_OA))[0])
+assert d.rejects == [] and d.error == (1, 36)
+
+# Any other operation has no forward-SM fields: None, not an error.
+@gsm_map.on_operation("purge-ms")
+def on_purge_fields(dlg, arg):
+    assert arg.sm_rp_ui is None and arg.sm_rp_oa is None
+    dlg.reply(gsm_map.purge_ms_res())
+    dlg.end()
+
+assert node.decode(drive("purge-ms")[0]).rejects == []
+
+# ── INAP: the argument is decoded strictly, a leg is an explicit choice ───────
+# RequestReportBCSMEvent with a leg: `legID [2]` wraps the LegID CHOICE, so the
+# event is `30 0B { 80 01 09, 81 01 01, A2 03 { 80 01 02 } }` (oDisconnect,
+# notifyAndContinue, sendingSideID leg 2; 3 + 3 + 5 = 11 octets). The primitive `82 01 02` of the
+# earlier encoding is what a conforming SSF rejects.
+inap_rrbe = {}
+
+@inap.on_operation("initial-dp")
+def on_inap_strict(dlg, idp):
+    if idp.is_peer_turn:
+        return
+    inap_rrbe["key"] = idp.inap_service_key          # raises MistypedParameter if unreadable
+    dlg.invoke(inap.request_report_bcsm_event(events=[(7, 0), (9, 1, 2)]))
+    dlg.send()
+
+def inap_idp(argument):
+    return node.deliver(node.assemble_begin(
+        op="initial-dp", called_gt="15550100", called_ssn=106, calling_gt="15550170",
+        arg=argument, ac=inap.AC.ssp_to_scp,
+    ), opc=2000, dpc=1000)
+
+d = node.decode(inap_idp(INAP_IDP)[0])
+assert d.kind == "continue" and inap_rrbe.pop("key") == 100
+assert list(d.app_context) == [0, 4, 0, 1, 1, 1, 0, 0]
+rrbe = d.invokes[0][1]
+assert bytes.fromhex("300b800109810101" "a203800102") in bytes(rrbe)
+assert bytes.fromhex("3006800107810100") in bytes(rrbe)   # the event without a leg
+node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, bytes(d.otid)))), opc=2000, dpc=1000)
+
+# An InitialDP whose serviceKey [0] announces four octets and holds one does not
+# decode: Reject, invokeProblem mistypedParameter, in an End.
+out = inap_idp(tlv(0x30, b"\x80\x04\x64"))
+assert "key" not in inap_rrbe
+d = node.decode(out[0])
+assert d.kind == "end" and d.rejects == [(1, "invoke", 2)] and d.invokes == []
+# So does one without its mandatory serviceKey, and one carrying a member the
+# argument does not have ([45]).
+assert node.decode(inap_idp(tlv(0x30, b"\x82\x05\x91\x51\x55\x10\x24"))[0]).rejects == [(1, "invoke", 2)]
+assert node.decode(inap_idp(tlv(0x30, b"\x80\x01\x64" + b"\x9f\x2d\x01\x00"))[0]).rejects == [(1, "invoke", 2)]
+
+# ── CAP: strict InitialDP, legs, and charging by the dialogue's CAMEL phase ────
+# InitialDPArg by hand: serviceKey [0] 100, calledPartyBCDNumber [56] (unknown
+# type, ISDN plan, 15550142). Tag 56 takes the high tag number form, `9F 38`.
+CAP_IDP = tlv(0x30, b"\x80\x01\x64" + b"\x9f\x38\x05\x81\x51\x55\x10\x24")
+cap_seen = {}
+
+@gsm_cap.on_operation("initial-dp")
+def on_cap_prepaid(dlg, idp):
+    if idp.is_peer_turn:
+        return
+    cap_seen["key"] = idp.service_key                 # raises MistypedParameter if unreadable
+    cap_seen["dialled"] = bytes(idp.called_party_bcd_number)
+    assert idp.called_party_number is None            # not in this InitialDP
+    dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 1, 2), (9, 0, 1), (9, 0, 2)]))
+    dlg.invoke(gsm_cap.apply_charging(max_call_period_duration=600,
+                                      release_if_duration_exceeded=True, tone=True,
+                                      party_to_charge=1))
+    dlg.invoke(gsm_cap.continue_())
+    dlg.send()
+
+def cap_idp(argument, ac):
+    out = node.deliver(node.assemble_begin(
+        op="initial-dp", called_gt="15550100", called_ssn=6, calling_gt="15550170",
+        arg=argument, ac=ac,
+    ), opc=2000, dpc=1000)
+    d = node.decode(out[0])
+    if d.kind == "continue":   # release the dialogue the handler left open
+        node.deliver(node.assemble_tcap(tlv(0x67, tlv(0x49, bytes(d.otid)))), opc=2000, dpc=1000)
+    return d
+
+assert list(gsm_cap.AC.gsm_ssf_scf.arcs) == [0, 4, 0, 0, 1, 21, 3, 4]
+assert list(gsm_cap.AC.gsm_ssf_scf_phase4.arcs) == [0, 4, 0, 0, 1, 23, 3, 4]
+
+# Under the phase 3 context the charging characteristics carry `tone [3]
+# BOOLEAN` (83 01 FF); under the phase 4 context `audibleIndicator [3]`, an
+# explicit choice (A3 03 01 01 FF). Same call, different octets, chosen by the
+# dialogue. partyToCharge [2] is explicit around sendingSideID [0].
+d3 = cap_idp(CAP_IDP, gsm_cap.AC.gsm_ssf_scf)
+assert d3.kind == "continue" and cap_seen == {"key": 100, "dialled": b"\x81\x51\x55\x10\x24"}
+ops = [op for (op, _) in d3.invokes]
+assert ops == [23, 35, 31]
+rrbe3, ach3 = bytes(d3.invokes[0][1]), bytes(d3.invokes[1][1])
+assert bytes.fromhex("300b800107810101a203800102") in rrbe3   # oAnswer, notify, leg 2
+assert bytes.fromhex("300b800109810100a203800101") in rrbe3   # oDisconnect, interrupted, leg 1
+assert ach3 == bytes.fromhex("3013" "800c" "a00a8002025881" "01ff8301ff" "a203800101")
+d4 = cap_idp(CAP_IDP, gsm_cap.AC.gsm_ssf_scf_phase4)
+ach4 = bytes(d4.invokes[1][1])
+assert ach4 == bytes.fromhex("3015" "800e" "a00c8002025881" "01ffa3030101ff" "a203800101")
+
+# A phase given explicitly needs no dialogue; one that is not 3 or 4 is refused.
+assert gsm_cap.apply_charging(max_call_period_duration=600, phase=4) is not None
+for bad in (lambda: gsm_cap.apply_charging(max_call_period_duration=600, phase=2),
+            lambda: gsm_cap.apply_charging(),
+            lambda: gsm_cap.connect(destination_routing_address=["15550199", "15550198"]),
+            lambda: gsm_cap.request_report_bcsm_event(events=[(1, 0)])):   # no such CAP event
+    try:
+        bad()
+        raise AssertionError("expected SigtranError")
+    except siphon.SigtranError:
+        pass
+
+# On a dialogue that is not under a CAP phase 3 or 4 context the phase cannot be
+# chosen, and nothing is guessed. The rest of the answer is not sent without the
+# charging instruction either (that would be a call let through unmetered): the
+# dialogue is aborted, and the gsmSSF falls back to its default call handling.
+d0 = cap_idp(CAP_IDP, None)
+assert (d0.kind, d0.abort_kind, d0.invokes) == ("abort", "u-abort", [])
+assert node.open_dialogues() == 0
+
+# An InitialDP that does not decode: Reject, invokeProblem mistypedParameter.
+d = cap_idp(tlv(0x30, b"\x80\x04\x64"), gsm_cap.AC.gsm_ssf_scf)
+assert d.kind == "end" and d.rejects == [(1, "invoke", 2)] and d.invokes == []
+
+# The new metric families are exposed.
+text = siphon.metrics()
+assert 'sigtran_tcap_abort_total{dir="rx",kind="p-abort",cause="resource-limitation"}' in text
+assert 'sigtran_tcap_reject_total{dir="rx",problem="invoke"}' in text
 
 # An unknown operation name raises at decoration time, before any dialogue runs.
 try:

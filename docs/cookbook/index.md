@@ -53,6 +53,10 @@ These show up across the recipes:
   flushes with `send` (continue) or `end` (close). The engine builds the wire
   TCAP; you never encode bytes.
 - **Answer every request.** On the wire, always answer or abort a dialogue.
-  Silently dropping a Begin is a bug; return a result, an error, or an abort.
+  Silently dropping a Begin is a bug; return a result, an error, a reject
+  (`dlg.reject`, for an argument that does not decode), or an abort. A handler
+  that answers nothing to a Begin has the dialogue aborted for it.
+- **Clean up on every end.** A follow-up turn with `is_end` or `closed` set is the
+  one place a dialogue's end reaches the script, whatever ended it.
 
 Start with [Building an STP](stp.md).

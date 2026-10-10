@@ -333,14 +333,18 @@ pub struct Sccp {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Tcap {
-    /// How long an outstanding invoke waits for its result before it is aged out
-    /// and `sigtran_invoke_timeouts_total` counts it. Milliseconds.
+    /// The invocation timer of an invoke that does not name its own (Q.774
+    /// 3.2.1.1.3). Its expiry is reported to the dialogue's handler and means
+    /// what the class of the operation says; only the expiry of a class 1
+    /// invoke is counted in `sigtran_invoke_timeouts_total`. Milliseconds.
     pub invoke_timer_ms: u64,
-    /// How long a dialogue may sit with no activity before it is aged out and
-    /// `sigtran_dialogue_timeouts_total` counts it. Milliseconds.
+    /// How long a dialogue may go without a message in either direction before
+    /// it is aborted and `sigtran_dialogue_timeouts_total` counts it; a dialogue
+    /// can set its own. `0` disables it. Milliseconds.
     pub dialogue_timer_ms: u64,
     /// The maximum number of concurrently open dialogues. A Begin over this
-    /// ceiling is rejected with a P-Abort (counted as a local abort).
+    /// ceiling is refused with a P-Abort, cause resource limitation (counted as
+    /// a local abort).
     pub max_dialogues: usize,
 }
 

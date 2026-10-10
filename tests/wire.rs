@@ -39,7 +39,7 @@ use tokio::time::{sleep, timeout};
 use async_sctp::{SctpAssociation, SctpConfig, SctpListener};
 
 use gsm_cap::operations::{EventReportBcsmArg, InitialDpArg, RequestReportBcsmEventArg};
-use gsm_cap::types::{BcsmEvent, EventTypeBcsm, MonitorMode};
+use gsm_cap::types::{BcsmEvent, EventTypeBcsm, LegId, MiscCallInfo, MonitorMode, ReceivingSideId};
 use gsm_map::operations::location::UpdateLocationArg;
 use gsm_map::operations::mo_forward_sm::MoForwardSmArg;
 use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
@@ -94,7 +94,7 @@ const AC_MO_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 21, 3];
 /// gsmSSF-scfGenericAC v3 (CAMEL initialDP).
 const AC_CAP: [u32; 8] = [0, 4, 0, 0, 1, 21, 3, 4];
 /// cs1-ssp-to-scp (Core INAP CS-1 initialDP). Binds Wireshark's INAP dissector.
-const AC_INAP: [u32; 8] = [0, 4, 0, 1, 1, 0, 3, 0];
+const AC_INAP: [u32; 8] = [0, 4, 0, 1, 1, 1, 0, 0];
 /// The IN SCP subsystem number (Wireshark dispatches SSN 106 to INAP by default).
 const SCP_SSN: u8 = 106;
 
@@ -126,63 +126,43 @@ fn imsi_bytes(digits: &str) -> Vec<u8> {
 // ── MAP/CAP argument bytes (BER) ─────────────────────────────────────────────
 
 fn sri_sm_arg(msisdn: &str) -> Vec<u8> {
-    let arg = RoutingInfoForSmArg {
-        msisdn: isdn(msisdn).into(),
-        sm_rp_pri: true,
-        service_centre_address: isdn(OUR_GT).into(),
-        gprs_support_indicator: None,
-        sm_rp_mti: None,
-        sm_rp_smea: None,
-    };
+    let arg = RoutingInfoForSmArg::new(isdn(msisdn).into(), true, isdn(OUR_GT).into());
     rasn::ber::encode(&arg).expect("encode sri-sm")
 }
 
 fn update_location_arg(imsi: &str) -> Vec<u8> {
-    let arg = UpdateLocationArg {
-        imsi: imsi_bytes(imsi).into(),
-        msc_number: isdn("15550170").into(),
-        vlr_number: isdn("15550171").into(),
-        lmsi: None,
-        vlr_capability: None,
-    };
+    let arg = UpdateLocationArg::new(
+        imsi_bytes(imsi).into(),
+        isdn("15550170").into(),
+        isdn("15550171").into(),
+    );
     rasn::ber::encode(&arg).expect("encode ul")
 }
 
 fn mo_forward_sm_arg() -> Vec<u8> {
-    let arg = MoForwardSmArg {
-        sm_rp_da: SmRpDa::ServiceCentreAddressDa(isdn(OUR_GT).into()),
-        sm_rp_oa: SmRpOa::MsIsdn(isdn("15550142").into()),
-        sm_rp_ui: vec![0x00, 0x01, 0x02].into(),
-        imsi: None,
-    };
+    let arg = MoForwardSmArg::new(
+        SmRpDa::ServiceCentreAddressDa(isdn(OUR_GT).into()),
+        SmRpOa::MsIsdn(isdn("15550142").into()),
+        vec![0x00, 0x01, 0x02].into(),
+    );
     rasn::ber::encode(&arg).expect("encode mo")
 }
 
 fn mt_forward_sm_arg() -> Vec<u8> {
-    let arg = MtForwardSmArg {
-        sm_rp_da: SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
-        sm_rp_oa: SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
-        sm_rp_ui: vec![0x04, 0x0B, 0x91].into(),
-        more_messages_to_send: None,
-    };
+    let arg = MtForwardSmArg::new(
+        SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
+        SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
+        vec![0x04, 0x0B, 0x91].into(),
+    );
     rasn::ber::encode(&arg).expect("encode mt")
 }
 
 fn initial_dp_arg(imsi: &str) -> Vec<u8> {
     let arg = InitialDpArg {
-        service_key: 100.into(),
         called_party_number: Some(isdn("15550142").into()),
         calling_party_number: Some(isdn("15550101").into()),
-        calling_partys_category: None,
-        original_called_party_id: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
         imsi: Some(imsi_bytes(imsi).into()),
-        location_information: None,
-        call_reference_number: None,
-        msc_address: None,
-        called_party_bcd_number: None,
-        time_and_timezone: None,
+        ..InitialDpArg::new(100.into())
     };
     gsm_cap::encode(&arg).expect("encode idp")
 }
@@ -190,20 +170,9 @@ fn initial_dp_arg(imsi: &str) -> Vec<u8> {
 /// An INAP CS-1 initialDP argument (fixed-network IEs, no mobile fields).
 fn inap_initial_dp_arg() -> Vec<u8> {
     let arg = inap::operations::InitialDpArg {
-        service_key: 100.into(),
         called_party_number: Some(isdn("15550142").into()),
         calling_party_number: Some(isdn("15550101").into()),
-        calling_partys_category: None,
-        ip_ssp_capabilities: None,
-        ip_available: None,
-        location_number: None,
-        original_called_party_id: None,
-        high_layer_compatibility: None,
-        service_interaction_indicators: None,
-        additional_calling_party_number: None,
-        forward_call_indicators: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
+        ..inap::operations::InitialDpArg::new(100)
     };
     inap::encode(&arg).expect("encode inap idp")
 }
@@ -1425,17 +1394,12 @@ const SERVING_MSC: &str = "15550180";
 struct WireHlr;
 impl TerminationHandler for WireHlr {
     fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
-        let res = RoutingInfoForSmRes {
-            imsi: imsi_bytes(HLR_IMSI).into(),
-            location_info_with_lmsi: LocationInfoWithLmsi {
-                network_node_number: isdn(SERVING_MSC).into(),
-                lmsi: None,
-                gprs_node_indicator: None,
-                additional_number: None,
-            },
-        };
+        let res = RoutingInfoForSmRes::new(
+            imsi_bytes(HLR_IMSI).into(),
+            LocationInfoWithLmsi::new(isdn(SERVING_MSC).into()),
+        );
         dlg.reply(op.operation_code, Some(rasn::ber::encode(&res).unwrap()));
-        dlg.end();
+        dlg.end().expect("end");
     }
 }
 
@@ -1473,10 +1437,8 @@ fn decode_sri_sm_reply(payload: &[u8]) -> Option<(i64, Vec<u8>, Vec<u8>)> {
     };
     // An AARE must be present on the terminating End.
     let has_aare = matches!(
-        end.dialogue_portion
-            .as_ref()
-            .and_then(|dp| dp.dialogue_pdu()),
-        Some(DialoguePdu::Aare { .. })
+        end.dialogue_portion.as_ref().map(|dp| dp.dialogue_pdu()),
+        Some(Ok(Some(DialoguePdu::Aare { .. })))
     );
     assert!(has_aare, "the terminating End carries an AARE");
     match end.components?.into_iter().next()? {
@@ -1488,7 +1450,7 @@ fn decode_sri_sm_reply(payload: &[u8]) -> Option<(i64, Vec<u8>, Vec<u8>)> {
                 }),
             ..
         }) => {
-            let res: RoutingInfoForSmRes = rasn::ber::decode(param.as_bytes()).ok()?;
+            let res: RoutingInfoForSmRes = gsm_map::decode(param.as_bytes()).ok()?;
             Some((
                 op,
                 res.imsi.to_vec(),
@@ -1584,8 +1546,8 @@ struct WireOriginator {
 }
 impl TerminationHandler for WireOriginator {
     fn on_start(&self, dlg: &mut Dialogue) {
-        dlg.invoke(self.op, Some(self.arg.clone()));
-        dlg.send();
+        dlg.invoke(self.op, Some(self.arg.clone())).expect("invoke");
+        dlg.send().expect("send");
     }
     fn on_continue(&self, _dlg: &mut Dialogue, peer: &PeerTurn) {
         if let Some(tx) = self.responder.lock().unwrap().take() {
@@ -1613,15 +1575,10 @@ fn otid_of_begin(payload: &[u8]) -> Option<Vec<u8>> {
 /// answering invoke id 1, addressed dtid = the node's OTID, over SCCP
 /// route-on-SSN 6 back to the node (→ Local termination in the engine).
 fn sri_sm_reply_end(node_otid: &[u8]) -> Vec<u8> {
-    let res = RoutingInfoForSmRes {
-        imsi: imsi_bytes(HLR_IMSI).into(),
-        location_info_with_lmsi: LocationInfoWithLmsi {
-            network_node_number: isdn(SERVING_MSC).into(),
-            lmsi: None,
-            gprs_node_indicator: None,
-            additional_number: None,
-        },
-    };
+    let res = RoutingInfoForSmRes::new(
+        imsi_bytes(HLR_IMSI).into(),
+        LocationInfoWithLmsi::new(isdn(SERVING_MSC).into()),
+    );
     let end = End {
         dtid: node_otid.to_vec().into(),
         dialogue_portion: None,
@@ -1737,7 +1694,7 @@ async fn wire_originates_sri_sm_and_correlates_the_response() {
                 ..
             } => {
                 let res: RoutingInfoForSmRes =
-                    rasn::ber::decode(parameter.as_ref()?.as_slice()).ok()?;
+                    gsm_map::decode(parameter.as_ref()?.as_slice()).ok()?;
                 Some((
                     *operation_code,
                     res.imsi.to_vec(),
@@ -1845,7 +1802,7 @@ async fn wire_originates_sri_sm_and_correlates_the_response() {
 const AC_MT_RELAY: [u32; 8] = [0, 4, 0, 0, 1, 0, 25, 3];
 
 /// An `Invoke` component with an explicit id / operation / optional argument.
-fn invoke_comp(id: i64, op: i64, arg: Option<Vec<u8>>) -> Component {
+fn invoke_comp(id: i8, op: i64, arg: Option<Vec<u8>>) -> Component {
     Component::Invoke(Invoke {
         invoke_id: id,
         linked_id: None,
@@ -1855,12 +1812,14 @@ fn invoke_comp(id: i64, op: i64, arg: Option<Vec<u8>>) -> Component {
 }
 
 /// A `ReturnResultLast` component answering `id` for `op` (optional parameter).
-fn result_comp(id: i64, op: i64, param: Option<Vec<u8>>) -> Component {
+fn result_comp(id: i8, op: i64, param: Option<Vec<u8>>) -> Component {
     Component::ReturnResultLast(ReturnResult {
         invoke_id: id,
-        result: Some(ReturnResultValue {
+        // Q.773 3.1: the result sequence is there with its parameter, or not
+        // at all.
+        result: param.map(|p| ReturnResultValue {
             operation_code: OperationCode::Local(op),
-            parameter: param.map(Any::new),
+            parameter: Some(Any::new(p)),
         }),
     })
 }
@@ -1943,10 +1902,12 @@ fn sms_deliver_udh(part: u8) -> Vec<u8> {
 /// `moreMessagesToSend` (present on every segment but the last).
 fn mt_fwd_arg(part: u8, more: bool) -> Vec<u8> {
     let arg = MtForwardSmArg {
-        sm_rp_da: SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
-        sm_rp_oa: SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
-        sm_rp_ui: sms_deliver_udh(part).into(),
         more_messages_to_send: more.then_some(()),
+        ..MtForwardSmArg::new(
+            SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
+            SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
+            sms_deliver_udh(part).into(),
+        )
     };
     rasn::ber::encode(&arg).expect("encode mt-forwardSM")
 }
@@ -2087,22 +2048,19 @@ fn wire_full_dialogue_captures_encode_clean() {
     // A CAMEL session: the gsmSSF (4000) triggers a call at the SCP (1000) —
     // Begin(initialDP) → Continue(requestReportBCSMEvent + continue) →
     // Continue(eventReportBCSM: oDisconnect) → End(releaseCall), closing it.
+    // This capture is the clean-dissection gate for the hand-built frames; the
+    // flow driven through the dialogue engine, with the dissected fields
+    // asserted, is `tests/strict_decode.rs`.
     let ssf = [0xCCu8; 4];
     let scf = [0xDDu8; 4];
-    let rrbe = gsm_cap::encode(&RequestReportBcsmEventArg {
-        bcsm_events: vec![BcsmEvent {
-            event_type_bcsm: EventTypeBcsm::ODisconnect,
-            monitor_mode: MonitorMode::NotifyAndContinue,
-            leg_id: None,
-        }],
-    })
-    .expect("encode rrbe");
-    let erb = gsm_cap::encode(&EventReportBcsmArg {
-        event_type_bcsm: EventTypeBcsm::ODisconnect,
-        leg_id: None,
-        misc_call_info: None,
-    })
-    .expect("encode erb");
+    let mut disconnect = BcsmEvent::new(EventTypeBcsm::ODisconnect, MonitorMode::NotifyAndContinue);
+    disconnect.leg_id = Some(LegId::sending(1));
+    let rrbe =
+        gsm_cap::encode(&RequestReportBcsmEventArg::new(vec![disconnect])).expect("encode rrbe");
+    let mut report = EventReportBcsmArg::new(EventTypeBcsm::ODisconnect);
+    report.leg_id = Some(ReceivingSideId::leg(1));
+    report.misc_call_info = Some(MiscCallInfo::notification());
+    let erb = gsm_cap::encode(&report).expect("encode erb");
     let scp = SubsystemNumber::from_u8(146);
     let camel = [
         m3ua_sccp(

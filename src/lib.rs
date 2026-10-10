@@ -121,8 +121,9 @@ pub mod transport;
 
 pub use config::Config;
 pub use dialogue::{
-    Dialogue, DialogueEngine, IncomingOp, OutgoingBegin, PeerComponent, PeerTurn, Role,
-    TerminationHandler,
+    CloseReason, Dialogue, DialogueClosed, DialogueEngine, DialogueError, IncomingOp,
+    InvokeTimeout, OperationClass, OutgoingBegin, PeerAbort, PeerComponent, PeerTurn, Role,
+    TerminationHandler, UserAbort,
 };
 pub use error::{Error, Result};
 pub use mtp3::route::Destination;

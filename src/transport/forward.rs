@@ -160,7 +160,16 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
     // tenant actually has content rules, so a pure-transit node pays nothing.
     if msu.si == framing::SI_SCCP && ctx.router.tenant_has_content_rules(&ctx.tenant) {
         if let Ok(sccp) = SccpMessage::decode(&msu.payload) {
-            inbound.view = crate::content::decode_map_view(&sccp);
+            use crate::content::Screening;
+            match crate::content::screen(&sccp) {
+                Screening::View(view) => inbound.view = Some(view),
+                // Dropped by the router where the rules would have applied.
+                Screening::Undecodable => inbound.content_undecodable = true,
+                // One segment of a segmented message: not reassembled here, so
+                // not evaluated. Counted, so it is visible that it was not.
+                Screening::Segmented => metrics::content_segment_unscreened(),
+                Screening::NotApplicable => {}
+            }
         }
     }
     match ctx.router.route_in(&ctx.tenant, &inbound) {

@@ -66,15 +66,18 @@ jobs:
 
       # `routing`, `wire` and `wire_python` open real SCTP associations and run in
       # the `wire` job below. Everything else needs nothing but a toolchain.
+      # `abnormal` and `strict_decode` run here for their codec-level assertions;
+      # their Wireshark dissection half skips without tshark and is required in
+      # the `wire` job.
       # cargo refuses to mix --doc with other target selectors, hence the split.
       - name: Test (routing brain)
         run: |
-          cargo test --lib --test dialogue --test python
+          cargo test --lib --test dialogue --test abnormal --test strict_decode --test python
           cargo test --doc
 
       - name: Test (siphon extension, driven against siphon-sip)
         run: |
-          cargo test --features python --lib --test dialogue --test python
+          cargo test --features python --lib --test dialogue --test abnormal --test strict_decode --test python
           cargo test --features python --doc
 
       - name: Benches compile
@@ -116,6 +119,13 @@ jobs:
 
       - name: Wire tests (SCTP loopback, M3UA/M2PA/SUA, tshark gate)
         run: cargo test --test routing --test wire
+
+      # Every message the dialogue engine emits in answer to a damaged or
+      # unexpected one, dissected by Wireshark with assertions on the fields.
+      - name: Abnormal procedures (tshark field assertions)
+        env:
+          SIGTRAN_REQUIRE_TSHARK: "1"
+        run: cargo test --test abnormal --test strict_decode
 
       - name: Wire tests (siphon extension)
         run: cargo test --features python --test wire_python

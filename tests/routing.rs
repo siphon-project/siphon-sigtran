@@ -25,7 +25,7 @@ use async_sctp::{SctpAssociation, SctpConfig};
 
 use gsm_cap::operations::InitialDpArg;
 use gsm_map::operations::auth::SendAuthenticationInfoArg;
-use gsm_map::operations::location::{CancelLocationArg, UpdateLocationArg};
+use gsm_map::operations::location::{CancelLocationArg, Identity, UpdateLocationArg};
 use gsm_map::operations::mo_forward_sm::MoForwardSmArg;
 use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
 use gsm_map::operations::sri_sm::RoutingInfoForSmArg;
@@ -130,81 +130,53 @@ fn imsi_bytes(imsi_digits: &str) -> Vec<u8> {
 // ── MAP/CAP argument bytes (BER) ─────────────────────────────────────────────
 
 fn sri_sm_arg(msisdn: &str) -> Vec<u8> {
-    let arg = RoutingInfoForSmArg {
-        msisdn: isdn(msisdn).into(),
-        sm_rp_pri: true,
-        service_centre_address: isdn(OUR_GT).into(),
-        gprs_support_indicator: None,
-        sm_rp_mti: None,
-        sm_rp_smea: None,
-    };
+    let arg = RoutingInfoForSmArg::new(isdn(msisdn).into(), true, isdn(OUR_GT).into());
     rasn::ber::encode(&arg).expect("encode sri-sm")
 }
 
 fn update_location_arg(imsi: &str) -> Vec<u8> {
-    let arg = UpdateLocationArg {
-        imsi: imsi_bytes(imsi).into(),
-        msc_number: isdn("15550170").into(),
-        vlr_number: isdn("15550171").into(),
-        lmsi: None,
-        vlr_capability: None,
-    };
+    let arg = UpdateLocationArg::new(
+        imsi_bytes(imsi).into(),
+        isdn("15550170").into(),
+        isdn("15550171").into(),
+    );
     rasn::ber::encode(&arg).expect("encode ul")
 }
 
 fn cancel_location_arg(imsi: &str) -> Vec<u8> {
-    let arg = CancelLocationArg {
-        identity: imsi_bytes(imsi).into(),
-        cancellation_type: None,
-    };
+    let arg = CancelLocationArg::new(Identity::Imsi(imsi_bytes(imsi).into()));
     rasn::ber::encode(&arg).expect("encode cl")
 }
 
 fn send_auth_info_arg(imsi: &str) -> Vec<u8> {
-    let arg = SendAuthenticationInfoArg {
-        imsi: imsi_bytes(imsi).into(),
-        number_of_requested_vectors: 5.into(),
-        re_synchronisation_info: None,
-        requesting_node_type: None,
-    };
+    let arg = SendAuthenticationInfoArg::new(imsi_bytes(imsi).into(), 5.into());
     rasn::ber::encode(&arg).expect("encode sai")
 }
 
 fn mo_forward_sm_arg() -> Vec<u8> {
-    let arg = MoForwardSmArg {
-        sm_rp_da: SmRpDa::ServiceCentreAddressDa(isdn(OUR_GT).into()),
-        sm_rp_oa: SmRpOa::MsIsdn(isdn("15550142").into()),
-        sm_rp_ui: vec![0x00, 0x01, 0x02].into(),
-        imsi: None,
-    };
+    let arg = MoForwardSmArg::new(
+        SmRpDa::ServiceCentreAddressDa(isdn(OUR_GT).into()),
+        SmRpOa::MsIsdn(isdn("15550142").into()),
+        vec![0x00, 0x01, 0x02].into(),
+    );
     rasn::ber::encode(&arg).expect("encode mo")
 }
 
 fn mt_forward_sm_arg() -> Vec<u8> {
-    let arg = MtForwardSmArg {
-        sm_rp_da: SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
-        sm_rp_oa: SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
-        sm_rp_ui: vec![0x04, 0x0B, 0x91].into(),
-        more_messages_to_send: None,
-    };
+    let arg = MtForwardSmArg::new(
+        SmRpDa::Imsi(imsi_bytes("001010000000042").into()),
+        SmRpOa::ServiceCentreAddressOa(isdn(OUR_GT).into()),
+        vec![0x04, 0x0B, 0x91].into(),
+    );
     rasn::ber::encode(&arg).expect("encode mt")
 }
 
 fn initial_dp_arg(imsi: &str) -> Vec<u8> {
     let arg = InitialDpArg {
-        service_key: 100.into(),
         called_party_number: Some(isdn("15550142").into()),
         calling_party_number: Some(isdn("15550101").into()),
-        calling_partys_category: None,
-        original_called_party_id: None,
-        event_type_bcsm: None,
-        redirecting_party_id: None,
         imsi: Some(imsi_bytes(imsi).into()),
-        location_information: None,
-        call_reference_number: None,
-        msc_address: None,
-        called_party_bcd_number: None,
-        time_and_timezone: None,
+        ..InitialDpArg::new(100.into())
     };
     gsm_cap::encode(&arg).expect("encode idp")
 }
@@ -388,6 +360,7 @@ fn sri_sm_over_m3ua_addressed_to_us_routes_via_content_rule() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     // Non-home CdPA → falls through mt-sms-home-route to sri-sm-route (2000/6).
     match decision {
@@ -396,6 +369,49 @@ fn sri_sm_over_m3ua_addressed_to_us_routes_via_content_rule() {
             assert_eq!(ssn, 6);
         }
         other => panic!("expected RouteTo, got {other:?}"),
+    }
+}
+
+#[test]
+fn sri_sm_with_a_malformed_trailing_component_is_dropped_not_routed() {
+    use siphon_sigtran::content::{screen, Screening};
+    let r = router();
+    // The SRI-SM of the test above, with a second component appended to its
+    // component portion by hand: an Invoke that stops after its invoke id
+    // (`A1 03 02 01 02`). Both enclosing lengths grow by five.
+    let mut tcap = tcap_begin(
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        sri_sm_arg("19995550000"),
+    );
+    assert!(tcap[1] < 0x7A, "short-form lengths in this vector");
+    let portion = tcap
+        .windows(1)
+        .position(|w| w[0] == 0x6C)
+        .expect("the component portion tag");
+    tcap[1] += 5;
+    tcap[portion + 1] += 5;
+    tcap.extend_from_slice(&[0xA1, 0x03, 0x02, 0x01, 0x02]);
+
+    let sccp = sccp_udt("19995550000", SubsystemNumber::Hlr, &tcap);
+    let payload = m3ua_data(&sccp, 1000);
+    let (dpc, udt) = parse_m3ua(&payload);
+    let message = SccpMessage::Udt(udt.clone());
+    // The lenient decoder returned this message without its last component and
+    // the rules ran on the rest. It is now neither a view nor "nothing to
+    // screen".
+    assert_eq!(screen(&message), Screening::Undecodable);
+
+    let (called_ssn, cdpa, _) = view_from_udt(&udt);
+    let decision = r.route(&Inbound {
+        dpc,
+        cdpa,
+        called_ssn,
+        view: None,
+        content_undecodable: true,
+    });
+    match decision {
+        RouteDecision::Drop { reason } => assert!(reason.contains("content rules"), "{reason}"),
+        other => panic!("expected Drop, got {other:?}"),
     }
 }
 
@@ -418,6 +434,7 @@ fn sri_sm_for_home_sub_routes_to_group() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     match decision {
         RouteDecision::RouteTo { dpc, ssn, .. } => {
@@ -451,6 +468,7 @@ fn update_location_customer_a_routes_to_home_over_m2pa() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     match decision {
         RouteDecision::RouteTo { dpc, ssn, via, .. } => {
@@ -483,6 +501,7 @@ fn send_auth_info_customer_a_routes_to_home() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     assert!(matches!(
         decision,
@@ -513,6 +532,7 @@ fn cancel_location_customer_a_routes_to_home() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     assert!(matches!(
         decision,
@@ -555,6 +575,7 @@ fn mo_forward_sm_to_owned_ssn_terminates_local() {
         cdpa: None, // route-on-SSN, no GT to translate
         called_ssn,
         view: None,
+        ..Default::default()
     });
     assert_eq!(decision, RouteDecision::Local);
 }
@@ -575,6 +596,7 @@ fn mt_forward_sm_transits_to_serving_msc() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     // 2002 is not our PC → MTP3 transfer to AS msc.
     assert_eq!(
@@ -604,6 +626,7 @@ fn initial_dp_transits_to_scp() {
         cdpa,
         called_ssn,
         view: Some(view),
+        ..Default::default()
     });
     // 3000 is an m2pa adjacent → implicit route via linkset transit.
     assert_eq!(
@@ -634,6 +657,7 @@ fn gtt_route_on_gt_to_hlr() {
         cdpa,
         called_ssn,
         view: None,
+        ..Default::default()
     });
     match decision {
         RouteDecision::RouteTo { dpc, ssn, via, .. } => {
@@ -662,6 +686,7 @@ fn e214_mgt_converts_then_routes() {
         cdpa: Some(sel),
         called_ssn: Some(6),
         view: None,
+        ..Default::default()
     });
     match decision {
         RouteDecision::RouteTo { dpc, .. } => assert_eq!(dpc, 2000),

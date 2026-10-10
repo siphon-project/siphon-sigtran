@@ -25,8 +25,8 @@ async def on_update_location(dlg, event):
         if event.is_result:
             dlg.reply(gsm_map.update_location_res(hlr_number=HLR_NUMBER))
             dlg.end()  # close with the updateLocation result
-        elif event.is_error:
-            dlg.abort()  # the VLR refused the data
+        elif event.is_error or event.is_reject:
+            dlg.abort()  # the VLR refused the data (an error) or the invoke (a reject)
         return
     # Opening leg: push the subscriber profile, hold the dialogue open.
     imsi, msisdn = await load_profile(event.argument)
