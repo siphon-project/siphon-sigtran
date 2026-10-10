@@ -7,6 +7,8 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-10-10
+
 ### Added
 
 - **`sigtran_rx_discarded_total{reason}`**, and `metrics::RxDiscard` /
