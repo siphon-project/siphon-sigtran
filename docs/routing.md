@@ -172,8 +172,16 @@ call. The families:
 | `sigtran_tcap_reject_total` | counter | `dir`, `problem` |
 | `sigtran_tcap_discarded_total` | counter | `reason` |
 | `sigtran_tcap_send_errors_total` | counter | |
+| `sigtran_rx_discarded_total` | counter | `reason` |
 | `sigtran_loops_detected_total` | counter | `kind` |
 | `sigtran_isup_screened_total` | counter | `reason` |
+
+`sigtran_rx_discarded_total` counts what an association received and dropped
+before routing: `ppid` (not the adaptation layer's payload protocol identifier),
+`undecodable`, `out-of-state` (traffic from an ASP that is not active, or on a
+link that is not in service), `no-payload` (a data message without its user
+part) and `not-unitdata` (addressed to a local subsystem and not a UDT). Each is
+also a line on stderr naming the association. Alert on any of them moving.
 
 Good first panels: linkset / ASP state and route availability (is the node
 wired up?), MSU rate by SI, GTT translations vs errors, active dialogues, and

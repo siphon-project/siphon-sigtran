@@ -92,7 +92,7 @@ pub use tcap::{
 };
 
 use crate::config::Tcap;
-use crate::metrics::{self, AbortCause, AbortSource, Dir, RejectClass, TcapDiscard};
+use crate::metrics::{self, AbortCause, AbortSource, Dir, RejectClass, RxDiscard, TcapDiscard};
 use crate::transport::framing::SI_SCCP;
 use crate::transport::Msu;
 
@@ -1040,11 +1040,19 @@ impl DialogueEngine {
     /// send back to the peer, if any.
     pub fn deliver(&self, inbound: &Msu, ingress_assoc: &str) -> Vec<Msu> {
         if inbound.si != SI_SCCP {
+            not_unitdata(inbound, ingress_assoc, "not an SCCP message");
             return Vec::new();
         }
         let udt = match SccpMessage::decode(&inbound.payload) {
             Ok(SccpMessage::Udt(u)) => u,
-            _ => return Vec::new(),
+            Ok(other) => {
+                not_unitdata(inbound, ingress_assoc, sccp_type(&other));
+                return Vec::new();
+            }
+            Err(error) => {
+                not_unitdata(inbound, ingress_assoc, error);
+                return Vec::new();
+            }
         };
         // Whatever the answer is (a reply, an Abort for a message that belongs
         // to no dialogue), it goes back where the message came from.
@@ -1312,8 +1320,14 @@ impl DialogueEngine {
                     reply_to,
                 ),
                 // END with an unassigned destination transaction ID: Discard.
+                // An answer that comes after the dialogue timed out ends here,
+                // so say which one it was.
                 None => {
                     metrics::tcap_discard(TcapDiscard::UnknownTransaction);
+                    eprintln!(
+                        "siphon-sigtran: discarded an End for transaction {}, which is not open here (never was, or already ended or timed out)",
+                        hex(our_tid)
+                    );
                     Vec::new()
                 }
             };
@@ -1361,6 +1375,10 @@ impl DialogueEngine {
             // Table 7/Q.774, ABORT with an unassigned destination transaction
             // ID: Discard.
             metrics::tcap_discard(TcapDiscard::UnknownTransaction);
+            eprintln!(
+                "siphon-sigtran: discarded an Abort for transaction {}, which is not open here",
+                hex(&abort.dtid)
+            );
             return;
         };
         let (kind, cause) = classify_abort(abort);
@@ -1836,6 +1854,32 @@ fn send_abort(abort: &Abort, a: &Addressing) -> Vec<Msu> {
 /// an error is marked as one.
 fn log_error(message: std::fmt::Arguments<'_>) {
     eprintln!("siphon-sigtran: ERROR: {message}");
+}
+
+/// Count and log an MSU that was routed to a subsystem of this node and is not
+/// a unitdata message the engine reads. Only a UDT is read: an XUDT or an LUDT
+/// for a local subsystem ends here.
+fn not_unitdata(inbound: &Msu, ingress_assoc: &str, what: impl std::fmt::Display) {
+    metrics::rx_discard(RxDiscard::NotUnitdata);
+    eprintln!(
+        "siphon-sigtran: dropped a message received on `{ingress_assoc}` ({}): OPC {} DPC {} SI {}, {what}",
+        RxDiscard::NotUnitdata.label(),
+        inbound.opc,
+        inbound.dpc,
+        inbound.si
+    );
+}
+
+/// The name of an SCCP message type, for a log line.
+fn sccp_type(message: &SccpMessage) -> &'static str {
+    match message {
+        SccpMessage::Udt(_) => "UDT",
+        SccpMessage::Udts(_) => "UDTS",
+        SccpMessage::Xudt(_) => "XUDT",
+        SccpMessage::Xudts(_) => "XUDTS",
+        SccpMessage::Ludt(_) => "LUDT",
+        SccpMessage::Ludts(_) => "LUDTS",
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

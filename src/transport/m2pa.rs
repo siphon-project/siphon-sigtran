@@ -20,7 +20,8 @@ use tokio::sync::watch;
 use super::forward::dispatch;
 use super::framing;
 use super::registry::AssocSlot;
-use super::TaskCtx;
+use super::{discard, TaskCtx};
+use crate::metrics::RxDiscard;
 
 const STATUS_STREAM: u16 = 0;
 const PPID_M2PA: u32 = 5;
@@ -67,6 +68,11 @@ pub async fn run_link(
                     Err(_) => break,
                 };
                 if info.ppid != PPID_M2PA {
+                    discard(
+                        RxDiscard::Ppid,
+                        &slot.id,
+                        format_args!("payload protocol identifier {}, not M2PA", info.ppid),
+                    );
                     continue;
                 }
                 match M2paMessage::decode(&data) {
@@ -81,15 +87,20 @@ pub async fn run_link(
                             ctx.registry.recompute(&ctx.router);
                         }
                     }
-                    Ok(M2paMessage::UserData { .. }) => {
-                        if slot.is_carrying() {
-                            if let Ok(Some(msu)) = framing::extract_m2pa(&data) {
-                                dispatch(msu, &ctx, &slot.id).await;
-                            }
+                    Ok(M2paMessage::UserData { .. }) if slot.is_carrying() => {
+                        match framing::extract_m2pa(&data) {
+                            Ok(Some(msu)) => dispatch(msu, &ctx, &slot.id).await,
+                            Ok(None) => {}
+                            Err(error) => discard(RxDiscard::NoPayload, &slot.id, error),
                         }
-                        // User Data before in-service is dropped (as MTP2 would).
                     }
-                    Err(_) => continue,
+                    // User Data before in-service is dropped (as MTP2 would).
+                    Ok(M2paMessage::UserData { .. }) => discard(
+                        RxDiscard::OutOfState,
+                        &slot.id,
+                        format_args!("user data while the link is {:?}", sm.state()),
+                    ),
+                    Err(error) => discard(RxDiscard::Undecodable, &slot.id, error),
                 }
             }
         }

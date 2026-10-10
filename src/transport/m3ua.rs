@@ -32,8 +32,9 @@ use tokio::sync::watch;
 use super::forward::{self, dispatch};
 use super::framing;
 use super::registry::AssocSlot;
-use super::TaskCtx;
+use super::{discard, TaskCtx};
 use crate::config::TrafficMode;
+use crate::metrics::RxDiscard;
 
 const CTRL_STREAM: u16 = 0;
 const PPID_M3UA: u32 = 3;
@@ -64,11 +65,19 @@ pub async fn run_sg(
                     Err(_) => break,
                 };
                 if info.ppid != PPID_M3UA {
+                    discard(
+                        RxDiscard::Ppid,
+                        &slot.id,
+                        format_args!("payload protocol identifier {}, not M3UA", info.ppid),
+                    );
                     continue;
                 }
                 let msg = match M3uaMessage::decode(&data) {
                     Ok(m) => m,
-                    Err(_) => continue,
+                    Err(error) => {
+                        discard(RxDiscard::Undecodable, &slot.id, error);
+                        continue;
+                    }
                 };
                 // SSNM is not part of the ASP state machine; handle it directly.
                 if forward::is_ssnm(msg.message_type) {
@@ -82,11 +91,14 @@ pub async fn run_sg(
                     AspAction::Reply(reply) => {
                         let _ = assoc.send(&reply.encode(), CTRL_STREAM, PPID_M3UA).await;
                     }
-                    AspAction::Deliver => {
-                        if let Ok(msu) = framing::extract_m3ua(&data) {
-                            dispatch(msu, &ctx, &slot.id).await;
-                        }
-                    }
+                    AspAction::Deliver => deliver(&data, &ctx, &slot).await,
+                    // The state machine has no use for it. For DATA that means
+                    // the ASP is not active (RFC 4666 4.3.4.3).
+                    AspAction::Ignore if msg.message_type == MessageType::Data => discard(
+                        RxDiscard::OutOfState,
+                        &slot.id,
+                        format_args!("DATA while the ASP is {before:?}"),
+                    ),
                     AspAction::Ignore => {}
                 }
                 if before != after {
@@ -125,11 +137,19 @@ pub async fn run_asp(
                     Err(_) => break,
                 };
                 if info.ppid != PPID_M3UA {
+                    discard(
+                        RxDiscard::Ppid,
+                        &slot.id,
+                        format_args!("payload protocol identifier {}, not M3UA", info.ppid),
+                    );
                     continue;
                 }
                 let msg = match M3uaMessage::decode(&data) {
                     Ok(m) => m,
-                    Err(_) => continue,
+                    Err(error) => {
+                        discard(RxDiscard::Undecodable, &slot.id, error);
+                        continue;
+                    }
                 };
                 match msg.message_type {
                     MessageType::AspUpAck => {
@@ -158,13 +178,12 @@ pub async fn run_asp(
                             .await;
                     }
                     MessageType::HeartbeatAck => {}
-                    MessageType::Data => {
-                        if slot.is_carrying() {
-                            if let Ok(msu) = framing::extract_m3ua(&data) {
-                                dispatch(msu, &ctx, &slot.id).await;
-                            }
-                        }
-                    }
+                    MessageType::Data if slot.is_carrying() => deliver(&data, &ctx, &slot).await,
+                    MessageType::Data => discard(
+                        RxDiscard::OutOfState,
+                        &slot.id,
+                        "DATA before the ASP is active",
+                    ),
                     MessageType::Notify => {
                         // Status notification from the SG; no state change here.
                     }
@@ -177,6 +196,15 @@ pub async fn run_asp(
         }
     }
     disconnect(&slot, &ctx);
+}
+
+/// Hand the MSU of a DATA message to the router. A DATA message the MSU cannot
+/// be taken from is counted and logged.
+async fn deliver(data: &[u8], ctx: &TaskCtx, slot: &Arc<AssocSlot>) {
+    match framing::extract_m3ua(data) {
+        Ok(msu) => dispatch(msu, ctx, &slot.id).await,
+        Err(error) => discard(RxDiscard::NoPayload, &slot.id, error),
+    }
 }
 
 /// Mark the slot down and recompute availability when the association ends.
