@@ -7,6 +7,42 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A script reads what the gsmSSF sends in a CAMEL call**, typed, where 3.0.0
+  gave it the service key, the two called numbers and raw BER.
+  - The rest of an InitialDP on `IncomingOp`: `imsi`, `calling_party_number`,
+    `calling_partys_category`, `event_type_bcsm`, `subscriber_state` and
+    `not_reachable_reason`, `location_information` (a `LocationInformation`
+    with the VLR and MSC numbers, the cell global identity, the location area,
+    the age), `ext_basic_service_code`, `call_reference_number`, `msc_address`,
+    `time_and_timezone`, `call_forwarding_ss_pending`, and for a forwarded or
+    terminating call `original_called_party_id`, `redirecting_party_id`,
+    `redirection_information` and `gmsc_address`. They follow the getters there
+    were: `None` for an absent member or another operation,
+    `MistypedParameter` when the argument does not decode. The IMSI and the
+    address strings are given as digits, and a string that holds something
+    other than decimal digits is mistyped.
+  - `component.event_report_bcsm`, an `EventReportBcsm`: the event type, the
+    leg, whether the report is a request (the call waits for an instruction)
+    or a notification, and the event specific information: the release, busy
+    and failure causes, what an answer carries, the forwarding indications of
+    a terminating busy or no-answer, `route_not_permitted` of an abandon.
+  - `component.apply_charging_report`, an `ApplyChargingReport`: the party
+    charged, the time used with or without a tariff switch, `leg_active`
+    (`call_active` in phases 2 and 3), `call_leg_released_at_tcp_expiry`.
+  - `dlg.application_context` (the arcs, a tuple) and `dlg.camel_phase` (1 to
+    4), so a script can tell under which phase its dialogue runs.
+- **A `MistypedParameter` raised by a view of one component carries
+  `invoke_id`**, and the Reject the node sends for it names that component. A
+  turn with several components (a charging report and the disconnect it belongs
+  to) no longer has its first one rejected for the fault of another.
+
+ApplyCharging for CAMEL phase 2 is still not typed: the phase 2 form of the
+charging characteristics (GSM 09.78 clause 6.3, `releaseIfdurationExceeded [1]`
+as a SEQUENCE holding the tone) has no type in `gsm_cap` 3. A script now sees
+`dlg.camel_phase == 2` and can pass `charging_characteristics=`.
+
 ### Fixed
 
 - **A message for a local subsystem that arrived in an XUDT was dropped**, so a

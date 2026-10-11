@@ -65,6 +65,8 @@ use crate::routing::Router;
 use crate::transport::framing::{Msu, SI_SCCP};
 use crate::transport::{Origination, TransportHandle};
 
+mod cap;
+
 // ── Error ────────────────────────────────────────────────────────────────────
 create_exception!(
     siphon_sigtran,
@@ -627,6 +629,129 @@ impl PyIncomingOp {
             .map_err(|_| mistyped("the InitialDP serviceKey", "it does not fit an integer"))
     }
 
+    // The rest of a CAMEL initialDP. Each getter is `None` for another
+    // operation or an absent member, and raises `MistypedParameter` when the
+    // argument does not decode, as the three above do.
+
+    /// The `iMSI` of a CAMEL initialDP, as its digits.
+    #[getter]
+    fn imsi(&self) -> PyResult<Option<String>> {
+        cap::imsi(self)
+    }
+
+    /// The `callingPartyNumber` of a CAMEL initialDP: the octets of a Q.763
+    /// calling party number.
+    #[getter]
+    fn calling_party_number<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        cap::calling_party_number(py, self)
+    }
+
+    /// The `callingPartysCategory` of a CAMEL initialDP (Q.763): 10 is an
+    /// ordinary subscriber.
+    #[getter]
+    fn calling_partys_category(&self) -> PyResult<Option<u8>> {
+        cap::calling_partys_category(self)
+    }
+
+    /// The `eventTypeBCSM` of a CAMEL initialDP, the detection point that
+    /// triggered: 2 collectedInfo (an originating call), 12
+    /// termAttemptAuthorized (a terminating one), ...
+    #[getter]
+    fn event_type_bcsm(&self) -> PyResult<Option<i64>> {
+        cap::event_type_bcsm(self)
+    }
+
+    /// The `subscriberState` of a CAMEL initialDP: `assumed-idle`,
+    /// `camel-busy`, `net-det-not-reachable` or `not-provided-from-vlr`.
+    #[getter]
+    fn subscriber_state(&self) -> PyResult<Option<&'static str>> {
+        cap::subscriber_state(self)
+    }
+
+    /// Why the subscriber is `net-det-not-reachable`: `ms-purged`,
+    /// `imsi-detached`, `restricted-area` or `not-registered`.
+    #[getter]
+    fn not_reachable_reason(&self) -> PyResult<Option<&'static str>> {
+        cap::not_reachable_reason(self)
+    }
+
+    /// The `locationInformation` of a CAMEL initialDP, as a
+    /// [`LocationInformation`](cap::PyLocationInformation).
+    #[getter]
+    fn location_information(&self) -> PyResult<Option<cap::PyLocationInformation>> {
+        cap::location_information(self)
+    }
+
+    /// The `ext-basicServiceCode` of a CAMEL initialDP as `(kind, octets)`,
+    /// `kind` being `bearer-service` or `teleservice`.
+    #[getter]
+    fn ext_basic_service_code<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<(&'static str, Bound<'py, PyBytes>)>> {
+        cap::ext_basic_service_code(py, self)
+    }
+
+    /// The `callReferenceNumber` of a CAMEL initialDP. With `msc_address` it
+    /// identifies the call.
+    #[getter]
+    fn call_reference_number<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        cap::call_reference_number(py, self)
+    }
+
+    /// The `mscAddress` of a CAMEL initialDP, as its digits.
+    #[getter]
+    fn msc_address(&self) -> PyResult<Option<String>> {
+        cap::msc_address(self)
+    }
+
+    /// The `timeAndTimezone` of a CAMEL initialDP: eight octets, the date and
+    /// time in BCD with swapped nibbles, then the time zone.
+    #[getter]
+    fn time_and_timezone<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        cap::time_and_timezone(py, self)
+    }
+
+    /// Whether a CAMEL initialDP carries `callForwardingSS-Pending`: the call
+    /// is about to be forwarded by a supplementary service.
+    #[getter]
+    fn call_forwarding_ss_pending(&self) -> PyResult<bool> {
+        cap::call_forwarding_ss_pending(self)
+    }
+
+    /// The `originalCalledPartyID` of a CAMEL initialDP for a forwarded call:
+    /// the octets of a Q.763 original called number.
+    #[getter]
+    fn original_called_party_id<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        cap::original_called_party_id(py, self)
+    }
+
+    /// The `redirectingPartyID` of a CAMEL initialDP for a forwarded call: the
+    /// octets of a Q.763 redirecting number.
+    #[getter]
+    fn redirecting_party_id<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        cap::redirecting_party_id(py, self)
+    }
+
+    /// The `redirectionInformation` of a CAMEL initialDP: two octets (Q.763).
+    #[getter]
+    fn redirection_information<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        cap::redirection_information(py, self)
+    }
+
+    /// The `gmscAddress` of a CAMEL initialDP for a terminating or forwarded
+    /// call (in `initialDPArgExtension`), as its digits.
+    #[getter]
+    fn gmsc_address(&self) -> PyResult<Option<String>> {
+        cap::gmsc_address(self)
+    }
+
     /// The `serviceKey` of an INAP CS-1 initialDP: the IN service logic the SSF
     /// triggered on (an `@inap.on_operation("initial-dp")` handler keys its
     /// service selection on it). `None` for another operation. Raises
@@ -817,6 +942,24 @@ impl PyComponent {
     #[getter]
     fn parameter<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
         self.0.parameter.as_ref().map(|p| PyBytes::new(py, p))
+    }
+
+    /// A CAMEL EventReportBCSM, decoded, when this component is an Invoke of
+    /// it (operation 24); `None` for any other component. Raises
+    /// `MistypedParameter` when the argument does not decode.
+    #[getter]
+    fn event_report_bcsm(&self, py: Python<'_>) -> PyResult<Option<cap::PyEventReportBcsm>> {
+        cap::event_report_bcsm(py, &self.0)
+    }
+
+    /// A CAMEL ApplyChargingReport, decoded, when this component is an Invoke
+    /// of it (operation 36). As `event_report_bcsm`.
+    #[getter]
+    fn apply_charging_report(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Option<cap::PyApplyChargingReport>> {
+        cap::apply_charging_report(py, &self.0)
     }
 
     /// The error code of an error.
@@ -1384,6 +1527,9 @@ pub struct PyDialogue {
     cmds: Mutex<Vec<DlgCmd>>,
     otid: Vec<u8>,
     dtid: Vec<u8>,
+    /// The application context of the dialogue; empty when it has none, and
+    /// on the turn that reports a dialogue that is already gone.
+    application_context: Vec<u32>,
 }
 
 #[pymethods]
@@ -1513,6 +1659,24 @@ impl PyDialogue {
         PyBytes::new(py, &self.dtid)
     }
 
+    /// The application context of the dialogue as the arcs of its object
+    /// identifier, `(0, 4, 0, 0, 1, 21, 3, 4)`. `None` for a dialogue without
+    /// one, and on the turn that tells the script a dialogue is gone.
+    #[getter]
+    fn application_context<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        if self.application_context.is_empty() {
+            return Ok(None);
+        }
+        PyTuple::new(py, &self.application_context).map(Some)
+    }
+
+    /// The CAMEL phase the dialogue runs under, 1 to 4, read off its
+    /// application context. `None` when that is not a CAP context.
+    #[getter]
+    fn camel_phase(&self) -> Option<u8> {
+        cap::camel_phase(&self.application_context)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Dialogue(otid={}, dtid={})",
@@ -1523,11 +1687,12 @@ impl PyDialogue {
 }
 
 impl PyDialogue {
-    fn new(otid: Vec<u8>, dtid: Vec<u8>) -> Self {
+    fn new(otid: Vec<u8>, dtid: Vec<u8>, application_context: &[u32]) -> Self {
         PyDialogue {
             cmds: Mutex::new(Vec::new()),
             otid,
             dtid,
+            application_context: application_context.to_vec(),
         }
     }
 
@@ -1640,14 +1805,14 @@ impl PyHandler {
     /// Call the script for one leg on a live dialogue and replay what it staged.
     /// Returns whether the script staged anything.
     fn run(&self, dlg: &mut CoreDialogue, leg: Leg<'_>) -> bool {
-        let cmds = self.call(dlg.otid(), dlg.dtid(), leg);
+        let cmds = self.call(dlg.otid(), dlg.dtid(), dlg.application_context(), leg);
         let staged = !cmds.is_empty();
         let _ = replay(dlg, cmds);
         staged
     }
 
     /// Call the script for one leg and return the commands it staged.
-    fn call(&self, otid: &[u8], dtid: &[u8], leg: Leg<'_>) -> Vec<DlgCmd> {
+    fn call(&self, otid: &[u8], dtid: &[u8], ac: &[u32], leg: Leg<'_>) -> Vec<DlgCmd> {
         // What to reject if the script finds the parameter of this leg mistyped.
         let rejection = match &leg {
             Leg::Begin(op) => Some(op.mistyped_parameter()),
@@ -1658,7 +1823,7 @@ impl PyHandler {
             Leg::Start | Leg::Event(_) => None,
         };
         Python::attach(|py| {
-            let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec())) {
+            let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec(), ac)) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("siphon-sigtran: building Dialogue failed: {e}");
@@ -1731,7 +1896,9 @@ fn handler_raised(
     dtid: &[u8],
 ) -> Vec<DlgCmd> {
     let ids = format!("otid={} dtid={}", hex(otid), hex(dtid));
-    match rejection {
+    // A view of one component names the Invoke it could not read; without
+    // that, the component to reject is the first of the turn.
+    match cap::rejected_invoke(py, error).or(rejection) {
         Some((id, problem)) if error.is_instance_of::<MistypedParameter>(py) => {
             eprintln!("siphon-sigtran: dialogue {ids}: rejecting the component: {error}");
             vec![DlgCmd::Reject { id, problem }, DlgCmd::End]
@@ -1777,7 +1944,7 @@ impl TerminationHandler for PyHandler {
         // An end the script brought about or was handed as a turn is not told
         // twice. Whatever it stages on a dialogue that is over is discarded.
         if let Some(event) = TurnEvent::from_closed(&closed.reason) {
-            let _ = self.call(&closed.otid, &closed.dtid, Leg::Event(event));
+            let _ = self.call(&closed.otid, &closed.dtid, &[], Leg::Event(event));
         }
     }
 }
@@ -1872,17 +2039,29 @@ impl TerminationHandler for OriginationHandler {
 /// it stages onto the real dialogue. The follow-up-leg counterpart of
 /// [`PyHandler::run`], shared by the script-driven [`OriginationScriptHandler`].
 fn call_python_leg(func: &Py<PyAny>, dlg: &mut CoreDialogue, turn: PyPeerTurn) -> bool {
-    let cmds = call_python_turn(func, dlg.otid(), dlg.dtid(), turn);
+    let cmds = call_python_turn(
+        func,
+        dlg.otid(),
+        dlg.dtid(),
+        dlg.application_context(),
+        turn,
+    );
     let staged = !cmds.is_empty();
     let _ = replay(dlg, cmds);
     staged
 }
 
 /// Call `func(dialogue, turn)` and return the commands it staged.
-fn call_python_turn(func: &Py<PyAny>, otid: &[u8], dtid: &[u8], turn: PyPeerTurn) -> Vec<DlgCmd> {
+fn call_python_turn(
+    func: &Py<PyAny>,
+    otid: &[u8],
+    dtid: &[u8],
+    ac: &[u32],
+    turn: PyPeerTurn,
+) -> Vec<DlgCmd> {
     let rejection = turn.rejection;
     Python::attach(|py| {
-        let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec())) {
+        let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec(), ac)) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("siphon-sigtran: building Dialogue failed: {e}");
@@ -1945,7 +2124,7 @@ impl TerminationHandler for OriginationScriptHandler {
     fn on_closed(&self, closed: &DialogueClosed) {
         if let Some(event) = TurnEvent::from_closed(&closed.reason) {
             let turn = PyPeerTurn::from_event(event);
-            let _ = call_python_turn(&self.on_reply, &closed.otid, &closed.dtid, turn);
+            let _ = call_python_turn(&self.on_reply, &closed.otid, &closed.dtid, &[], turn);
         }
     }
 }
@@ -4147,6 +4326,7 @@ fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MapAcHandle>()?;
     m.add_class::<StagedInvoke>()?;
     m.add_class::<StagedResult>()?;
+    cap::add_classes(m)?;
 
     // Module functions.
     // Nothing here may carry a name the host gives one of its own namespaces:
