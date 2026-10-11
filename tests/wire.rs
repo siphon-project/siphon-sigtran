@@ -1517,6 +1517,67 @@ async fn wire_terminates_sri_sm_in_the_dialogue_engine() {
     handle.shutdown();
 }
 
+// ── Scenario 8a: the same in an XUDT ──────────────────────────────────────────
+
+/// The Begin arrives in an unsegmented XUDT (Q.713 4.18) for a subsystem of
+/// this node, over a live association. It reaches the dialogue engine as a UDT
+/// does (Q.714 4.1), and the answer comes back in an XUDT with a hop counter of
+/// its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_terminates_a_begin_that_arrives_in_an_xudt() {
+    let Some(mut handle) = start_node(TERMINATION_NODE, "wire_terminate_xudt").await else {
+        return;
+    };
+    let mut engine = DialogueEngine::new(Tcap::default());
+    engine.register(
+        6,
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        Arc::new(WireHlr),
+    );
+    let engine = Arc::new(engine);
+    handle.serve_dialogues(engine.clone());
+
+    let ingress = handle.bound_addr("ingress").expect("ingress bound");
+    let Some(mut peer) = AspPeer::connect(ingress, 0).await else {
+        eprintln!("SKIP wire_terminate_xudt: ingress connect failed");
+        return;
+    };
+    sleep(Duration::from_millis(150)).await;
+
+    let begin = tcap_begin(
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        sri_sm_arg("15559999"),
+        &AC_SRI_SM,
+    );
+    let called = SccpAddress::with_ssn(SubsystemNumber::Hlr, Some(NODE_PC as u16));
+    let calling = SccpAddress::with_ssn(SubsystemNumber::Msc, Some(OPC_UPSTREAM as u16));
+    let mut xudt = ExtendedUnitData::new(called.clone(), calling.clone(), begin);
+    xudt.hop_counter = 9;
+    let sccp = xudt.encode().expect("encode sccp xudt");
+    peer.send_in(&m3ua_sccp(&sccp, OPC_UPSTREAM, NODE_PC, 0))
+        .await;
+
+    let reply = peer.recv_out().await.expect("the answer");
+    let msg = M3uaMessage::decode(&reply).expect("m3ua");
+    let pd = msg.protocol_data().expect("protocol data");
+    assert_eq!((pd.opc, pd.dpc), (NODE_PC, OPC_UPSTREAM));
+    let SccpMessage::Xudt(answer) = SccpMessage::decode(&pd.user_data).expect("sccp") else {
+        panic!("the answer to an XUDT is an XUDT");
+    };
+    assert_eq!(answer.hop_counter, 15, "a hop counter of its own");
+    assert!(answer.optional_part.is_empty(), "sent whole");
+    assert_eq!(answer.called_party, calling, "to the calling party");
+    assert_eq!(answer.calling_party, called);
+    assert!(matches!(
+        tcap::decode(&answer.data).expect("tcap"),
+        TcapMessage::End(_)
+    ));
+    assert_eq!(engine.open_dialogues(), 0);
+
+    peer.close();
+    handle.shutdown();
+}
+
 // ── Scenario 8b: MAP dialogue origination over the wire (the node initiates) ──
 
 /// A node that owns HLR (SSN 6) locally AND routes DPC 2000 to an M3UA AS `hlr`.

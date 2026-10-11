@@ -268,9 +268,17 @@ fn udt_of(m: &Msu) -> UnitData {
     }
 }
 
-/// The TCAP octets an outbound MSU carries.
+/// The SCCP message an MSU carries.
+pub fn sccp_of(m: &Msu) -> SccpMessage {
+    SccpMessage::decode(&m.payload).expect("decode sccp")
+}
+
+/// The TCAP octets an outbound MSU carries, in a UDT or an XUDT.
 pub fn tcap_bytes(m: &Msu) -> Vec<u8> {
-    udt_of(m).data
+    match sccp_of(m) {
+        message @ (SccpMessage::Udt(_) | SccpMessage::Xudt(_)) => message.data().to_vec(),
+        other => panic!("the reply is not unitdata: {other}"),
+    }
 }
 
 /// Decode an outbound MSU with the strict decoder.
@@ -305,6 +313,57 @@ pub fn assert_reversed(m: &Msu) {
     let udt = udt_of(m);
     assert_eq!(udt.called_party.global_title.digits(), Some(PEER_GT));
     assert_eq!(udt.calling_party.global_title.digits(), Some(OUR_GT));
+}
+
+/// An SCCP extended unitdata (XUDT) message by hand, Q.713 4.18: the message
+/// type, the protocol class with the message handling in its upper half, the
+/// hop counter, four one-octet pointers (each counted from its own position to
+/// the length octet of what it points at, 0 for an absent optional part), then
+/// the called party address, the calling party address and the data, each
+/// behind its length, then the optional part as given.
+pub fn xudt(
+    handling: u8,
+    hop_counter: u8,
+    called: &[u8],
+    calling: &[u8],
+    data: &[u8],
+    optional: &[u8],
+) -> Vec<u8> {
+    let to_calling = 4 + called.len();
+    let to_data = to_calling + calling.len();
+    let to_optional = if optional.is_empty() {
+        0
+    } else {
+        to_data + data.len()
+    };
+    let mut out = vec![
+        0x11,
+        handling << 4,
+        hop_counter,
+        4,
+        to_calling as u8,
+        to_data as u8,
+        to_optional as u8,
+    ];
+    for part in [called, calling, data] {
+        out.push(part.len() as u8);
+        out.extend_from_slice(part);
+    }
+    out.extend_from_slice(optional);
+    out
+}
+
+/// An inbound MSU from the peer carrying `sccp`.
+pub fn inbound_sccp(sccp: Vec<u8>) -> Msu {
+    Msu {
+        opc: PEER_PC,
+        dpc: OUR_PC,
+        si: 3,
+        ni: 0,
+        mp: 0,
+        sls: 0,
+        payload: sccp,
+    }
 }
 
 pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -648,7 +707,7 @@ impl Dissection {
         self.fields
             .iter()
             .filter(|f| {
-                ["tcap.", "gsm_old.", "gsm_map.", "camel.", "inap."]
+                ["sccp.", "tcap.", "gsm_old.", "gsm_map.", "camel.", "inap."]
                     .iter()
                     .any(|p| f.name.starts_with(p))
             })

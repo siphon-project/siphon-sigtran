@@ -81,6 +81,7 @@ mod m3ua;
 pub mod registry;
 mod sua;
 
+pub(crate) use forward::sccp_return;
 pub use framing::Msu;
 pub use m2pa::next_status;
 pub use registry::Registry;

@@ -1479,8 +1479,8 @@ fn dialogue_timer_ages_out_an_idle_dialogue() {
 }
 
 /// What the engine is handed and does not read is counted, never dropped in
-/// silence: an XUDT for a local subsystem (only a UDT is read), octets that are
-/// not SCCP, and an MSU of another user part.
+/// silence: a segment of a segmented XUDT for a local subsystem (there is no
+/// reassembly), octets that are not SCCP, and an MSU of another user part.
 #[test]
 fn a_local_message_the_engine_does_not_read_is_counted() {
     use siphon_sigtran::metrics::RxDiscard;
@@ -1490,13 +1490,10 @@ fn a_local_message_the_engine_does_not_read_is_counted() {
 
     let called = SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Hlr));
     let calling = SccpAddress::with_gt(gt(PEER_GT), Some(SubsystemNumber::Msc));
-    let xudt = SccpMessage::Xudt(sccp::ExtendedUnitData::new(
-        called,
-        calling,
-        vec![0x62, 0x00],
-    ))
-    .encode()
-    .expect("encode xudt");
+    let mut segment = sccp::ExtendedUnitData::new(called, calling, vec![0x62, 0x00]);
+    // Segmentation (Q.713 3.17): first segment, one more to come.
+    segment.optional_part = vec![0x10, 0x04, 0x81, 0x00, 0x00, 0x01, 0x00];
+    let xudt = SccpMessage::Xudt(segment).encode().expect("encode xudt");
     assert!(e.deliver(&msu(xudt), "peer").is_empty());
     assert!(e.deliver(&msu(vec![0xFF, 0x00]), "peer").is_empty());
     let mut isup = msu(vec![0x00, 0x01]);

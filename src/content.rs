@@ -213,7 +213,7 @@ pub fn decode_map_view(sccp: &SccpMessage) -> Option<MapView> {
 /// Whether the message is one segment of a segmented message: an XUDT or LUDT
 /// whose optional part carries a Segmentation parameter (Q.713 3.17, parameter
 /// name `0x10`, four octets) that is not "first segment, no segments remaining".
-fn is_segment(sccp: &SccpMessage) -> bool {
+pub(crate) fn is_segment(sccp: &SccpMessage) -> bool {
     let optional = match sccp {
         SccpMessage::Xudt(m) => &m.optional_part,
         SccpMessage::Ludt(m) => &m.optional_part,
