@@ -45,8 +45,19 @@
 //! outage and remote congestion, link failure and realignment. On top of it,
 //! the signalling link test of Q.707: a link is an egress only after its test
 //! passed, and a test message from the peer is always answered. See
-//! [`M2paLink`] for the state machine. Level 3 management (changeover,
-//! transfer-prohibited, ...) is not part of this layer.
+//! [`M2paLink`] for the state machine.
+//!
+//! ## Level 3 of a transfer point
+//!
+//! Signalling network management as ITU-T Q.704 has it runs in one task per
+//! routing domain ([`crate::mtp3::management`] is the state machine): changeover
+//! and changeback when a link fails and returns, forced and controlled
+//! rerouting when an adjacent point prohibits or allows a route,
+//! transfer-prohibited and transfer-allowed toward the adjacent points when a
+//! destination becomes inaccessible or accessible here, the signalling route
+//! set test, management inhibiting at the far end's request, and the MTP
+//! restart procedure. A management message for this node (service indicator 0)
+//! from a link goes there, not to SCCP.
 //!
 //! ## Transfer is Service-Indicator-agnostic
 //!
@@ -75,6 +86,7 @@ use tokio::task::JoinHandle;
 use crate::config::{Adaptation, Association, Config, Role, DEFAULT_TENANT};
 use crate::dialogue::{DialogueEngine, OutgoingBegin, TerminationHandler};
 use crate::metrics;
+use crate::mtp3::management::{Management, Timers, Topology};
 use crate::mtp3::route::Destination;
 use crate::routing::{Inbound, RouteDecision, Router};
 
@@ -82,6 +94,7 @@ mod forward;
 pub mod framing;
 mod m2pa;
 mod m3ua;
+mod management;
 pub mod registry;
 mod sua;
 
@@ -92,7 +105,7 @@ pub use m2pa::link::{
 };
 #[allow(deprecated)]
 pub use m2pa::next_status;
-pub use registry::Registry;
+pub use registry::{DestinationChange, Registry};
 
 /// The lifecycle state an association's adaptation layer exposes.
 ///
@@ -217,6 +230,33 @@ impl TransportHandle {
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
         let mut bound = HashMap::new();
 
+        // Signalling network management of the domain (ITU-T Q.704): one task,
+        // fed by the link tasks and the transfer path.
+        let tenant = config
+            .tenant(tenant_id)
+            .ok_or_else(|| TransportError::Config(format!("unknown tenant `{tenant_id}`")))?;
+        let machine = Management::new(
+            Topology::build(tenant, &config.associations),
+            Timers::from(&tenant.mtp3),
+            tenant.mtp3.tfp_for_unknown_destination,
+        );
+        let (inputs, input_rx) = mpsc::unbounded_channel();
+        let (unroutable, unroutable_rx) = mpsc::channel(256);
+        registry.attach_management(inputs, unroutable);
+        let management_ctx = TaskCtx {
+            router: router.clone(),
+            registry: registry.clone(),
+            tenant: tenant_id.to_string(),
+            local_tx: local_tx.clone(),
+        };
+        tasks.push(tokio::spawn(management::run(
+            machine,
+            input_rx,
+            unroutable_rx,
+            management_ctx,
+            shutdown_rx.clone(),
+        )));
+
         for assoc in &config.associations {
             let slot = registry
                 .slot(&assoc.id)
@@ -234,6 +274,16 @@ impl TransportHandle {
                 (Adaptation::M3ua, Role::Server)
                 | (Adaptation::M2pa, Role::Server)
                 | (Adaptation::Sua, Role::Server) => {
+                    // A link nobody has connected to yet still has its queue
+                    // served.
+                    if assoc.adaptation == Adaptation::M2pa {
+                        tasks.push(tokio::spawn(m2pa::idle_link(
+                            slot.clone(),
+                            ctx.clone(),
+                            shutdown_rx.clone(),
+                            0,
+                        )));
+                    }
                     let listener = bind(&addrs, &sctp_cfg)?;
                     bound.insert(assoc.id.clone(), listener.local_addr()?);
                     tasks.push(tokio::spawn(accept_loop(

@@ -323,6 +323,112 @@ impl Linkset {
     }
 }
 
+// ── MTP3 management ─────────────────────────────────────────────────────────
+
+/// The `mtp3:` block: signalling network management of a transfer point
+/// (ITU-T Q.704). Every timer is in milliseconds; the defaults are the values
+/// of Q.704 16.8 (where it gives a range, a value inside it).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Mtp3 {
+    /// T1, delay to avoid mis-sequencing on changeover (500 to 1200 ms).
+    pub t1_ms: u64,
+    /// T2, waiting for the changeover acknowledgement (700 to 2000 ms).
+    pub t2_ms: u64,
+    /// T3, time-controlled diversion on changeback (500 to 1200 ms).
+    pub t3_ms: u64,
+    /// T4, waiting for the changeback acknowledgement, first attempt (500 to
+    /// 1200 ms).
+    pub t4_ms: u64,
+    /// T5, waiting for the changeback acknowledgement, second attempt (500 to
+    /// 1200 ms).
+    pub t5_ms: u64,
+    /// T6, delay to avoid mis-sequencing on controlled rerouting (500 to
+    /// 1200 ms).
+    pub t6_ms: u64,
+    /// T8, transfer-prohibited inhibition (800 to 1200 ms).
+    pub t8_ms: u64,
+    /// T10, waiting to repeat the signalling route set test (30 to 60 s).
+    pub t10_ms: u64,
+    /// T12, waiting for the uninhibit acknowledgement (800 to 1500 ms).
+    pub t12_ms: u64,
+    /// T13, waiting for the force uninhibit (800 to 1500 ms).
+    pub t13_ms: u64,
+    /// T18, the first phase of this node's MTP restart: how long it waits for
+    /// the traffic restart allowed of its adjacent points. Q.704 leaves the
+    /// value to the implementation and the network.
+    pub t18_ms: u64,
+    /// T19, during which a second traffic restart allowed from the same
+    /// adjacent point is ignored (67 to 69 s).
+    pub t19_ms: u64,
+    /// T20, the overall restart timer of this node (59 to 61 s).
+    pub t20_ms: u64,
+    /// T21, how long an adjacent point that restarts is waited for before
+    /// traffic is sent to it (63 to 65 s).
+    pub t21_ms: u64,
+    /// T23, the interval of the remote inhibit test (3 to 6 minutes).
+    pub t23_ms: u64,
+    /// Whether a message for a point code this node has no route for at all
+    /// is answered with transfer-prohibited, as it is for a destination that
+    /// is known and inaccessible. Footnote 7 of Q.704 13.2.2 leaves that to
+    /// the network operator.
+    pub tfp_for_unknown_destination: bool,
+    /// Messages held for one destination while its traffic is rerouted under
+    /// T6, before further ones are discarded.
+    pub rerouting_buffer: usize,
+}
+
+impl Default for Mtp3 {
+    fn default() -> Self {
+        Self {
+            t1_ms: 800,
+            t2_ms: 1_400,
+            t3_ms: 800,
+            t4_ms: 800,
+            t5_ms: 800,
+            t6_ms: 800,
+            t8_ms: 1_000,
+            t10_ms: 45_000,
+            t12_ms: 1_150,
+            t13_ms: 1_150,
+            t18_ms: 20_000,
+            t19_ms: 68_000,
+            t20_ms: 60_000,
+            t21_ms: 64_000,
+            t23_ms: 240_000,
+            tfp_for_unknown_destination: true,
+            rerouting_buffer: 4_096,
+        }
+    }
+}
+
+impl Mtp3 {
+    /// The key of the first timer or size that is 0, which none may be.
+    fn zero_key(&self) -> Option<&'static str> {
+        [
+            ("t1_ms", self.t1_ms),
+            ("t2_ms", self.t2_ms),
+            ("t3_ms", self.t3_ms),
+            ("t4_ms", self.t4_ms),
+            ("t5_ms", self.t5_ms),
+            ("t6_ms", self.t6_ms),
+            ("t8_ms", self.t8_ms),
+            ("t10_ms", self.t10_ms),
+            ("t12_ms", self.t12_ms),
+            ("t13_ms", self.t13_ms),
+            ("t18_ms", self.t18_ms),
+            ("t19_ms", self.t19_ms),
+            ("t20_ms", self.t20_ms),
+            ("t21_ms", self.t21_ms),
+            ("t23_ms", self.t23_ms),
+            ("rerouting_buffer", self.rerouting_buffer as u64),
+        ]
+        .iter()
+        .find(|(_, value)| *value == 0)
+        .map(|(key, _)| *key)
+    }
+}
+
 // ── MTP3 routes ─────────────────────────────────────────────────────────────
 
 /// One `mtp3_routes:` entry: a static route to a DPC via an Application Server
@@ -697,6 +803,9 @@ pub struct Tenant {
     /// The tenant's MTP3 route table.
     #[serde(default)]
     pub mtp3_routes: Vec<Mtp3Route>,
+    /// The tenant's signalling network management (timers of ITU-T Q.704).
+    #[serde(default)]
+    pub mtp3: Mtp3,
     /// The tenant's SCCP/GTT tables.
     #[serde(default)]
     pub sccp: Sccp,
@@ -730,6 +839,8 @@ struct RawFile {
     linksets: Vec<Linkset>,
     #[serde(default)]
     mtp3_routes: Vec<Mtp3Route>,
+    #[serde(default)]
+    mtp3: Option<Mtp3>,
     #[serde(default)]
     sccp: Option<Sccp>,
     #[serde(default)]
@@ -793,13 +904,14 @@ impl Config {
                 if !raw.application_servers.is_empty()
                     || !raw.linksets.is_empty()
                     || !raw.mtp3_routes.is_empty()
+                    || raw.mtp3.is_some()
                     || raw.sccp.is_some()
                     || raw.content_routing.is_some()
                     || raw.isup_screening.is_some()
                 {
                     return Err(Error::validation(
                         "top-level routing fields (application_servers/linksets/mtp3_routes/\
-                         sccp/content_routing/isup_screening) cannot be mixed with an explicit \
+                         mtp3/sccp/content_routing/isup_screening) cannot be mixed with an explicit \
                          `tenants:` block",
                     ));
                 }
@@ -820,6 +932,7 @@ impl Config {
                         application_servers: raw.application_servers,
                         linksets: raw.linksets,
                         mtp3_routes: raw.mtp3_routes,
+                        mtp3: raw.mtp3.unwrap_or_default(),
                         sccp: raw.sccp.unwrap_or_default(),
                         content_routing: raw.content_routing,
                         isup_screening: raw.isup_screening,
@@ -922,6 +1035,10 @@ impl Config {
         tenant
             .resolved_point_code()
             .map_err(|e| where_(format!("point_code: {e}")))?;
+
+        if let Some(key) = tenant.mtp3.zero_key() {
+            return Err(where_(format!("mtp3 `{key}` must not be 0")));
+        }
 
         // Route-destination names live in one namespace across Application
         // Servers and linksets, so `mtp3_routes` can reference either and a name
@@ -1838,5 +1955,50 @@ tenants:
 "#;
         let err = Config::parse(yaml).unwrap_err();
         assert!(err.to_string().contains("cannot be mixed"));
+    }
+
+    #[test]
+    fn mtp3_management_defaults_to_the_q704_timers() {
+        // A file without an `mtp3:` block loads unchanged, with Q.704 16.8.
+        let cfg = Config::parse(SAMPLE).unwrap();
+        let mtp3 = &cfg.default_tenant().unwrap().mtp3;
+        assert_eq!(*mtp3, Mtp3::default());
+        // 16.8: T1 "500 (800) to 1200 ms", T2 "700 (1400) to 2000 ms", T8
+        // "800 to 1200 ms", T10 "30 to 60 seconds", T19 "67 to 69 seconds",
+        // T20 "59 to 61 seconds", T21 "63 to 65 seconds".
+        assert_eq!((mtp3.t1_ms, mtp3.t2_ms, mtp3.t8_ms), (800, 1_400, 1_000));
+        assert!((30_000..=60_000).contains(&mtp3.t10_ms));
+        assert!((67_000..=69_000).contains(&mtp3.t19_ms));
+        assert!((59_000..=61_000).contains(&mtp3.t20_ms));
+        assert!((63_000..=65_000).contains(&mtp3.t21_ms));
+        assert!(mtp3.t18_ms < mtp3.t20_ms, "phase 1 ends inside the restart");
+        assert!(mtp3.tfp_for_unknown_destination);
+    }
+
+    #[test]
+    fn the_mtp3_block_sets_timers_and_keeps_the_other_defaults() {
+        let yaml = "node: { point_code: 1000, variant: ITU }\n\
+                    mtp3: { t2_ms: 900, t21_ms: 5000, tfp_for_unknown_destination: false }\n";
+        let cfg = Config::parse(yaml).unwrap();
+        let mtp3 = &cfg.default_tenant().unwrap().mtp3;
+        assert_eq!((mtp3.t2_ms, mtp3.t21_ms), (900, 5_000));
+        assert!(!mtp3.tfp_for_unknown_destination);
+        assert_eq!(mtp3.t1_ms, Mtp3::default().t1_ms);
+
+        // Under an explicit domain it is that domain's.
+        let yaml =
+            "tenants:\n  default: { point_code: 1000, variant: ITU, mtp3: { t6_ms: 600 } }\n";
+        let cfg = Config::parse(yaml).unwrap();
+        assert_eq!(cfg.default_tenant().unwrap().mtp3.t6_ms, 600);
+    }
+
+    #[test]
+    fn rejects_an_mtp3_timer_of_zero() {
+        for key in ["t1_ms", "t8_ms", "t18_ms", "rerouting_buffer"] {
+            let yaml =
+                format!("node: {{ point_code: 1000, variant: ITU }}\nmtp3: {{ {key}: 0 }}\n");
+            let err = Config::parse(&yaml).unwrap_err().to_string();
+            assert!(err.contains(key) && err.contains("must not be 0"), "{err}");
+        }
     }
 }

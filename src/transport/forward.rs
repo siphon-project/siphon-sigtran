@@ -15,7 +15,8 @@ use super::framing::{self, Msu};
 use super::{LocalDelivery, Registry, TaskCtx};
 use crate::config::Adaptation;
 use crate::isup::{IsupScreen, Screened};
-use crate::metrics::{self, LoopKind};
+use crate::metrics::{self, LoopKind, Mtp3Discard};
+use crate::mtp3::management::Input;
 use crate::mtp3::route::Destination;
 use crate::routing::{Inbound, RouteDecision};
 use crate::sccp::gtt::GttSelector;
@@ -139,7 +140,8 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
 
     // Loop guard 1 (own-OPC): a message whose OPC is our own point code is one
     // we originated coming back to us. Drop it before it can loop.
-    if let Some(our_pc) = ctx.router.node_point_code(&ctx.tenant) {
+    let node_pc = ctx.router.node_point_code(&ctx.tenant);
+    if let Some(our_pc) = node_pc {
         if msu.opc == our_pc {
             metrics::record_loop(LoopKind::OwnOpc);
             eprintln!(
@@ -170,7 +172,9 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
             }
         }
     }
-    match ctx.router.route_in(&ctx.tenant, &inbound) {
+    // The signalling link selection of the label picks among routes of equal
+    // priority (Q.704 2.3.2 b).
+    match ctx.router.route_for(&ctx.tenant, &inbound, msu.sls) {
         RouteDecision::Route { via } => {
             // ISUP screening on the SI=5 transit path (opt-in per tenant). Only an
             // SI=5 MSU consults `isup_screen`; every other Service Indicator (the
@@ -185,6 +189,10 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
             }
             if is_reflection(inbound_src.as_ref(), &via) {
                 loop_reflect(&via, &msu, inbound_assoc);
+                // The point it came from is the one this node routes it
+                // through: it is not transferred, and that point is told
+                // (Q.704 13.2.2 iii, the response method).
+                ctx.registry.unroutable(msu.dpc, inbound_assoc);
                 return;
             }
             send_via(&via, &msu, &ctx.registry).await
@@ -248,6 +256,14 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
         }
         RouteDecision::Drop { reason } => {
             eprintln!("siphon-sigtran: dropping MSU to {}: {reason}", msu.dpc);
+            // Q.704 2.4.1: "When a signalling transfer point detects that a
+            // received message cannot be delivered to its destination point,
+            // it sends in response a transfer-prohibited message as specified
+            // in 13.2." A message for this node itself is not a transfer.
+            if node_pc.is_some_and(|pc| pc != msu.dpc) {
+                metrics::mtp3_discard(Mtp3Discard::NoRoute, 1);
+                ctx.registry.unroutable(msu.dpc, inbound_assoc);
+            }
             return_undeliverable(
                 &msu,
                 ReturnCause::NoTranslationForAddress,
@@ -478,44 +494,54 @@ async fn return_undeliverable(
 /// the [`Registry`] directly (not the whole [`TaskCtx`]) so the origination path
 /// — which routes an originated `Begin` by DPC without an inbound context — can
 /// reuse the same egress selection + framing as the transfer path.
+///
+/// A message for a destination whose traffic is held for controlled rerouting
+/// (Q.704 8.2.1 a) goes into that buffer instead, and leaves by the routing as
+/// it is when T6 runs out.
 pub(crate) async fn send_via(via: &Destination, msu: &Msu, registry: &Registry) {
+    if registry.hold_if_rerouting(msu) {
+        return;
+    }
+    send_now(via, msu, registry).await;
+}
+
+/// [`send_via`] for a message that is not to be held.
+async fn send_now(via: &Destination, msu: &Msu, registry: &Registry) {
+    // An M2PA link numbers and sends its own User Data: hand the MSU to the
+    // link, which counts it when it goes out.
+    if let Destination::Linkset(name) = via {
+        match registry.select_link(name, msu.sls) {
+            Some(slot) => send_on_link(slot, msu),
+            None => no_egress(via, msu),
+        }
+        return;
+    }
     let selected = registry.select(via, msu.sls);
     if selected.is_empty() {
-        eprintln!(
-            "siphon-sigtran: no active egress for {via} (dpc {})",
-            msu.dpc
-        );
+        no_egress(via, msu);
         return;
     }
     for sel in selected {
-        let (bytes, stream, ppid) = match via {
-            // An Application Server is served by M3UA or SUA ASPs; the egress
-            // framing follows the selected association's adaptation (M3UA DATA on
-            // a point-code routing label, or a SUA CLDT wrapping the SCCP user).
-            Destination::ApplicationServer(_) => match sel.adaptation {
-                Adaptation::M3ua => (
-                    framing::wrap_m3ua(msu, sel.routing_context),
-                    M3UA_DATA_STREAM,
-                    PPID_M3UA,
-                ),
-                Adaptation::Sua => match framing::wrap_sua(msu, sel.routing_context.unwrap_or(0)) {
-                    Ok(b) => (b, SUA_DATA_STREAM, PPID_SUA),
-                    Err(e) => {
-                        eprintln!("siphon-sigtran: sua framing failed: {e}");
-                        continue;
-                    }
-                },
-                Adaptation::M2pa => {
-                    eprintln!(
-                        "siphon-sigtran: application-server egress selected an m2pa association (invalid config), dropping"
-                    );
+        // An Application Server is served by M3UA or SUA ASPs; the egress
+        // framing follows the selected association's adaptation (M3UA DATA on
+        // a point-code routing label, or a SUA CLDT wrapping the SCCP user).
+        let (bytes, stream, ppid) = match sel.adaptation {
+            Adaptation::M3ua => (
+                framing::wrap_m3ua(msu, sel.routing_context),
+                M3UA_DATA_STREAM,
+                PPID_M3UA,
+            ),
+            Adaptation::Sua => match framing::wrap_sua(msu, sel.routing_context.unwrap_or(0)) {
+                Ok(b) => (b, SUA_DATA_STREAM, PPID_SUA),
+                Err(e) => {
+                    eprintln!("siphon-sigtran: sua framing failed: {e}");
                     continue;
                 }
             },
-            // An M2PA link numbers and sends its own User Data: hand the MSU
-            // to the link, which counts it when it goes out.
-            Destination::Linkset(_) => {
-                send_on_link(&sel.slot, msu);
+            Adaptation::M2pa => {
+                eprintln!(
+                    "siphon-sigtran: application-server egress selected an m2pa association (invalid config), dropping"
+                );
                 continue;
             }
         };
@@ -523,6 +549,95 @@ pub(crate) async fn send_via(via: &Destination, msu: &Msu, registry: &Registry) 
             eprintln!("siphon-sigtran: egress send on {via} failed: {e}");
         } else {
             metrics::msu(metrics::Dir::Tx, msu.si);
+        }
+    }
+}
+
+/// A route was chosen and nothing on it carries traffic: counted and logged.
+fn no_egress(via: &Destination, msu: &Msu) {
+    metrics::mtp3_discard(Mtp3Discard::NoEgress, 1);
+    eprintln!(
+        "siphon-sigtran: no active egress for {via} (dpc {}), message dropped",
+        msu.dpc
+    );
+}
+
+/// Send what was held for a destination during controlled rerouting, by the
+/// routing as it now is (Q.704 8.2.1 c: "starting with the content of the
+/// controlled rerouting buffer"), until the buffer is found empty.
+pub(crate) async fn release_destination(dpc: u32, ctx: &TaskCtx) {
+    while let Some(batch) = ctx.registry.release_destination(dpc) {
+        for msu in batch {
+            match ctx.router.egress_for(&ctx.tenant, msu.dpc, msu.sls, None) {
+                Some(via) => send_now(&via, &msu, &ctx.registry).await,
+                None => {
+                    metrics::mtp3_discard(Mtp3Discard::NoRoute, 1);
+                    eprintln!(
+                        "siphon-sigtran: dpc {} became inaccessible during rerouting, held message dropped",
+                        msu.dpc
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Send an MSU (SIO and SIF) that the link `from` held or was handed and will
+/// not carry: by another link of its linkset, or by another route to its
+/// destination (Q.704 4.3.2, 4.3.3).
+pub(crate) async fn reroute(raw: Vec<u8>, ctx: &TaskCtx, from: &super::registry::AssocSlot) {
+    let decoded = match mtp3::Mtp3Msu::decode(&raw, mtp3::Variant::Itu) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            metrics::mtp3_discard(Mtp3Discard::NoAlternative, 1);
+            eprintln!(
+                "siphon-sigtran: a message held by `{}` cannot be read back ({error}), dropped",
+                from.id
+            );
+            return;
+        }
+    };
+    let msu = Msu {
+        opc: decoded.opc.value(),
+        dpc: decoded.dpc.value(),
+        si: decoded.si.0,
+        ni: decoded.ni.bits(),
+        mp: decoded.mp,
+        sls: decoded.sls,
+        payload: decoded.data,
+    };
+    // Routing may still lead to `from` itself: it is passed by here, link
+    // first, then its whole linkset.
+    let own = ctx.registry.inbound_destination(&from.id);
+    let mut via = ctx.router.egress_for(&ctx.tenant, msu.dpc, msu.sls, None);
+    if via.is_some() && via == own {
+        if let Some(Destination::Linkset(name)) = &own {
+            let other = ctx
+                .registry
+                .select_link_avoiding(name, msu.sls, Some(&from.id));
+            if let Some(slot) = other {
+                if !ctx.registry.hold_if_rerouting(&msu) {
+                    send_on_link(slot, &msu);
+                }
+                return;
+            }
+        }
+        via = ctx
+            .router
+            .egress_for(&ctx.tenant, msu.dpc, msu.sls, own.as_ref());
+    }
+    match via {
+        Some(via) => send_via(&via, &msu, &ctx.registry).await,
+        // Q.704 5.3.3 i): "the concerned messages already stored in the
+        // transmission and retransmission buffers of the unavailable
+        // signalling link, as well as those received subsequently, are
+        // discarded".
+        None => {
+            metrics::mtp3_discard(Mtp3Discard::NoAlternative, 1);
+            eprintln!(
+                "siphon-sigtran: no alternative to `{}` for dpc {}, message dropped",
+                from.id, msu.dpc
+            );
         }
     }
 }
@@ -577,6 +692,12 @@ pub async fn handle_ssnm(msg: &M3uaMessage, ctx: &TaskCtx, reply: &SctpAssociati
                 if let Some(p) = to_pc(pc) {
                     ctx.router
                         .apply_mtp3_event(&ctx.tenant, &Mtp3Event::Pause { affected: p });
+                    // Signalling route management announces it to the
+                    // adjacent points like any other inaccessibility.
+                    ctx.registry.manage(Input::Paused {
+                        dpc: pc,
+                        paused: true,
+                    });
                 }
             }
         }
@@ -585,6 +706,10 @@ pub async fn handle_ssnm(msg: &M3uaMessage, ctx: &TaskCtx, reply: &SctpAssociati
                 if let Some(p) = to_pc(pc) {
                     ctx.router
                         .apply_mtp3_event(&ctx.tenant, &Mtp3Event::Resume { affected: p });
+                    ctx.registry.manage(Input::Paused {
+                        dpc: pc,
+                        paused: false,
+                    });
                 }
             }
         }

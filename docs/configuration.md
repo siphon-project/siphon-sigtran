@@ -35,8 +35,15 @@ application_servers:
 linksets:
   - { name: transit, links: [{assoc: xit-1}] }
 
+# Signalling network management (ITU-T Q.704): its timers, in milliseconds.
+# Every key is optional; these two are the ones a lab changes first.
+mtp3:
+  t18_ms: 20000               # how long a restart waits for adjacent points
+  t21_ms: 64000               # how long a restarting adjacent point is waited for
+
 # MTP3 routes: dpc -> an AS or a linkset, priority (1 = primary, higher =
-# alternate). The adjacent PC of an m2pa link (3000) is an implicit route.
+# alternate, equal = shared by SLS). The adjacent PC of an m2pa link (3000)
+# is an implicit route.
 mtp3_routes:
   - { dpc: 2000, as: hlr,          priority: 1 }
   - { dpc: 2000, linkset: transit, priority: 2 }   # alternate via M2PA transit
@@ -143,8 +150,16 @@ ASPSM/ASPTM state machine brings it up.
 
 M2PA linksets (RFC 4165). M2PA replaces MTP2, so the classic linkset/link
 model applies directly: a linkset groups links toward an adjacent point code,
-and SLS spreads traffic across the in-service links. There is no traffic mode
-here.
+and SLS spreads traffic across its links. There is no traffic mode here.
+
+Each selection code has a normal link, by the position of the links in
+`links` (ITU-T Q.704 2.3.2 a: with two links, the even codes on the first and
+the odd ones on the second). While a link carries no traffic its codes go to
+the links that do, and come back by changeback when it returns
+([Routing model](routing.md#management)). The links of a linkset are expected
+to name the same `adjacent_pc`: changeover orders, transfer-prohibited and
+traffic restart allowed for the linkset go to the first one named, and a
+linkset whose links name none gets no management messages at all.
 
 | Field | Meaning |
 |---|---|
@@ -181,12 +196,72 @@ The static route table: DPC to a destination, by priority.
 |---|---|
 | `dpc` | Destination point code (decimal, validated against the node variant). |
 | `as` **or** `linkset` | The destination. Exactly one of the two; naming both, or neither, is a load error. |
-| `priority` | **1 = primary**; higher numbers are alternates. The resolver picks the lowest-priority *available* route and fails over as availability changes. |
+| `priority` | **1 = primary**; higher numbers are alternates. The resolver picks the lowest-priority *available* route and fails over as availability changes. Routes of the **same** priority to one DPC are a combined linkset (ITU-T Q.704 2.3.2 b, 4.2.1): they share its traffic by SLS, in the order they are listed. |
 
 Adjacent PCs on M2PA links are implicit routes and need no entry. Availability
-comes from live state: M3UA ASP active/inactive, M2PA link in/out of service,
-and MTP3 management (Pause / Resume / Status) folded in from the wire. See
-[Routing model & coverage](routing.md#availability).
+comes from live state: M3UA ASP active/inactive, M2PA link in/out of traffic,
+a transfer-prohibited or transfer-allowed from the adjacent point of a linkset
+(which marks that one route), and Pause / Resume from an application server.
+See [Routing model & coverage](routing.md#availability).
+
+With two routes of one priority, the lowest bit of the SLS picks the route and
+the links of each linkset are picked by the next bits, as Figure 5/Q.704 has
+it, so every link of both linksets carries traffic. The SLS in the label is
+not rewritten. A route added at run time with `ss7.routes.add(...)` shares like
+any other, but the width a linkset divides the codes by is fixed from this
+file at start.
+
+## `mtp3` { #mtp3 }
+
+Signalling network management of a transfer point (ITU-T Q.704), per routing
+domain: what the node does when a link, a route or an adjacent point changes
+state. Every key is optional and every timer is in milliseconds; the defaults
+are the values of Q.704 16.8, or a value inside the range it gives. What each
+procedure does is in [Routing model](routing.md#management).
+
+```yaml
+mtp3:
+  t2_ms: 1400
+  t21_ms: 64000
+  tfp_for_unknown_destination: true
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `t1_ms` | `800` | T1 (500 to 1200 ms), "delay to avoid message mis-sequencing on changeover": how long the traffic of a link is withheld when the far end cannot be asked what it received (Q.704 5.6.2), and when a link is inhibited (10.2). Also the isolation that is short enough not to call for a restart (9.4.1). |
+| `t2_ms` | `1400` | T2 (700 to 2000 ms), "waiting for changeover acknowledgement" (5.7.2). |
+| `t3_ms` | `800` | T3 (500 to 1200 ms), "time controlled diversion-delay to avoid mis-sequencing on changeback": how long the traffic of a linkset that became available is withheld (6.4). |
+| `t4_ms` | `800` | T4 (500 to 1200 ms), "waiting for changeback acknowledgement (first attempt)" (6.5.3). |
+| `t5_ms` | `800` | T5 (500 to 1200 ms), the same for the second attempt, after which traffic starts on the link anyway. |
+| `t6_ms` | `800` | T6 (500 to 1200 ms), "delay to avoid message mis-sequencing on controlled rerouting": how long the traffic of a destination is held when a transfer-allowed or -restricted moves it to another route (8.2.1). |
+| `t8_ms` | `1000` | T8 (800 to 1200 ms), "transfer prohibited inhibition timer": after a transfer-prohibited for a destination, no further one is sent by the response method for this long (13.2.2). |
+| `t10_ms` | `45000` | T10 (30 to 60 s), "waiting to repeat signalling route set test message" (13.5.2). |
+| `t12_ms` | `1150` | T12 (800 to 1500 ms), "waiting for uninhibit acknowledgement" (10.3.1 e). |
+| `t13_ms` | `1150` | T13 (800 to 1500 ms), "waiting for force uninhibit" (10.3.2 e). |
+| `t18_ms` | `20000` | T18, the first phase of this node's MTP restart: how long it waits for the traffic restart allowed of every adjacent point before it goes on without them (9.2.2). Q.704 leaves the value to the implementation and the network; it has to be shorter than `t20_ms`. |
+| `t19_ms` | `68000` | T19 (67 to 69 s): after a traffic restart allowed was sent to an adjacent point, another one from it is ignored for this long (9.5). |
+| `t20_ms` | `60000` | T20 (59 to 61 s), the "overall MTP restart timer at the signalling point whose MTP restarts" (9.2.4). |
+| `t21_ms` | `64000` | T21 (63 to 65 s), the "overall MTP restart timer at a signalling point adjacent to one whose MTP restarts": how long an adjacent point that became reachable again is waited for before traffic is sent to it without its traffic restart allowed (9.3.2). |
+| `t23_ms` | `240000` | T23 (3 to 6 minutes), the "remote inhibit test timer" (10.6.2). |
+| `tfp_for_unknown_destination` | `true` | Whether a message for a point code this node has no route for at all is answered with transfer-prohibited, as it is for a destination that is configured and inaccessible (13.2.2 iii). Footnote 7 of that clause leaves it to the network operator: `false` avoids route set tests for destinations that do not exist. |
+| `rerouting_buffer` | `4096` | Messages held for one destination while T6 runs, before further ones are discarded and counted. The changeover and changeback buffers of a link are bounded by that link's `tx_queue`. |
+
+No timer may be `0`. T7, T11, T14 to T17 and T22 of Q.704 16.8 have no key:
+they belong to procedures this node does not run (the allocation of data
+links, the transfer-restricted timer, inhibiting a link on its own initiative,
+the route set congestion test), except T17, which is `restart_ms` of
+[the `m2pa` block](#m2pa-link).
+
+**A node that starts, and a peer that does not answer.** A node whose first
+link comes into service runs the MTP restart procedure: until every adjacent
+point has sent traffic restart allowed, or `t18_ms` is over, it discards what
+arrives on its linksets (Q.704 9.6.6). An adjacent point that was unreachable
+and returns is waited for in the same way under `t21_ms`. Against a conformant
+peer both end within milliseconds of the link test. Against one that never
+sends traffic restart allowed they last the whole timer: two nodes that start
+together each wait `t18_ms` for the other, and a peer that does not implement
+the procedure costs `t21_ms` every time its linkset comes back. Lower the two
+timers for such a peer rather than expect traffic at once.
 
 ## `sccp` { #sccp }
 

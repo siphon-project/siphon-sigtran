@@ -56,15 +56,114 @@ Availability is driven from the live transport:
 - **M3UA**: an AS is up when at least one of its ASPs reaches ASP-Active
   (ASPSM/ASPTM). Load-share spreads over the active ASPs by SLS; override keeps
   one active with the rest on standby; broadcast sends to all active.
-- **M2PA**: a linkset is up while at least one of its links is in service;
-  SLS spreads traffic across the in-service links.
-- **MTP3 management**: Pause prohibits a DPC, Resume allows it, and Status
-  folds in a congestion level. These arrive as M3UA SSNM or native MTP3 events
-  and update route state before the next message routes.
+- **M2PA**: a linkset is a route while level 3 routes traffic to at least one
+  of its links: a link that is in service, has passed its link test, is not
+  inhibited, and whose adjacent point has said traffic may restart. SLS
+  spreads traffic across those links.
+- **Route management**: a transfer-prohibited from the adjacent point of a
+  linkset takes that one route to the destination out; a transfer-allowed puts
+  it back; a transfer-restricted makes it the last choice among routes of its
+  priority.
+- **Application servers**: a destination-unavailable from an ASP prohibits a
+  DPC, a destination-available allows it.
 
 When the primary route for a DPC goes unavailable the resolver uses the next
 priority automatically; an alternate linkset behind an AS route
 ([Configuration](configuration.md#mtp3-routes)) is the common failover shape.
+Routes of the same priority share the traffic by SLS; when one of them goes,
+only its selection codes move.
+
+## Signalling network management { #management }
+
+A node with linksets is a signalling transfer point, and its neighbours expect
+ITU-T Q.704 of it. One task per routing domain runs the procedures below. All
+their timers are keys of the [`mtp3` block](configuration.md#mtp3). Messages
+are the ITU 14-bit formats of Q.704 clause 15; a management message for this
+node (service indicator 0) arriving on a link goes to this task, one for
+another point code is transferred like any other message.
+
+**A link fails (changeover, clause 5).** Traffic for the link is buffered. An
+extended changeover order goes to the far end on another link (or route) with
+the sequence number of the last message accepted on the failed link: M2PA
+numbers are 24 bits, so RFC 4165 4.2.3 has XCO and XCA of Q.2210 take the place
+of COO and COA. On the acknowledgement, the messages the far end does not have
+are sent again on the alternative links, then what was never sent, then the
+buffer, in that order: none lost and none twice. An order from the far end is
+acknowledged the same way, also for a link that still looked fine here. Without
+an acknowledgement in T2, with an emergency acknowledgement, or when nothing
+leads to the far end (T1), only what was never sent goes out again: what was
+sent and never acknowledged might be a duplicate, so it is not, and is counted
+in `sigtran_m2pa_discarded_total{reason="tx-lost-on-failure"}`. A 7-bit COO is
+answered with ECA, since its number cannot name an M2PA message.
+
+**A link returns (changeback, clause 6).** In a linkset that carries traffic,
+the link's traffic is buffered, a changeback declaration goes out on every link
+that carried it meanwhile, and the buffer goes out on the link once each is
+acknowledged (or after T4 and T5). A linkset that returns as a whole takes its
+traffic back after T3, or at once when nothing has to move. A declaration from
+the far end is always acknowledged.
+
+**An adjacent point prohibits or allows a route (clauses 7, 8, 13).** A
+transfer-prohibited marks the route and the next message takes the
+alternative (forced rerouting; the alternative is known the moment the route
+is marked, so nothing waits). The route is then tested with a signalling route
+set test every T10 until a transfer-allowed arrives. A transfer-allowed or
+transfer-restricted that moves traffic between routes holds the destination's
+messages for T6 first (controlled rerouting), so the ones still on the old
+route arrive before the first on the new one.
+
+**What this node tells its neighbours (clause 13).** One rule: an adjacent
+point is told transfer-prohibited for a destination when the destination is
+inaccessible from here (the broadcast method, 13.2.2 ii), or when this node
+routes to it through that very point (13.2.2 i); transfer-allowed otherwise.
+Whatever changes (a link, a linkset, an application server, a received
+transfer-prohibited), the difference to what each point was last told is sent.
+A message for a destination that cannot be reached is also answered with
+transfer-prohibited toward the point it came from, once per T8 (the response
+method, 13.2.2 iii), in addition to whatever SCCP returns. A route set test
+from a neighbour is answered when what it believes differs from what is
+(13.5.4). Transfer-restricted is acted on and never sent.
+
+**Restart (clause 9).** When the first link comes into service after the node
+was isolated (at start, or for longer than T1), it restarts: it collects
+transfer-prohibited messages and traffic restart allowed from its adjacent
+points for at most T18, discards traffic from the linksets meanwhile, then
+sends its own transfer-prohibited messages and a traffic restart allowed to
+each. When one adjacent point returns, it is sent what it must not route here
+and a traffic restart allowed, and no traffic goes to it until its own arrives
+or T21 is over. An unexpected traffic restart allowed is answered once per T19.
+
+**Inhibiting (clause 10).** A request to inhibit a link is granted (the link
+leaves traffic after T1, and is tested every T23) unless a destination would
+become inaccessible, in which case it is denied. Uninhibit, force uninhibit
+and the inhibit tests are answered as 10.3, 10.4 and 10.6 have it. This node
+never asks to inhibit a link itself: there is no management interface to ask
+it to.
+
+**Congestion.** A transfer-controlled is counted and published; routing does
+not change, and none is sent.
+
+**Not done.** Transfer-restricted and transfer-controlled are never
+originated; the route set congestion test, the allocation of signalling data
+links (clause 12.3 on), uninhibiting on the initiative of routing (10.3.2) and
+user part unavailable are not run: such a message for this node is counted in
+`sigtran_mtp3_discarded_total{reason="management-not-acted-on"}`. The formats
+are ITU only. Toward application servers nothing of this is translated yet: a
+destination that becomes inaccessible is announced to adjacent signalling
+points, not to ASPs. The registry publishes every such change for whatever
+does that (`Registry::destination_changes`).
+
+**Order.** A message is held, sent again or diverted by the task of the link
+it was handed to, and that task is also what tells routing to lead to the link
+or to pass it by: it does so after it knows what to do with the traffic, and
+after it has passed on what it held. So the messages of one link keep their
+order through a changeover and a changeback, and a changeback declaration
+travels in the queue of the alternative link, behind the traffic already
+handed to it. What is left is the instant between a message choosing its link
+and being handed to it: one that chose a link just as routing stopped leading
+there is passed on by that link's task and can be overtaken by the next one,
+and one that chose the alternative link just as a changeback began can follow
+the declaration. Both need a link to change state inside that instant.
 
 ## Service-Indicator-agnostic transit
 
@@ -176,6 +275,12 @@ call. The families:
 | `sigtran_m2pa_discarded_total` | counter | `reason` |
 | `sigtran_m2pa_link_failures_total` | counter | `reason` |
 | `sigtran_link_tests_total` | counter | `result` |
+| `sigtran_mtp3_link_traffic` | gauge | `link` |
+| `sigtran_mtp3_restarting` | gauge | |
+| `sigtran_mtp3_management_total` | counter | `dir`, `type` |
+| `sigtran_mtp3_procedures_total` | counter | `procedure` |
+| `sigtran_mtp3_retrieved_total` | counter | `fate` |
+| `sigtran_mtp3_discarded_total` | counter | `reason` |
 | `sigtran_loops_detected_total` | counter | `kind` |
 | `sigtran_isup_screened_total` | counter | `reason` |
 
@@ -202,9 +307,45 @@ Service), `abnormal-bsn`, `link-test`, `association` (SCTP lost) and `stopped`.
 `tx-lost-on-failure` (sent or queued, not acknowledged, and the link failed),
 `tx-flushed-by-peer` (discarded by a peer recovering from processor outage) and
 `encode`. `sigtran_link_tests_total` counts signalling link test messages
-`sent`, `passed` and `failed`. A link that keeps failing its test, or a
-`tx-lost-on-failure` that moves, is traffic lost: there is no changeover to
-another link yet.
+`sent`, `passed` and `failed`.
+
+The level-3 families ([Signalling network management](#management)):
+
+- `sigtran_mtp3_link_traffic{link}` is `1` while level 3 routes traffic to the
+  link, `0` while the link is down, changed over, inhibited, or waiting for a
+  restart to end. `sigtran_m2pa_link_state` says what level 2 thinks of the
+  same link. `sigtran_mtp3_restarting` is `1` while this node's restart runs.
+- `sigtran_mtp3_management_total{dir,type}` counts management messages by
+  their abbreviation in Table 1/Q.704 (`TFP`, `TFA`, `XCO`, `TRA`, ...).
+  `sigtran_mtp3mg_events_total{dpc,type}` counts per destination: `tfp` and
+  `tfa` for a route marked by an adjacent point, `pause` and `resume` for the
+  destination becoming inaccessible and accessible, `congestion` for a
+  transfer-controlled.
+- `sigtran_mtp3_procedures_total{procedure}` counts what ran and how it ended:
+  `changeover-acknowledged`, `changeover-emergency` (acknowledged without a
+  usable sequence number), `changeover-unacknowledged` (T2),
+  `changeover-time-controlled` (T1), `changeback-acknowledged`,
+  `changeback-unacknowledged` (T5), `changeback-time-controlled` (T3),
+  `forced-rerouting`, `controlled-rerouting`, `restart-begun`, `restart-ended`,
+  `adjacent-restart-begun`, `adjacent-restart-ended`,
+  `adjacent-restart-expired` (T21, the peer never said traffic restart
+  allowed), `link-inhibited`, `link-inhibit-denied`, `link-uninhibited` and
+  `uninhibit-abandoned`.
+- `sigtran_mtp3_retrieved_total{fate}` counts what a failed link still held at
+  changeover: `resent` on an alternative link, `confirmed` (the far end had
+  it), `link-test` (a link test message, which goes nowhere else). What was
+  sent, never acknowledged and not sent again is in
+  `sigtran_m2pa_discarded_total{reason="tx-lost-on-failure"}`: that counter
+  moving is traffic that may be lost, and `changeover-unacknowledged` or
+  `changeover-time-controlled` moving with it says why.
+- `sigtran_mtp3_discarded_total{reason}` counts what level 3 did not carry:
+  `no-route` (a message for a point code nothing leads to, answered with
+  transfer-prohibited), `no-egress` (a route was chosen and nothing on it
+  carries), `restarting` (received from a linkset during this node's restart),
+  `no-alternative` (held at changeover, and nothing else leads to its
+  destination), `buffer-full` (a changeover, changeback or rerouting buffer
+  overflowed), `management-not-acted-on` and `management-no-path` (a management
+  message of this node had no link or route to leave on).
 
 Good first panels: linkset / ASP state and route availability (is the node
 wired up?), MSU rate by SI, GTT translations vs errors, active dialogues, and
