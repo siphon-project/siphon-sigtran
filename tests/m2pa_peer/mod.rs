@@ -1009,6 +1009,8 @@ enum Order {
     Restart(bool),
     /// Drop the association.
     Close,
+    /// Drop the association and accept the next one the node dials.
+    Drop,
 }
 
 /// One link toward the node, run by a task: it aligns as Q.703 clause 7 has a
@@ -1043,107 +1045,112 @@ impl Adjacent {
         let sent = Arc::new(AtomicU32::new(INITIAL));
         let task_sent = sent.clone();
         let task = tokio::spawn(async move {
-            let Some(mut peer) = listening.accept(pc, node_pc, ni).await else {
-                return;
-            };
-            peer.slc = slc;
-            peer.status(OUT_OF_SERVICE).await;
-            peer.status(ALIGNMENT).await;
-            let (mut proving_sent, mut ready_sent) = (false, false);
-            let mut acknowledging = true;
-            // The FSN of the last User Data message seen, acknowledged or not.
-            let mut seen = INITIAL;
-            let mut down = false;
             // Traffic restart allowed is due after the next link test.
             let mut restart_due = restart;
-            loop {
-                task_sent.store(peer.fsn_out, Ordering::Relaxed);
-                tokio::select! {
-                    order = order_rx.recv() => match order {
-                        None | Some(Order::Close) => break,
-                        Some(Order::Restart(on)) => restart_due = on,
-                        Some(Order::Send(msu)) => peer.send_msu(&msu).await,
-                        Some(Order::Acknowledge(on)) => {
-                            acknowledging = on;
-                            if on {
-                                peer.fsn_in = seen;
-                                peer.ack().await;
+            // One association after the other: the link is the listener.
+            'associations: loop {
+                let Some(mut peer) = listening.accept(pc, node_pc, ni).await else {
+                    return;
+                };
+                task_sent.store(INITIAL, Ordering::Relaxed);
+                peer.slc = slc;
+                peer.status(OUT_OF_SERVICE).await;
+                peer.status(ALIGNMENT).await;
+                let (mut proving_sent, mut ready_sent) = (false, false);
+                let mut acknowledging = true;
+                // The FSN of the last User Data message seen, acknowledged or not.
+                let mut seen = INITIAL;
+                let mut down = false;
+                loop {
+                    task_sent.store(peer.fsn_out, Ordering::Relaxed);
+                    tokio::select! {
+                        order = order_rx.recv() => match order {
+                            None | Some(Order::Close) => break 'associations,
+                            Some(Order::Drop) => continue 'associations,
+                            Some(Order::Restart(on)) => restart_due = on,
+                            Some(Order::Send(msu)) => peer.send_msu(&msu).await,
+                            Some(Order::Acknowledge(on)) => {
+                                acknowledging = on;
+                                if on {
+                                    peer.fsn_in = seen;
+                                    peer.ack().await;
+                                }
                             }
-                        }
-                        Some(Order::Fail) => {
-                            down = true;
-                            peer.status(OUT_OF_SERVICE).await;
-                            peer.fsn_in = INITIAL;
-                            peer.fsn_out = INITIAL;
-                            seen = INITIAL;
-                            proving_sent = false;
-                            ready_sent = false;
-                        }
-                        Some(Order::Restore) => {
-                            down = false;
-                            peer.status(ALIGNMENT).await;
-                        }
-                    },
-                    got = peer.assoc.recv() => {
-                        let Ok((bytes, info)) = got else { break };
-                        let frame = Frame { bytes, stream: info.stream, ppid: info.ppid };
-                        task_log.lock().unwrap().push(frame.clone());
-                        match frame.status() {
-                            Some(OUT_OF_SERVICE) => {
+                            Some(Order::Fail) => {
+                                down = true;
+                                peer.status(OUT_OF_SERVICE).await;
                                 peer.fsn_in = INITIAL;
                                 peer.fsn_out = INITIAL;
                                 seen = INITIAL;
                                 proving_sent = false;
                                 ready_sent = false;
+                            }
+                            Some(Order::Restore) => {
+                                down = false;
+                                peer.status(ALIGNMENT).await;
+                            }
+                        },
+                        got = peer.assoc.recv() => {
+                            let Ok((bytes, info)) = got else { break 'associations };
+                            let frame = Frame { bytes, stream: info.stream, ppid: info.ppid };
+                            task_log.lock().unwrap().push(frame.clone());
+                            match frame.status() {
+                                Some(OUT_OF_SERVICE) => {
+                                    peer.fsn_in = INITIAL;
+                                    peer.fsn_out = INITIAL;
+                                    seen = INITIAL;
+                                    proving_sent = false;
+                                    ready_sent = false;
+                                    continue;
+                                }
+                                Some(_) if down => continue,
+                                Some(ALIGNMENT) => {
+                                    if !proving_sent {
+                                        peer.status(PROVING_NORMAL).await;
+                                        proving_sent = true;
+                                    }
+                                    continue;
+                                }
+                                Some(PROVING_NORMAL | PROVING_EMERGENCY) => {
+                                    if !proving_sent {
+                                        peer.status(PROVING_NORMAL).await;
+                                        proving_sent = true;
+                                    }
+                                    if !ready_sent {
+                                        peer.status(PROVING_NORMAL).await;
+                                        peer.status(READY).await;
+                                        ready_sent = true;
+                                    }
+                                    continue;
+                                }
+                                Some(_) => continue,
+                                None => {}
+                            }
+                            if down {
                                 continue;
                             }
-                            Some(_) if down => continue,
-                            Some(ALIGNMENT) => {
-                                if !proving_sent {
-                                    peer.status(PROVING_NORMAL).await;
-                                    proving_sent = true;
-                                }
-                                continue;
+                            let Some(label) = frame.label() else { continue };
+                            seen = frame.fsn();
+                            if acknowledging {
+                                peer.accept_and_ack(&frame).await;
                             }
-                            Some(PROVING_NORMAL | PROVING_EMERGENCY) => {
-                                if !proving_sent {
-                                    peer.status(PROVING_NORMAL).await;
-                                    proving_sent = true;
+                            match frame.link_test() {
+                                Some((false, pattern)) => {
+                                    let slta = itu_msu(
+                                        1, ni, pc, label.opc, label.sls, &link_test(true, &pattern),
+                                    );
+                                    peer.send_msu(&slta).await;
+                                    if restart_due {
+                                        restart_due = false;
+                                        let tra = itu_msu(SI_MANAGEMENT, ni, pc, node_pc, 0, &signal(TRA));
+                                        peer.send_msu(&tra).await;
+                                    }
                                 }
-                                if !ready_sent {
-                                    peer.status(PROVING_NORMAL).await;
-                                    peer.status(READY).await;
-                                    ready_sent = true;
-                                }
-                                continue;
-                            }
-                            Some(_) => continue,
-                            None => {}
-                        }
-                        if down {
-                            continue;
-                        }
-                        let Some(label) = frame.label() else { continue };
-                        seen = frame.fsn();
-                        if acknowledging {
-                            peer.accept_and_ack(&frame).await;
-                        }
-                        match frame.link_test() {
-                            Some((false, pattern)) => {
-                                let slta = itu_msu(
-                                    1, ni, pc, label.opc, label.sls, &link_test(true, &pattern),
-                                );
-                                peer.send_msu(&slta).await;
-                                if restart_due {
-                                    restart_due = false;
-                                    let tra = itu_msu(SI_MANAGEMENT, ni, pc, node_pc, 0, &signal(TRA));
-                                    peer.send_msu(&tra).await;
-                                }
-                            }
-                            Some((true, _)) => {}
-                            None => {
-                                if received_tx.send(frame).is_err() {
-                                    break;
+                                Some((true, _)) => {}
+                                None => {
+                                    if received_tx.send(frame).is_err() {
+                                        break 'associations;
+                                    }
                                 }
                             }
                         }
@@ -1209,6 +1216,12 @@ impl Adjacent {
     /// Drop the SCTP association of the link, for good.
     pub fn close(&self) {
         let _ = self.orders.send(Order::Close);
+    }
+
+    /// Drop the SCTP association of the link and listen for the node to
+    /// dial it again: the link then aligns and is tested as at first.
+    pub fn drop_association(&self) {
+        let _ = self.orders.send(Order::Drop);
     }
 
     /// Let the link align again.

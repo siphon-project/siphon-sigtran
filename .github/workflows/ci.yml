@@ -152,6 +152,15 @@ jobs:
           SIGTRAN_REQUIRE_TSHARK: "1"
         run: cargo test --test wire_identity
 
+      # A client association against far ends that are absent, appear, drop
+      # the association and accept again: what the node sends after it dialled
+      # again (ASP Up, the Link Status exchange, the changeback declaration)
+      # is read back by Wireshark.
+      - name: Association redial (tshark field assertions)
+        env:
+          SIGTRAN_REQUIRE_TSHARK: "1"
+        run: cargo test --test wire_reconnect
+
       # Every message the dialogue engine emits in answer to a damaged or
       # unexpected one, dissected by Wireshark with assertions on the fields.
       - name: Abnormal procedures (tshark field assertions)

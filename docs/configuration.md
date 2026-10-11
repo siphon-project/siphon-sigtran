@@ -104,6 +104,9 @@ The SCTP transport plane: one entry per association.
 | `port` | *(required)* | SCTP port. Convention: 2905 for M3UA, 3565 for M2PA. For a `server`, `0` asks the kernel for a port of its own (a test, not a deployment). |
 | `peer_addrs` | `[]` *(server only)* | Every IP address of the peer this association accepts: all of them for a multihomed peer. See [who a listening association accepts](#peer-identity). Empty accepts whoever connects first and logs a warning at start. |
 | `peer_port` | *(none: any port)* *(server only)* | The SCTP port of the peer. Needs `peer_addrs`. Not `0`. |
+| `local_addrs` | `[]` *(client only)* | The local IP addresses the association is dialled from; more than one makes this end multihomed. Empty leaves the choice to the kernel, which then offers the peer **every** address of the host: a peer that accepts by source address (`peer_addrs` on its side) needs this set. |
+| `local_port` | *(none: any port)* *(client only)* | The local SCTP port the association is dialled from. Without `local_addrs` it is bound on every address. Not `0`. |
+| `dial` | *(client only)* every default below | How the association is dialled, and dialled again: see [the `dial` block](#dial). |
 | `adjacent_pc` | *(m2pa only)* | The adjacent point code reached directly over this link. An adjacent PC is an **implicit route**; it needs no `mtp3_routes` entry. |
 | `m2pa` | *(m2pa only)* every default below | Level 2 of the link: see [the `m2pa` block](#m2pa-link). |
 | `m3ua` | *(m3ua only)* every default below | The heartbeat and the acknowledgement timer of the peer: see [the `m3ua` block](#m3ua-peer). |
@@ -171,6 +174,48 @@ Without `peer_addrs` an association accepts whoever connects first to its
 port, as every release before this key did, and a line at start says so in
 capitals. It then needs an address and port of its own.
 
+### The `dial` block { #dial }
+
+A `client` association is dialled by a task of its own when the node starts,
+again after every attempt that failed, and again after the association it had
+was lost (the peer closed or aborted it, SCTP gave it up, the M3UA heartbeat
+went unanswered). RFC 4666 4.3.4.6: "the signalling process SHOULD attempt to
+re-establish communication if it is configured as the client for the
+disconnected M3UA peer". A peer that is absent at start delays nothing and
+stops nothing: the node starts, its other associations are served, and the
+absent one is dialled until it is there. On an association that was dialled
+again everything runs as on the first: ASP Up and ASP Active, or the
+alignment and the test of the link and, for a link that had been changed over
+from, the changeback (ITU-T Q.704 clause 6). The times are in milliseconds.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `connect_timeout_ms` | `10000` | How long one attempt may take before it is given up and counted as `timeout`. The default lets the INIT and its first two retransmissions out at the Linux initial retransmission timeout of 3 seconds (at 0, 3 and 9 seconds) and does not sit through all eight the kernel would send. Not `0`. |
+| `backoff_initial_ms` | `1000` | The wait before the next attempt after the first failure, and after an association that had been up was lost. It doubles with every further failure. The default is that of `restart_ms` of an M2PA link, for the same reason (ITU-T Q.704 16.8, T17: "Delay to avoid oscillation of initial alignment failure and link restart"). Not `0`. |
+| `backoff_max_ms` | `30000` | The longest wait. The default is the interval at which SCTP itself probes an idle path (RFC 9260 16, HB.interval: 30 seconds): a peer that is back is found within that, and a node with many absent peers sends one INIT per peer in that time. Not below `backoff_initial_ms`. |
+| `backoff_jitter_percent` | `20` | How much of every wait is taken off at random (`0` to `100`), so that associations that failed together (one peer with many links, many nodes toward one peer) are not all dialled in the same instant. The sequence is seeded per association from the per-process random key of the standard library's hasher and the association id; it spreads waits and is not for anything that must be unpredictable. |
+
+The waits start over at `backoff_initial_ms` once an association has held for
+`backoff_max_ms`. One that ends sooner (a far end that accepts and aborts,
+for instance because this node is not the peer it has configured) counts as
+one more failure, and the waits go on growing to the cap.
+
+A fixed `local_port` has a cost on Linux: the far end can still be finishing
+the shutdown of the association it had with that port when the next INIT
+arrives, and discards it (RFC 9260 9.2: "it SHOULD discard the INIT chunk and
+retransmit the SHUTDOWN ACK chunk"). A redial right after a close then takes
+one INIT retransmission, 3 seconds by default, as measured on loopback. Keep
+`connect_timeout_ms` above that.
+
+What the dialling does is in `sigtran_association_dial_attempts_total`,
+`sigtran_association_dial_failures_total{reason}` and
+`sigtran_association_dial_backoff_seconds`
+([metrics](routing.md#metrics)), and in one line of the log per change: the
+first attempt of a run that failed, a failure for another reason, the
+association established (with how many attempts failed before), the
+association ended. While attempts keep failing for the same reason there is
+one line a minute, which says how many it left out.
+
 ### The `m3ua` block { #m3ua-peer }
 
 What RFC 4666 leaves to provisioning for one M3UA peer, on an `m3ua`
@@ -178,7 +223,7 @@ association. The timers are in milliseconds.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `beat_ms` | `0` | T(beat) of RFC 4666 4.3.4.6: the interval at which this node sends Heartbeat. `0` sends none, which is the default because SCTP has a heartbeat of its own; set it to notice a peer whose process hangs while its SCTP stack still answers. When nothing at all arrives from the peer for twice the interval ("If no Heartbeat Ack message (or any other M3UA message) is received from the M3UA peer within 2*T(beat), the remote M3UA peer is considered unavailable") the association is aborted: for a `server` association the ASP is then down and may connect again, a `client` association is not dialled again by this release. A Heartbeat from the peer is always acknowledged with its data unchanged, whatever is set here. |
+| `beat_ms` | `0` | T(beat) of RFC 4666 4.3.4.6: the interval at which this node sends Heartbeat. `0` sends none, which is the default because SCTP has a heartbeat of its own; set it to notice a peer whose process hangs while its SCTP stack still answers. When nothing at all arrives from the peer for twice the interval ("If no Heartbeat Ack message (or any other M3UA message) is received from the M3UA peer within 2*T(beat), the remote M3UA peer is considered unavailable") the association is aborted: for a `server` association the ASP is then down and may connect again, a `client` association is [dialled again](#dial). A Heartbeat from the peer is always acknowledged with its data unchanged, whatever is set here. |
 | `ack_ms` | `2000` | T(ack) of RFC 4666 4.3.4.1 and 4.3.4.3 ("provisionable, with a default of 2 seconds"): on a `client` association, an ASP Up or ASP Active that is not acknowledged is sent again every `ack_ms`. Not `0`. |
 | `asp_id` | *(none)* | The ASP Identifier this node puts in its ASP Up on a `client` association (RFC 4666 3.5.1: "a unique value that is locally significant among the ASPs that support an AS"). Left out when not set. A gateway quotes it in the Notify that tells the other ASPs of a takeover or a failure. |
 
