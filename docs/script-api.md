@@ -142,7 +142,7 @@ an SCP stages toward the gsmSSF.
 
 | Name | Operation | Op code |
 |---|---|---|
-| `initial-dp` | A CAMEL initialDP. Handler is `def on(dlg, idp)`, `idp` a decoded [`IncomingOp`](#incomingop) (with `.service_key`, `.called_party_bcd_number`, `.called_party_number`). | 0 |
+| `initial-dp` | A CAMEL initialDP. Handler is `def on(dlg, idp)`, `idp` a decoded [`IncomingOp`](#incomingop) (with `.service_key`, `.imsi`, `.calling_party_number`, `.event_type_bcsm`, `.location_information` and [the rest](#initial-dp)). | 0 |
 | `event-report-bcsm` | An EventReportBCSM the gsmSSF sends when an armed detection point fires. | 24 |
 
 | Invoke builder | Stages |
@@ -169,14 +169,25 @@ as a whole, logged as an error, and a `Begin` left unanswered that way is
 aborted, so a call is not let through without its charging instruction. `phase=3`
 or `phase=4` fixes the phase regardless of the context.
 
+A script sees the phase before it decides: [`dlg.camel_phase`](#dialogue) is 1 to
+4. Under phase 2 (`0.4.0.0.1.0.50.1`), where the warning tone sits inside
+`releaseIfdurationExceeded [1]`, a SEQUENCE (GSM 09.78 clause 6.3), the typed
+keywords are not available because the `gsm_cap` codec has no type for that
+form; `charging_characteristics=` carries the octets a script has for it.
+
 `gsm_cap.AC.gsm_ssf_scf` is the phase 3 generic context (`0.4.0.0.1.21.3.4`),
 `gsm_cap.AC.gsm_ssf_scf_phase4` the phase 4 one (`0.4.0.0.1.23.3.4`).
 
-The InitialDP getters (`service_key`, `called_party_bcd_number`,
-`called_party_number`) decode the argument strictly and raise
+The InitialDP getters decode the argument strictly and raise
 [`MistypedParameter`](#mistyped) when it does not decode. A mobile-originated
 call carries what was dialled in `called_party_bcd_number`; `called_party_number`
-is there on forwarded and terminating calls.
+is there on forwarded and terminating calls. The whole list is under
+[`IncomingOp`](#initial-dp).
+
+The reports that follow an InitialDP in the same dialogue (EventReportBCSM,
+ApplyChargingReport) come to the InitialDP's handler as the components of a
+[`PeerTurn`](#peerturn), and each [`Component`](#component) has a typed view of
+them: `component.event_report_bcsm` and `component.apply_charging_report`.
 
 ## `inap` { #inap }
 
@@ -238,7 +249,12 @@ encoding stays in Rust.
 | `dlg.abort()` | Abort as the dialogue's user: a U-Abort, carrying an ABRT (dialogue-service-user) when the dialogue has an application context. |
 
 `dlg.otid` and `dlg.dtid` expose the originating and peer transaction ids as
-bytes. In-process termination (reply / invoke / send / end) needs no transport and
+bytes. `dlg.application_context` is the application context of the dialogue as
+the arcs of its object identifier, a tuple such as `(0, 4, 0, 0, 1, 21, 3, 4)`,
+or `None` for a dialogue that has none; `dlg.camel_phase` is the CAMEL phase that
+context belongs to, 1 to 4, or `None` when it is not a CAP context. Both are
+`None` on the turn that tells the script a dialogue is gone (`turn.closed`).
+In-process termination (reply / invoke / send / end) needs no transport and
 is exercised by [`node.deliver`](#testing).
 
 Invoke ids are `INTEGER (-128..127)`: `reply_to`, `error` and `reject` raise
@@ -287,6 +303,45 @@ argument (`arg` / `idp`).
 | `sm_rp_oa` / `sm_rp_da` / `sm_rp_ui` | For MO-ForwardSM (46) and MT-ForwardSM (44): the originating address, destination address, and TPDU bytes. `None` for any other operation. Raise [`MistypedParameter`](#mistyped) when the argument does not decode. |
 | `service_key` / `called_party_bcd_number` / `called_party_number` | For a CAMEL initialDP: the service key, the dialled number of a mobile-originated call (type of number and plan, then TBCD digits), and the called party number of a forwarded or terminating call. `None` for any other operation, or when the InitialDP carries none. Raise [`MistypedParameter`](#mistyped) when the argument does not decode. |
 
+#### The members of a CAMEL initialDP { #initial-dp }
+
+Every getter below follows the three above: `None` for another operation or an
+absent member, [`MistypedParameter`](#mistyped) when the argument does not decode
+(TS 29.078 clause 6.1.1, `InitialDPArg`). Numbers that have a format of their own
+(Q.763, TS 24.008) are the octets as received; the two TBCD strings that only
+hold digits are given as digits, the way the builders take them.
+
+| Getter | Member | Value |
+|---|---|---|
+| `imsi` | `iMSI [50]` | Digits, `"001010000000001"`. |
+| `calling_party_number` | `callingPartyNumber [3]` | Octets of a Q.763 calling party number. |
+| `calling_partys_category` | `callingPartysCategory [5]` | Integer (Q.763); 10 is an ordinary subscriber. |
+| `event_type_bcsm` | `eventTypeBCSM [28]` | Integer: 2 collectedInfo (originating), 12 termAttemptAuthorized (terminating), ... |
+| `subscriber_state` | `subscriberState [51]` | `assumed-idle`, `camel-busy`, `net-det-not-reachable` or `not-provided-from-vlr`. |
+| `not_reachable_reason` | the same member | For `net-det-not-reachable`: `ms-purged`, `imsi-detached`, `restricted-area` or `not-registered`. |
+| `location_information` | `locationInformation [52]` | A `LocationInformation`, below. |
+| `ext_basic_service_code` | `ext-basicServiceCode [53]` | `(kind, octets)`, `kind` being `bearer-service` or `teleservice`. |
+| `call_reference_number` | `callReferenceNumber [54]` | Octets. With `msc_address` it identifies the call (TS 23.078 clause 4.6.1.8). |
+| `msc_address` | `mscAddress [55]` | Digits, `"15550180"`. |
+| `time_and_timezone` | `timeAndTimezone [57]` | Eight octets: date and time in BCD with swapped nibbles, then the time zone. |
+| `call_forwarding_ss_pending` | `callForwardingSS-Pending [58]` | `True` when present. `False` for another operation. |
+| `original_called_party_id` | `originalCalledPartyID [12]` | Octets (Q.763), on a forwarded call. |
+| `redirecting_party_id` | `redirectingPartyID [29]` | Octets (Q.763), on a forwarded call. |
+| `redirection_information` | `redirectionInformation [30]` | Two octets (Q.763). |
+| `gmsc_address` | `gmscAddress [0]` of `initialDPArgExtension [59]` | Digits, on a terminating or forwarded call. |
+
+`LocationInformation` (TS 29.002) has `age_of_location` (minutes since the last
+contact, 0 while in contact), `vlr_number` and `msc_number` (digits),
+`location_number` (octets, Q.763), `cell_global_id` (seven octets: MCC and MNC,
+location area code, cell identity), `location_area_id` (five octets: what the
+argument carries as a location area, or the first five octets of the cell
+identity), `geographical_information` (octets), `sai_present` (the cell identity
+is a service area identity) and `current_location_retrieved`.
+
+A digit getter (`imsi`, `msc_address`, `gmsc_address`, `vlr_number`,
+`msc_number`) raises `MistypedParameter` when the string holds something that is
+not a decimal digit before its end: a wrong subscriber is worse than none.
+
 !!! note "`sm_rp_ui` is an opaque SMS TPDU"
     siphon-sigtran handles the MAP and transaction layers; it does not decode
     the SMS content. `sm_rp_ui` (and the `tpdu=` argument of
@@ -308,7 +363,11 @@ of a receiver. When the argument does not decode the getter raises
 Let it propagate and the node answers for the script: the component is rejected
 (`Reject`, mistyped parameter: `invoke` problem 2 for an Invoke, `return-result`
 problem 2 for a result) in an `End`, and whatever the handler had staged is
-discarded. Catch it to decide otherwise:
+discarded. The Reject names the first component of the turn, unless the exception
+came from a typed view of one component (`component.event_report_bcsm`,
+`component.apply_charging_report`): that one carries the invoke id of its
+component as `error.invoke_id`, and the Reject names it. Catch the exception to
+decide otherwise:
 
 ```python
 @gsm_map.on_operation("mo-forward-sm")
@@ -372,6 +431,44 @@ One component of a turn (`turn.components`, `arg.further`).
 | `parameter` | The raw BER argument of an invoke or parameter of a result. |
 | `error_code` | Of an error. |
 | `problem_class` / `problem_code` / `problem_name` | Of a reject. |
+| `event_report_bcsm` | A CAMEL EventReportBCSM, decoded, when the component is an Invoke of operation 24; `None` otherwise. Raises [`MistypedParameter`](#mistyped) when the argument does not decode. |
+| `apply_charging_report` | A CAMEL ApplyChargingReport, decoded, when the component is an Invoke of operation 36; `None` otherwise. Raises the same way. |
+
+Both views are CAMEL's (TS 29.078). An INAP dialogue carries the same operation
+codes with other argument types, so read those from `parameter`.
+
+#### `EventReportBcsm` { #event-report-bcsm }
+
+TS 29.078 clause 6.1.1, `EventReportBCSMArg`.
+
+| Getter | Meaning |
+|---|---|
+| `event_type` | `eventTypeBCSM`: the detection point, by the number `request_report_bcsm_event` arms it with (7 oAnswer, 9 oDisconnect, ...). |
+| `leg` | `legID`: the leg the event happened on, 1 or 2, or `None`. |
+| `message_type` / `is_request` | `miscCallInfo.messageType`: `request` when the detection point was armed as interrupted, so the call waits for an instruction (answer with `continue_`, `connect` or `release_call`); `notification` when it goes on and there is nothing to answer. A report without the member is a request, its default. |
+| `specific_info` | Which alternative of `eventSpecificInformationBCSM` is there: `o-answer`, `t-answer`, `o-disconnect`, `t-disconnect`, `o-called-party-busy`, `t-busy`, `o-no-answer`, `t-no-answer`, `route-select-failure`, `o-abandon`, ... or `None`. |
+| `release_cause` | Of a disconnect: the octets of a Q.850 cause. |
+| `busy_cause` | Of oCalledPartyBusy or tBusy. |
+| `failure_cause` | Of routeSelectFailure. |
+| `destination_address` / `or_call` / `forwarded_call` / `charge_indicator` | Of an answer. |
+| `call_forwarded` / `forwarding_destination_number` | Of tBusy or tNoAnswer. |
+| `route_not_permitted` | Of tBusy or oAbandon. |
+
+The octet getters are `None`, and the flags `False`, on an event that does not
+carry them.
+
+#### `ApplyChargingReport` { #apply-charging-report }
+
+The `timeDurationChargingResult` of the CAMEL-CallResult inside the argument
+(TS 29.078 clause 5.1).
+
+| Getter | Meaning |
+|---|---|
+| `party_to_charge` | The leg the report is for, as its number: the one the ApplyCharging named. |
+| `time_if_no_tariff_switch` | The time used, in units of 100 ms, counted from the answer and not from the last report (TS 23.078 clause 4.6.1.2). `None` after a tariff switch. |
+| `time_since_tariff_switch` / `tariff_switch_interval` | The two times after a tariff switch, in units of 100 ms. |
+| `leg_active` / `call_active` | `legActive`, `callActive` in CAMEL phases 2 and 3: false means the leg is gone and this is its last figure. True when the member is absent, its default. |
+| `call_leg_released_at_tcp_expiry` | The gsmSSF released the leg because the granted period ran out. |
 
 ### `Address` { #address }
 

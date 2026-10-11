@@ -130,6 +130,13 @@ jobs:
       - name: Wire tests (siphon extension)
         run: cargo test --features python --test wire_python --test wire_global_title
 
+      # The CAMEL call a script decides through the typed views, dissected by
+      # Wireshark with assertions on the fields.
+      - name: Script suite (tshark field assertions)
+        env:
+          SIGTRAN_REQUIRE_TSHARK: "1"
+        run: cargo test --features python --test python
+
   # ── Deterministic dependency-graph policy: the PR gate ──────────────────────
   # bans / licenses / sources are a pure function of the checked-in tree, so
   # their verdict only changes when the dependency set does. That makes them

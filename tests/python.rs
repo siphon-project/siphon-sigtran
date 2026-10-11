@@ -15,9 +15,18 @@
 #![cfg(feature = "python")]
 
 use std::ffi::CString;
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
+
+use siphon_sigtran::transport::Msu;
+
+mod common;
+
+/// The node is process-wide and each script below configures it anew: the
+/// tests that run one hold this while they do.
+static NODE: Mutex<()> = Mutex::new(());
 
 /// Mount the addon onto a throwaway `siphon` module and register it in
 /// `sys.modules`, so `from siphon import ss7` resolves exactly as it does inside
@@ -719,6 +728,7 @@ except siphon.SigtranError:
 /// Mount the addon and drive every namespace end to end through the Rust engine.
 #[test]
 fn addon_drives_handlers_against_siphon_sip() {
+    let _node = NODE.lock().unwrap_or_else(|e| e.into_inner());
     Python::attach(|py| {
         mount(py).expect("mount the addon namespaces");
         let globals = PyDict::new(py);
@@ -780,4 +790,114 @@ fn register_leaves_the_names_of_the_host_alone() {
             .expect("ss7.metrics() renders the exposition");
         assert!(text.contains("sigtran_active_dialogues"), "{text}");
     });
+}
+
+/// The frames a script kept under `name`, as `(opc, dpc, sccp)`, as MSUs.
+fn frames(globals: &Bound<'_, PyDict>, name: &str) -> Vec<Msu> {
+    let kept: Vec<(u32, u32, Vec<u8>)> = globals
+        .get_item(name)
+        .expect("lookup")
+        .unwrap_or_else(|| panic!("the script sets {name}"))
+        .extract()
+        .unwrap_or_else(|e| panic!("{name} is a list of (opc, dpc, sccp): {e}"));
+    kept.into_iter()
+        .map(|(opc, dpc, payload)| Msu {
+            opc,
+            dpc,
+            si: 3,
+            ni: 0,
+            mp: 0,
+            sls: 0,
+            payload,
+        })
+        .collect()
+}
+
+/// A prepaid call decided by a script through the typed CAP views: it reads the
+/// IMSI and the location from the InitialDP, arms the events and grants a
+/// period, reads the answer, reads a charging report and grants again, and
+/// releases the call on the second report. Then the reports that do not decode.
+/// What the gsmSSF sends is written by hand in the script; Wireshark reads the
+/// whole exchange as CAMEL, and the fields are asserted.
+#[test]
+fn a_script_decides_a_prepaid_call_through_the_typed_cap_views() {
+    let _node = NODE.lock().unwrap_or_else(|e| e.into_inner());
+    let (call, rejected) = Python::attach(|py| {
+        mount(py).expect("mount the addon namespaces");
+        let globals = PyDict::new(py);
+        let code = CString::new(include_str!("scripts/cap_prepaid.py")).expect("no NUL");
+        if let Err(err) = py.run(code.as_c_str(), Some(&globals), None) {
+            err.print(py);
+            panic!("the prepaid script failed: {err}");
+        }
+        let rejected = ["REJECTED_EVENT", "REJECTED_REPORT", "REJECTED_TRIGGER"]
+            .map(|name| frames(&globals, name));
+        (frames(&globals, "CALL"), rejected)
+    });
+
+    assert_eq!(
+        call.len(),
+        7,
+        "four messages from the gsmSSF, three answers"
+    );
+    if let Some(d) = common::dissect_all(&call.iter().collect::<Vec<_>>()) {
+        d.present("camel")
+            .show_all(
+                "camel.local",
+                // InitialDP; RequestReportBCSMEvent, ApplyCharging, Continue;
+                // EventReportBCSM; ApplyChargingReport; ApplyCharging;
+                // ApplyChargingReport; ReleaseCall.
+                &["0", "23", "35", "31", "24", "36", "35", "36", "22"],
+            )
+            .show("tcap.aarq_application_context_name", "0.4.0.0.1.21.3.4")
+            .show("tcap.aare_application_context_name", "0.4.0.0.1.21.3.4")
+            // What the script read from the InitialDP is what Wireshark reads.
+            .show("camel.serviceKey", "100")
+            .show("camel.callingPartyNumber", "04:13:51:55:10:10")
+            .show("camel.iMSI", "00:01:01:00:00:00:00:f1")
+            .present("gsm_map.ms.assumedIdle_element")
+            .show("gsm_map.ms.vlr_number", "91:51:55:10:08")
+            .show(
+                "gsm_map.cellGlobalIdOrServiceAreaIdFixedLength",
+                "00:f1:10:00:01:00:01",
+            )
+            .show("camel.callReferenceNumber", "01:02:03:04")
+            .show("camel.mscAddress", "91:51:55:10:08")
+            .show("camel.timeandtimezone.time", "20261011081530")
+            // What it sent: three events with their legs, then two periods.
+            .show("camel.bcsmEvents", "3")
+            .show_all("camel.monitorMode", &["1", "0", "0"])
+            .show_all("inap.sendingSideID", &["02", "01", "02"])
+            .show_all("camel.maxCallPeriodDuration", &["600", "300"])
+            .show_all("camel.sendingSideID", &["01", "01"])
+            // What it read after that.
+            .show_all("camel.eventTypeBCSM", &["2", "7", "9", "9", "7"])
+            .present("camel.oAnswerSpecificInfo_element")
+            .show("inap.messageType", "1")
+            .show_all("camel.timeIfNoTariffSwitch", &["600", "900"])
+            .show("camel.legActive", "True")
+            // The release.
+            .present("tcap.end_element")
+            .show("camel.allCallSegments", "80:90")
+            .show("camel.cause_indicator", "16");
+    }
+
+    // Each damaged message is answered with a Reject of the Invoke that did not
+    // decode, mistyped parameter, in an End: the event report by its own id
+    // (6), not by that of the charging report in front of it (5).
+    for (frames, dtid, invoke_id) in [
+        (&rejected[0], "2a2b2c03", "6"),
+        (&rejected[1], "2a2b2c04", "9"),
+        (&rejected[2], "2a2b2c05", "1"),
+    ] {
+        let answer = frames.last().expect("an answer");
+        assert_eq!(frames.len(), 2, "the damaged message and its answer");
+        if let Some(d) = common::dissect(answer) {
+            d.present("tcap.end_element")
+                .hex("tcap.dtid", dtid)
+                .present("camel.reject_element")
+                .show("camel.present", invoke_id)
+                .show("camel.invokeProblem", "2");
+        }
+    }
 }
