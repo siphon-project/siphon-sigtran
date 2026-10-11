@@ -7,6 +7,31 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A message for a local subsystem that arrived in an XUDT was dropped**, so a
+  dialogue opened that way was never answered and the peer waited for its own
+  timer. Some networks send every message in an XUDT, whatever its size. An
+  XUDT that holds a whole message (no segmentation parameter, or one that says
+  first segment, none remaining) now reaches the dialogue engine as a UDT does
+  (ITU-T Q.714 4.1), from M3UA, M2PA and SUA alike (a CLDT that carries a hop
+  counter is such an XUDT).
+- **The answer goes back in an XUDT** when the dialogue was opened in one,
+  whole, protocol class 0, with a hop counter of 15. Q.714 leaves the choice
+  between UDT and XUDT to the sender; the form the peer chose is one the path
+  is known to carry. A dialogue the node opens still goes in a UDT.
+- **The hop counter of an XUDT addressed by global title is checked before it is
+  terminated** (Q.714 2.3.1): with one hop left the message is not delivered,
+  it is counted in `sigtran_loops_detected_total{kind="hop-counter"}` and
+  returned in an XUDTS, hop counter violation, when it asked to be returned. An
+  XUDT addressed by subsystem number is not translated and is delivered
+  whatever its hop counter says.
+
+Reassembly is still not implemented: a segment of a segmented XUDT, and an
+LUDT, are counted in `sigtran_rx_discarded_total{reason="not-unitdata"}` and
+logged as before, and the message is not answered, not with an XUDTS either. An
+answer that does not fit one message is not segmented.
+
 ## [4.0.0] — 2026-10-16
 
 ### Changed
