@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use crate::mtp3::management::Procedure;
 use crate::transport::{M2paDiscard, M2paFailure};
 
 // ── Loop guards (phase 2) ────────────────────────────────────────────────────
@@ -648,6 +649,160 @@ pub fn link_tests(result: LinkTestResult) -> u64 {
     LINK_TESTS[result as usize].load(Ordering::Relaxed)
 }
 
+// ── MTP level 3: signalling network management (ITU-T Q.704) ─────────────────
+
+/// Why level 3 did not carry a message, for [`mtp3_discard`]. Each is logged
+/// where it is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mtp3Discard {
+    /// A message for another point that no route leads to: unknown, or
+    /// inaccessible (Q.704 2.3.3, 5.3.3 i).
+    NoRoute,
+    /// A route was chosen and nothing on it carries traffic.
+    NoEgress,
+    /// Received from a linkset while this node's MTP restarts (9.6.6).
+    Restarting,
+    /// Held or retrieved at changeover, and no alternative link or route
+    /// leads to its destination (5.3.3 i).
+    NoAlternative,
+    /// A changeover, changeback or rerouting buffer was full.
+    BufferFull,
+    /// A management message for this node that was not acted on: unexpected
+    /// in the state, about a link or route that does not exist, or of a
+    /// procedure that is not run.
+    Management,
+    /// A management message of this node that had no link or route to leave
+    /// on.
+    NoPath,
+}
+
+impl Mtp3Discard {
+    /// Every value, for the metrics rendering.
+    pub const ALL: [Mtp3Discard; 7] = [
+        Self::NoRoute,
+        Self::NoEgress,
+        Self::Restarting,
+        Self::NoAlternative,
+        Self::BufferFull,
+        Self::Management,
+        Self::NoPath,
+    ];
+
+    /// The `reason` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoRoute => "no-route",
+            Self::NoEgress => "no-egress",
+            Self::Restarting => "restarting",
+            Self::NoAlternative => "no-alternative",
+            Self::BufferFull => "buffer-full",
+            Self::Management => "management-not-acted-on",
+            Self::NoPath => "management-no-path",
+        }
+    }
+}
+
+/// What became of a message a failed link still held, for [`mtp3_retrieved`].
+/// One that was sent, never acknowledged, and not sent again is counted in
+/// `sigtran_m2pa_discarded_total{reason="tx-lost-on-failure"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retrieved {
+    /// Sent again on an alternative link.
+    Resent,
+    /// Accepted by the far end before the failure, by its changeover message.
+    Confirmed,
+    /// A signalling link test message, which is about the failed link only.
+    LinkTest,
+}
+
+impl Retrieved {
+    /// Every value, for the metrics rendering.
+    pub const ALL: [Retrieved; 3] = [Self::Resent, Self::Confirmed, Self::LinkTest];
+
+    /// The `fate` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Resent => "resent",
+            Self::Confirmed => "confirmed",
+            Self::LinkTest => "link-test",
+        }
+    }
+}
+
+static MTP3_DISCARDS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static MTP3_RETRIEVED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static MTP3_PROCEDURES: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static MTP3_RESTARTING: AtomicI64 = AtomicI64::new(0);
+
+/// Count `count` messages level 3 did not carry
+/// (`sigtran_mtp3_discarded_total{reason}`).
+pub fn mtp3_discard(reason: Mtp3Discard, count: u64) {
+    MTP3_DISCARDS[reason as usize].fetch_add(count, Ordering::Relaxed);
+}
+
+/// The count of messages level 3 did not carry for the given reason.
+pub fn mtp3_discards(reason: Mtp3Discard) -> u64 {
+    MTP3_DISCARDS[reason as usize].load(Ordering::Relaxed)
+}
+
+/// Count `count` messages retrieved from a failed link
+/// (`sigtran_mtp3_retrieved_total{fate}`).
+pub fn mtp3_retrieved(fate: Retrieved, count: u64) {
+    MTP3_RETRIEVED[fate as usize].fetch_add(count, Ordering::Relaxed);
+}
+
+/// The count of retrieved messages with the given fate.
+pub fn mtp3_retrieved_total(fate: Retrieved) -> u64 {
+    MTP3_RETRIEVED[fate as usize].load(Ordering::Relaxed)
+}
+
+/// Count one run of a management procedure
+/// (`sigtran_mtp3_procedures_total{procedure}`).
+pub fn mtp3_procedure(procedure: Procedure) {
+    MTP3_PROCEDURES[procedure as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of runs of a management procedure.
+pub fn mtp3_procedures(procedure: Procedure) -> u64 {
+    MTP3_PROCEDURES[procedure as usize].load(Ordering::Relaxed)
+}
+
+/// Set the `sigtran_mtp3_restarting` gauge: this node's MTP restart runs.
+pub fn set_mtp3_restarting(on: bool) {
+    MTP3_RESTARTING.store(i64::from(on), Ordering::Relaxed);
+}
+
+/// Count one signalling network management message, by its abbreviation in
+/// Table 1/Q.704 (`sigtran_mtp3_management_total{dir,type}`).
+pub fn mtp3_management(dir: Dir, name: &'static str) {
+    if let Some(m) = labelled().as_mut() {
+        *m.mtp3_management.entry((dir.label(), name)).or_insert(0) += 1;
+    }
+}
+
+/// The count of management messages of one type in one direction.
+pub fn mtp3_management_total(dir: Dir, name: &str) -> u64 {
+    labelled()
+        .as_ref()
+        .and_then(|m| {
+            m.mtp3_management
+                .iter()
+                .find(|((d, n), _)| *d == dir.label() && *n == name)
+                .map(|(_, v)| *v)
+        })
+        .unwrap_or(0)
+}
+
+/// Set the `sigtran_mtp3_link_traffic{link}` gauge: whether level 3 routes
+/// traffic to the link (0 while it is down, changed over, inhibited, or
+/// waiting for a restart to end).
+pub fn set_mtp3_link_traffic(link: &str, carrying: bool) {
+    if let Some(m) = labelled().as_mut() {
+        m.mtp3_link_traffic
+            .insert(link.to_string(), i64::from(carrying));
+    }
+}
+
 static TCAP_SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 /// Count one TCAP message the dialogue engine could not encode, and therefore
@@ -682,6 +837,10 @@ struct Labelled {
     route_available: BTreeMap<u32, i64>,
     /// `sigtran_mtp3mg_events_total{dpc,type}`.
     mtp3mg_events: BTreeMap<(u32, &'static str), u64>,
+    /// `sigtran_mtp3_management_total{dir,type}`.
+    mtp3_management: BTreeMap<(&'static str, &'static str), u64>,
+    /// `sigtran_mtp3_link_traffic{link}` (0/1).
+    mtp3_link_traffic: BTreeMap<String, i64>,
     /// `sigtran_content_rule_hits_total{rule,action}`.
     content_rule_hits: BTreeMap<(String, String), u64>,
     /// `sigtran_invoke_timeouts_total{operation}` (operation = op code).
@@ -1111,6 +1270,60 @@ pub fn render() -> String {
     }
     help(
         &mut out,
+        "sigtran_mtp3_discarded_total",
+        "Messages level 3 did not carry, by reason (ITU-T Q.704).",
+        "counter",
+    );
+    for reason in Mtp3Discard::ALL {
+        line(
+            &mut out,
+            "sigtran_mtp3_discarded_total",
+            &[("reason", reason.label())],
+            mtp3_discards(reason),
+        );
+    }
+    help(
+        &mut out,
+        "sigtran_mtp3_retrieved_total",
+        "Messages retrieved from a failed link at changeover, by what became of them.",
+        "counter",
+    );
+    for fate in Retrieved::ALL {
+        line(
+            &mut out,
+            "sigtran_mtp3_retrieved_total",
+            &[("fate", fate.label())],
+            mtp3_retrieved_total(fate),
+        );
+    }
+    help(
+        &mut out,
+        "sigtran_mtp3_procedures_total",
+        "Signalling network management procedures run, by procedure and outcome.",
+        "counter",
+    );
+    for procedure in Procedure::ALL {
+        line(
+            &mut out,
+            "sigtran_mtp3_procedures_total",
+            &[("procedure", procedure.label())],
+            mtp3_procedures(procedure),
+        );
+    }
+    help(
+        &mut out,
+        "sigtran_mtp3_restarting",
+        "Whether this node's MTP restart is running (0/1).",
+        "gauge",
+    );
+    line_i(
+        &mut out,
+        "sigtran_mtp3_restarting",
+        &[],
+        MTP3_RESTARTING.load(Ordering::Relaxed),
+    );
+    help(
+        &mut out,
         "sigtran_tcap_send_errors_total",
         "TCAP messages the dialogue engine could not encode and did not send.",
         "counter",
@@ -1222,6 +1435,31 @@ pub fn render() -> String {
                 &[("dpc", &dpc.to_string()), ("type", ty)],
                 *v,
             );
+        }
+
+        help(
+            &mut out,
+            "sigtran_mtp3_management_total",
+            "Signalling network management messages, by direction and type.",
+            "counter",
+        );
+        for ((dir, name), v) in &m.mtp3_management {
+            line(
+                &mut out,
+                "sigtran_mtp3_management_total",
+                &[("dir", dir), ("type", name)],
+                *v,
+            );
+        }
+
+        help(
+            &mut out,
+            "sigtran_mtp3_link_traffic",
+            "Whether level 3 routes traffic to a link (0/1).",
+            "gauge",
+        );
+        for (link, v) in &m.mtp3_link_traffic {
+            line_i(&mut out, "sigtran_mtp3_link_traffic", &[("link", link)], *v);
         }
 
         help(
@@ -1356,6 +1594,12 @@ mod tests {
             "sigtran_m2pa_link_state",
             "sigtran_route_available",
             "sigtran_mtp3mg_events_total",
+            "sigtran_mtp3_discarded_total",
+            "sigtran_mtp3_retrieved_total",
+            "sigtran_mtp3_procedures_total",
+            "sigtran_mtp3_restarting",
+            "sigtran_mtp3_management_total",
+            "sigtran_mtp3_link_traffic",
             "sigtran_content_rule_hits_total",
             "sigtran_invoke_timeouts_total",
         ] {

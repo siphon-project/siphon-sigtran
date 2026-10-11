@@ -246,8 +246,40 @@ impl Router {
     pub fn is_reachable(&self, tenant: &str, dpc_value: u32) -> bool {
         self.tenancy
             .get(tenant)
-            .map(|rt| resolve_destination(rt, dpc_value).is_some())
+            .map(|rt| resolve_destination(rt, dpc_value, 0).is_some())
             .unwrap_or(false)
+    }
+
+    /// The egress a message for `dpc` with selection code `sls` leaves on,
+    /// without the routes through `avoid`. For a message this node sends or
+    /// sends again (management, traffic diverted at changeover), which is
+    /// routed by point code alone.
+    pub fn egress_for(
+        &self,
+        tenant: &str,
+        dpc_value: u32,
+        sls: u8,
+        avoid: Option<&Destination>,
+    ) -> Option<Destination> {
+        let rt = self.tenancy.get(tenant)?;
+        let dpc = mtp3::PointCode::from_value(dpc_value, rt.variant).ok()?;
+        let state = rt.state_read();
+        rt.routes.resolve_avoiding(dpc, sls, &state, avoid)
+    }
+
+    /// Record what the adjacent point of `via` said about its route to `dpc`:
+    /// transfer-prohibited, -restricted or -allowed (ITU-T Q.704 clause 13).
+    pub fn note_route_status(
+        &self,
+        tenant: &str,
+        dpc: u32,
+        via: &Destination,
+        status: crate::mtp3::route::RouteStatus,
+    ) {
+        if let Some(rt) = self.tenancy.get(tenant) {
+            rt.state_write().set_route_status(dpc, via, status);
+            self.refresh_route_metrics(tenant);
+        }
     }
 
     /// Route an inbound message within the implicit-default tenant.
@@ -255,8 +287,16 @@ impl Router {
         self.route_in(crate::config::DEFAULT_TENANT, msg)
     }
 
-    /// Route an inbound message within a named tenant.
+    /// Route an inbound message within a named tenant. The route of signalling
+    /// link selection 0: see [`route_for`](Self::route_for).
     pub fn route_in(&self, tenant: &str, msg: &Inbound) -> RouteDecision {
+        self.route_for(tenant, msg, 0)
+    }
+
+    /// Route an inbound message whose routing label carries signalling link
+    /// selection `sls`: where several routes of one priority lead to the
+    /// destination, the selection code picks one (ITU-T Q.704 2.3.2).
+    pub fn route_for(&self, tenant: &str, msg: &Inbound, sls: u8) -> RouteDecision {
         let Some(rt) = self.tenancy.get(tenant) else {
             return RouteDecision::Drop {
                 reason: format!("unknown tenant `{tenant}`"),
@@ -268,7 +308,7 @@ impl Router {
         //    SNM, …), not just SCCP; only a message addressed to us climbs the
         //    SCCP stack below.
         if msg.dpc != rt.point_code {
-            return match resolve_destination(rt, msg.dpc) {
+            return match resolve_destination(rt, msg.dpc, sls) {
                 Some(via) => RouteDecision::Route { via },
                 None => RouteDecision::Drop {
                     reason: format!("no MTP3 route to {}", msg.dpc),
@@ -299,7 +339,7 @@ impl Router {
         if let (Some(engine), Some(view)) = (rt.content.as_ref(), msg.view.as_ref()) {
             if let Some(hit) = engine.evaluate(view) {
                 crate::metrics::content_rule_hit(&hit.rule, action_label(&hit.action));
-                if let Some(decision) = self.decision_from_action(rt, hit.action, msg) {
+                if let Some(decision) = self.decision_from_action(rt, hit.action, sls) {
                     return decision;
                 }
             }
@@ -309,7 +349,7 @@ impl Router {
         if let Some(sel) = &msg.cdpa {
             let sel = self.pre_convert(rt, sel);
             match rt.gtt.translate(&sel) {
-                Some(result) => return self.decision_from_gtt(rt, result),
+                Some(result) => return self.decision_from_gtt(rt, result, sls),
                 None => {
                     crate::metrics::gtt_error(crate::metrics::GttError::NoTranslation);
                     return RouteDecision::Drop {
@@ -346,7 +386,7 @@ impl Router {
         sel.clone()
     }
 
-    fn decision_from_gtt(&self, rt: &TenantRuntime, result: GttResult) -> RouteDecision {
+    fn decision_from_gtt(&self, rt: &TenantRuntime, result: GttResult, sls: u8) -> RouteDecision {
         use crate::metrics::{self, GttError, GttResultKind};
         match result {
             GttResult::Local => {
@@ -355,7 +395,7 @@ impl Router {
             }
             GttResult::Dpc { dpc, ssn } => {
                 metrics::gtt_translation(GttResultKind::Dpc);
-                let via = resolve_destination(rt, dpc);
+                let via = resolve_destination(rt, dpc, sls);
                 if via.is_none() {
                     metrics::gtt_error(GttError::NoRoute);
                 }
@@ -387,7 +427,7 @@ impl Router {
         &self,
         rt: &TenantRuntime,
         action: Action,
-        _msg: &Inbound,
+        sls: u8,
     ) -> Option<RouteDecision> {
         match action {
             Action::Screen => Some(RouteDecision::Drop {
@@ -405,7 +445,7 @@ impl Router {
                 // as a `to:` clause: dpc, group (cost primary / share cursor),
                 // local, or cross-tenant.
                 let result = rt.gtt.resolve_target(&target)?;
-                let mut decision = self.decision_from_gtt(rt, result);
+                let mut decision = self.decision_from_gtt(rt, result, sls);
                 // Carry a `rewrite_cdpa_gt` action onto a concrete-DPC relay; the
                 // transport stamps it on the egress SCCP before forwarding.
                 if let (
@@ -439,10 +479,10 @@ fn action_label(action: &Action) -> &'static str {
 
 /// Resolve a DPC to an egress [`Destination`] within a tenant, honouring live
 /// availability (reads the interior-mutable route state).
-fn resolve_destination(rt: &TenantRuntime, dpc_value: u32) -> Option<Destination> {
+fn resolve_destination(rt: &TenantRuntime, dpc_value: u32, sls: u8) -> Option<Destination> {
     let dpc = mtp3::PointCode::from_value(dpc_value, rt.variant).ok()?;
     let state = rt.state_read();
-    rt.routes.resolve(dpc, &state)
+    rt.routes.resolve_for(dpc, sls, &state)
 }
 
 #[cfg(test)]
