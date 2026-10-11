@@ -47,6 +47,14 @@ consequences for any deployment:
   signalling IPs must be stable and cannot be NATed behind a shared egress
   (SNAT also breaks SCTP multihoming). This shapes the Kubernetes model; see
   [Kubernetes & scaling](kubernetes.md#the-signalling-plane).
+- **Outbound associations are dialled until they are up.** A peer that is
+  not there when the node starts, or that goes away later, is dialled again
+  with a back-off ([the `dial` block](configuration.md#dial)); the node is
+  ready without it, and `sigtran_association_state` with
+  `sigtran_association_dial_failures_total` says which peer is missing and
+  why. Set `local_addrs` (and `local_port` if the peer wants one) on every
+  `client` association whose peer accepts by source address: without them the
+  kernel picks the source and offers the peer every address of the host.
 - **Inbound associations are accepted by source address.** Give every `server`
   association the `peer_addrs` of its peer
   ([configuration](configuration.md#peer-identity)): without them it takes

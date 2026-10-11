@@ -58,7 +58,9 @@ no I/O. That is the throughput guarantee. The flow for an inbound message:
 ## The transport
 
 `TransportHandle::start` turns the config into a running node over real kernel
-SCTP: it binds/connects each association, runs the M3UA ASPSM/ASPTM handshake or
+SCTP: it binds each listening endpoint and accepts the configured peer on it,
+dials each `client` association until it is up and again after it is lost,
+runs the M3UA ASPSM/ASPTM handshake or
 the M2PA link alignment, folds SSNM into route availability, and routes +
 forwards inbound DATA through the routing brain. Egress honours the AS traffic
 mode (load-share by SLS, override, broadcast) and fails over to the next-priority

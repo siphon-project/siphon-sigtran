@@ -144,6 +144,25 @@ All notable changes are documented here. The format follows
   with no `peer_port` to tell them apart, an association without `peer_addrs`
   next to another, address lists that overlap and differ) does not load, and
   the error names both associations.
+- **A `client` association is dialled until it is up, and again after it is
+  lost** (RFC 4666 4.3.4.6: "the signalling process SHOULD attempt to
+  re-establish communication if it is configured as the client for the
+  disconnected M3UA peer"). Each has a task of its own with a back-off that
+  doubles from `backoff_initial_ms` to `backoff_max_ms`, less a random part
+  (`backoff_jitter_percent`), and a limit per attempt (`connect_timeout_ms`):
+  the new `dial:` block of an association, defaults 1 s, 30 s, 20 % and 10 s.
+  On the association that was dialled again everything runs as on the first:
+  ASP Up and ASP Active, the alignment and the test of a link, and the
+  changeback of level 3 to a link that returned.
+- `local_addrs` and `local_port` on a `client` association: the addresses and
+  the port it is dialled from, for a multihomed local end and for a peer that
+  accepts by source address.
+- `sigtran_association_dial_attempts_total{assoc}`,
+  `sigtran_association_dial_failures_total{assoc,reason}` (`refused`,
+  `timeout`, `unreachable`, `local`, `other`) and
+  `sigtran_association_dial_backoff_seconds{assoc}`. The log has one line per
+  change (first failure of a run, another reason, established, ended) and one
+  a minute while nothing changes.
 - `sigtran_association_refused_total{reason}` (`unknown-peer`,
   `unlisted-address`, `peer-port`, `duplicate`, `closed`), with a line on
   stderr per refusal, at most one a second per listening endpoint.
@@ -163,12 +182,17 @@ All notable changes are documented here. The format follows
   first, and now says so at start in a warning. Two of them on the same address
   and port, which failed to bind at start, are now refused when the file is
   loaded.
-- The transport binds every listening endpoint before it dials the first
-  `client` association, whatever their order in the file.
-- Needs `async-sctp` 1.1: a receive on an association that was aborted while
-  another task was sending on it could wait forever, and so could a send that
-  waited for room in the send buffer. With an association that is never
-  displaced, a task that never ends would have kept its association's place.
+- **`TransportHandle::start` no longer waits for the `client` associations**
+  and no longer fails because one of their peers is absent. It binds every
+  listening endpoint, starts the dialling, and returns. Code that sent on a
+  `client` association right after the start has to wait for it to carry
+  (`Registry::slot(..).is_carrying()`, or the destination being reachable).
+- Needs `async-sctp` 1.1: a connect that was refused could wait forever, a
+  receive on an association that was aborted while another task was sending
+  on it could wait forever, and so could a send that waited for room in the
+  send buffer. With an association that is never displaced, a task that never
+  ends would have kept its association's place. 1.1 also binds a client
+  socket to local addresses before it connects.
 - Needs `m2pa` 1.1 (Link Status Out of Service, the acknowledgement-only User
   Data message, the priority in its RFC 4165 bit position), `mtp3` 1.2 (the
   management and link test message codec) and `m3ua` 1.1 (the SCON, DUPU and
@@ -252,6 +276,16 @@ All notable changes are documented here. The format follows
   M2PA the link was taken out of service and aligned with the newcomer. See
   the two entries above: the peer is configured, and the first is not
   displaced. `tests/wire_identity.rs` has each on the wire.
+- **A `client` association whose peer was absent at start stopped the node or
+  was never dialled.** The start connected the client associations one after
+  the other and waited for each: a refused connect failed the whole start and
+  took the listening associations down with it, and a connect that did not
+  return (see `async-sctp` above) kept that association and every one after
+  it in the file from starting, with the dialogue and origination seams never
+  attached. Neither was dialled when its far end appeared.
+- **A `client` association that was lost was not established again**, so a
+  link or an ASP of this node stayed down until the process was restarted.
+  `tests/wire_reconnect.rs` has both on the wire.
 - A listener that failed one `accept` stopped listening without a word. It
   logs the error and goes on.
 - **An M2PA link did not stay in service against a conformant peer.** Every
