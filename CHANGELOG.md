@@ -130,8 +130,45 @@ All notable changes are documented here. The format follows
   `sigtran_mtp3mg_events_total` now also counts `tfp` and `tfa` received from a
   linkset.
 
+- **A listening association accepts its configured peer** (RFC 4165 4.1.2:
+  "it is RECOMMENDED that each endpoint know the IP address (or IP addresses,
+  if multi-homing is used) and port number of both endpoints"). `peer_addrs`
+  (every address of the peer) and `peer_port` are new keys of a `server`
+  association of any adaptation. A peer is the association's when every
+  address it presents is listed; anyone else is aborted right after the SCTP
+  handshake, which the kernel completes by itself, and nothing they sent is
+  read.
+- **Associations may share one local address and port.** There is one listener
+  per local endpoint, and the associations on it are told apart by the address
+  of the peer. A file in which that cannot work (a peer address in two lists
+  with no `peer_port` to tell them apart, an association without `peer_addrs`
+  next to another, address lists that overlap and differ) does not load, and
+  the error names both associations.
+- `sigtran_association_refused_total{reason}` (`unknown-peer`,
+  `unlisted-address`, `peer-port`, `duplicate`, `closed`), with a line on
+  stderr per refusal, at most one a second per listening endpoint.
+
 ### Changed
 
+- **An established association is not displaced by a later one.** A second
+  SCTP association for an association that has one waits, unread, for up to
+  two seconds for the first to end, and is then aborted and counted. Before,
+  the newest took the place of the one before: on an M2PA link the link failed,
+  on M3UA the ASP went down. A restart of the same peer from the same addresses
+  and port is not affected, SCTP handles it inside the association (RFC 9260
+  5.2.4). A peer that lost its association unnoticed and returns from another
+  port is refused until the old association has failed (the next packet sent to
+  it, or the SCTP heartbeat).
+- A `server` association without `peer_addrs` still accepts whoever connects
+  first, and now says so at start in a warning. Two of them on the same address
+  and port, which failed to bind at start, are now refused when the file is
+  loaded.
+- The transport binds every listening endpoint before it dials the first
+  `client` association, whatever their order in the file.
+- Needs `async-sctp` 1.1: a receive on an association that was aborted while
+  another task was sending on it could wait forever, and so could a send that
+  waited for room in the send buffer. With an association that is never
+  displaced, a task that never ends would have kept its association's place.
 - Needs `m2pa` 1.1 (Link Status Out of Service, the acknowledgement-only User
   Data message, the priority in its RFC 4165 bit position), `mtp3` 1.2 (the
   management and link test message codec) and `m3ua` 1.1 (the SCON, DUPU and
@@ -196,6 +233,15 @@ All notable changes are documented here. The format follows
 
 ### Fixed
 
+- **A listening association took whoever connected.** A second SCTP connection
+  to the port of an association with an active ASP, sending nothing at all,
+  was installed as the association: on SUA it received the next CLDT for the
+  application server, on M3UA the ASP went down and its traffic stopped, on
+  M2PA the link was taken out of service and aligned with the newcomer. See
+  the two entries above: the peer is configured, and the first is not
+  displaced. `tests/wire_identity.rs` has each on the wire.
+- A listener that failed one `accept` stopped listening without a word. It
+  logs the error and goes on.
 - **An M2PA link did not stay in service against a conformant peer.** Every
   User Data message went out with BSN and FSN `0xFFFFFF`, and received ones were
   never acknowledged, so the far end saw each message after the first as out of

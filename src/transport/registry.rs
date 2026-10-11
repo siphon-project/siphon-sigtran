@@ -262,6 +262,30 @@ pub struct AssocSlot {
     memberships: Vec<Membership>,
     /// For an m3ua association: its `m3ua:` block.
     pub(crate) m3ua: M3uaPeer,
+    /// An SCTP association has the slot: see [`AssocSlot::occupy`].
+    occupied: AtomicBool,
+    /// Told when the slot is free again.
+    vacated: tokio::sync::Notify,
+}
+
+/// The hold one SCTP association has on its slot, from the moment it is taken
+/// for the slot until the task that serves it has ended. Dropping it frees the
+/// slot for the next association, whatever way the task ended.
+pub(crate) struct Occupancy {
+    slot: Arc<AssocSlot>,
+    assoc: Arc<SctpAssociation>,
+}
+
+impl Drop for Occupancy {
+    fn drop(&mut self) {
+        // The task cleared these itself unless it did not end by itself.
+        if self.slot.is_sender(&self.assoc) {
+            self.slot.set_active(false);
+            self.slot.clear_sender();
+        }
+        self.slot.occupied.store(false, Ordering::Release);
+        self.slot.vacated.notify_one();
+    }
 }
 
 impl AssocSlot {
@@ -276,7 +300,29 @@ impl AssocSlot {
             asp: None,
             memberships: Vec::new(),
             m3ua: M3uaPeer::default(),
+            occupied: AtomicBool::new(false),
+            vacated: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Take the slot for `assoc`. `None` while another association has it:
+    /// a slot is one SCTP association at a time (RFC 4165 4.1.2, "Each MTP link
+    /// corresponds to an SCTP association"), and the one
+    /// that has it is not displaced by one that comes later.
+    pub(crate) fn occupy(self: &Arc<Self>, assoc: &Arc<SctpAssociation>) -> Option<Occupancy> {
+        self.occupied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Occupancy {
+                slot: self.clone(),
+                assoc: assoc.clone(),
+            })
+    }
+
+    /// Wait until the slot was freed since this was last asked. It may be
+    /// taken again by the time this returns: [`occupy`](Self::occupy) says.
+    pub(crate) async fn vacated(&self) {
+        self.vacated.notified().await;
     }
 
     /// The Application Servers this M3UA association is configured in.
@@ -740,6 +786,24 @@ impl Registry {
         let anywhere = slot.memberships.iter().any(|m| self.member_active(m));
         slot.set_active(anywhere);
         metrics::set_asp_state(&slot.id, &entry.name, active);
+    }
+
+    /// Put the adaptation state of a slot down before a new SCTP association
+    /// is installed in it: the association becomes an egress when its peer
+    /// has said so (ASP Active, a link aligned and tested), never by being
+    /// accepted. What the ASP state machine holds follows when the task of
+    /// the association reports it lost.
+    pub(crate) fn quiesce(&self, slot: &AssocSlot) {
+        for membership in &slot.memberships {
+            if let Some(flag) = self
+                .application_servers
+                .get(membership.server)
+                .and_then(|entry| entry.active.get(membership.position))
+            {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
+        slot.set_active(false);
     }
 
     fn member_active(&self, membership: &Membership) -> bool {

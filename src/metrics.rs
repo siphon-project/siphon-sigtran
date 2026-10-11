@@ -607,6 +607,62 @@ pub fn rx_discards(reason: RxDiscard) -> u64 {
     RX_DISCARDS[reason as usize].load(Ordering::Relaxed)
 }
 
+// ── Association identity ─────────────────────────────────────────────────────
+
+/// Why an SCTP association that reached a listening endpoint was refused, for
+/// [`association_refused`]. Each is logged where it is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// No association on the endpoint lists any address the peer presented.
+    UnknownPeer,
+    /// The peer presented an address its association lists, and one it does
+    /// not list: a multihomed peer is known by all of its addresses.
+    UnlistedAddress,
+    /// The addresses are those of an association whose `peer_port` is another
+    /// port than the peer's.
+    PeerPort,
+    /// The association the peer belongs to is established already and stayed
+    /// so (RFC 4165 4.1.2: "Each MTP link corresponds to an SCTP
+    /// association").
+    Duplicate,
+    /// The peer was gone before its addresses could be read.
+    Closed,
+}
+
+impl Refusal {
+    /// Every reason, in label order.
+    pub const ALL: [Refusal; 5] = [
+        Self::UnknownPeer,
+        Self::UnlistedAddress,
+        Self::PeerPort,
+        Self::Duplicate,
+        Self::Closed,
+    ];
+
+    /// The `reason` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnknownPeer => "unknown-peer",
+            Self::UnlistedAddress => "unlisted-address",
+            Self::PeerPort => "peer-port",
+            Self::Duplicate => "duplicate",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+static REFUSALS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Count one association refused at a listening endpoint.
+pub fn association_refused(reason: Refusal) {
+    REFUSALS[reason as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of associations refused at a listening endpoint for the reason.
+pub fn association_refusals(reason: Refusal) -> u64 {
+    REFUSALS[reason as usize].load(Ordering::Relaxed)
+}
+
 // ── M3UA management (RFC 4666) ───────────────────────────────────────────────
 
 static M3UA_DISCARDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -1374,6 +1430,20 @@ pub fn render() -> String {
     }
     help(
         &mut out,
+        "sigtran_association_refused_total",
+        "SCTP associations refused at a listening endpoint, by reason.",
+        "counter",
+    );
+    for reason in Refusal::ALL {
+        line(
+            &mut out,
+            "sigtran_association_refused_total",
+            &[("reason", reason.label())],
+            association_refusals(reason),
+        );
+    }
+    help(
+        &mut out,
         "sigtran_m3ua_events_total",
         "Events of M3UA management: timers that ran out, takeovers, heartbeats missed.",
         "counter",
@@ -1802,6 +1872,7 @@ mod tests {
             "sigtran_tcap_discarded_total",
             "sigtran_tcap_send_errors_total",
             "sigtran_rx_discarded_total",
+            "sigtran_association_refused_total",
             "sigtran_association_state",
             "sigtran_asp_state",
             "sigtran_linkset_available",
