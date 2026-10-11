@@ -318,7 +318,11 @@ fn m3ua_data_si(payload: &[u8], si: u8, opc: u32, dpc: u32, sls: u8) -> Vec<u8> 
         sls,
         payload.to_vec(),
     );
-    M3uaMessage::data(None, Some(1), pd, None).encode()
+    // Without a Routing Context, which is conditional in DATA (RFC 4666
+    // 3.3.1): one that the association is not configured in is answered with
+    // Error, "Invalid Routing Context" (3.8.1), and the peers here serve
+    // servers with different contexts.
+    M3uaMessage::data(None, None, pd, None).encode()
 }
 
 /// An M3UA DATA message carrying SCCP (`SI=3`).
@@ -392,9 +396,13 @@ impl AspPeer {
             .await
             .ok()?;
         wait_m3ua(&assoc, MessageType::AspUpAck).await?;
+        // Without a Traffic Mode Type, which is optional (RFC 4666 3.7.1): the
+        // servers here have different modes, and 4.3.4.3 has a mode that is
+        // "incompatible with the mode currently configured for the AS"
+        // answered with Error.
         assoc
             .send(
-                &M3uaMessage::asp_active(Some(2), Some(rc)).encode(),
+                &M3uaMessage::asp_active(None, Some(rc)).encode(),
                 0,
                 PPID_M3UA,
             )
@@ -641,6 +649,13 @@ async fn wait_route(router: &Router, dpc: u32, want: &Destination) -> bool {
 }
 
 // ── Node configs ─────────────────────────────────────────────────────────────
+//
+// The ingress association is the one ASP of server `caller`, routing context
+// 0, in every node: an ASP is active in an application server or not at all.
+// RFC 4666 3.8.1 has an ASP Active answered with Error, "No Configured AS for
+// ASP", when "it is not known by configuration data which Application Servers
+// are referenced", and with "Invalid Routing Context" when it names "an
+// invalid (unconfigured) Routing Context value".
 
 /// Ingress SG + an AS `hlr` load-shared over two ASPs. Route 2000 → hlr.
 const LOADSHARE_NODE: &str = r#"
@@ -650,6 +665,7 @@ associations:
   - { id: hlr-a,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
   - { id: hlr-b,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
 application_servers:
+  - { name: caller, traffic_mode: override, routing_context: 0, asps: [ingress] }
   - { name: hlr, traffic_mode: loadshare, routing_context: 100, asps: [hlr-a, hlr-b] }
 mtp3_routes:
   - { dpc: 2000, as: hlr, priority: 1 }
@@ -669,6 +685,7 @@ associations:
   - {{ id: hlr-a,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }}
   - {{ id: xit-1,   adaptation: m2pa, role: client, addrs: [127.0.0.1], port: {m2pa_port}, adjacent_pc: 3000, m2pa: {fast} }}
 application_servers:
+  - {{ name: caller, traffic_mode: override, routing_context: 0, asps: [ingress] }}
   - {{ name: hlr, traffic_mode: override, routing_context: 100, asps: [hlr-a] }}
 linksets:
   - {{ name: transit, links: [{{assoc: xit-1}}], link_test: {test} }}
@@ -988,6 +1005,7 @@ associations:
   - { id: ingress, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
   - { id: hlr-a,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
 application_servers:
+  - { name: caller, traffic_mode: override, routing_context: 0, asps: [ingress] }
   - { name: hlr, traffic_mode: override, routing_context: 100, asps: [hlr-a] }
 mtp3_routes:
   - { dpc: 2000, as: hlr, priority: 1 }
@@ -1328,6 +1346,8 @@ const TERMINATION_NODE: &str = r#"
 node: { point_code: 1000, variant: ITU, network_indicator: international }
 associations:
   - { id: ingress, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+application_servers:
+  - { name: caller, traffic_mode: override, routing_context: 0, asps: [ingress] }
 sccp:
   local_ssns: [6]
 "#;

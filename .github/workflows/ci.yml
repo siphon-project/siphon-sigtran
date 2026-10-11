@@ -135,6 +135,14 @@ jobs:
           SIGTRAN_REQUIRE_TSHARK: "1"
         run: cargo test --test wire_mtp3
 
+      # M3UA management against hand-written ASPs, a hand-written gateway and
+      # an adjacent point: every Error, Notify and SSNM message the node sends
+      # (RFC 4666) is read back by Wireshark.
+      - name: M3UA management (tshark field assertions)
+        env:
+          SIGTRAN_REQUIRE_TSHARK: "1"
+        run: cargo test --test wire_m3ua
+
       # Every message the dialogue engine emits in answer to a damaged or
       # unexpected one, dissected by Wireshark with assertions on the fields.
       - name: Abnormal procedures (tshark field assertions)

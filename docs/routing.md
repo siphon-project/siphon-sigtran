@@ -53,9 +53,12 @@ A route is usable only while its destination is available. The resolver picks
 the lowest-priority available route for a DPC and fails over as state changes.
 Availability is driven from the live transport:
 
-- **M3UA**: an AS is up when at least one of its ASPs reaches ASP-Active
-  (ASPSM/ASPTM). Load-share spreads over the active ASPs by SLS; override keeps
-  one active with the rest on standby; broadcast sends to all active.
+- **M3UA**: an AS is a route while it is active, which it becomes when
+  `required_asps` of its ASPs are active, and while it is pending: for
+  `recovery_ms` after its last active ASP left, its traffic is queued (RFC
+  4666 4.3.2). Load-share spreads over the active ASPs by SLS; override sends
+  to the ASP that became active last; broadcast sends to all active. See
+  [M3UA management](#m3ua-management).
 - **M2PA**: a linkset is a route while level 3 routes traffic to at least one
   of its links: a link that is in service, has passed its link test, is not
   inhibited, and whose adjacent point has said traffic may restart. SLS
@@ -164,6 +167,59 @@ and being handed to it: one that chose a link just as routing stopped leading
 there is passed on by that link's task and can be overtaken by the next one,
 and one that chose the alternative link just as a changeback began can follow
 the declaration. Both need a link to change state inside that instant.
+
+## M3UA management { #m3ua-management }
+
+Toward the ASPs of its application servers the node is a signalling gateway as
+RFC 4666 has one. One task per routing domain keeps the state of every ASP in
+every server (4.3.1) and of every server (4.3.2); the keys are in
+[`application_servers`](configuration.md#application-servers) and
+[the `m3ua` block](configuration.md#m3ua-peer).
+
+- **ASP state.** ASP Up and ASP Down are always acknowledged. ASP Active and
+  ASP Inactive are checked: the routing contexts against the servers the
+  association is configured in, the traffic mode against the server's.
+- **Notify** (4.3.4.5). Every ASP of a server that is not down is told when
+  the server becomes inactive, active or pending, after the acknowledgement
+  that caused it; an ASP that comes up is told the state the server is in; an
+  ASP of an override server that loses the traffic is told who took it; the
+  failure of an ASP is told to the others.
+- **The pending server.** See `recovery_ms`: T(r), the queue, and what
+  happens to it.
+- **Destinations.** What level 3 learns about a destination reaches every
+  active ASP: DUNA when it becomes inaccessible, DAVA when it is accessible
+  again, DRST when it is reached by a restricted route only, SCON for a
+  transfer-controlled (4.5.1). An ASP that becomes active is sent the
+  destinations that are unavailable or restricted at that moment. A server is
+  not told about its own point codes. A DAUD is answered per destination from
+  the routing tables, a range (a mask) for every destination of the table in
+  it. While this node's MTP restart runs every destination behind a linkset is
+  unavailable to the ASPs, also in answer to an audit, and DAVA follows when
+  the restart ends (4.6).
+- **Between an ASP and a linkset** (1.4.3.2). Signalling network management is
+  never carried in DATA. A DUNA or DAVA from an ASP changes the route state
+  and goes to the adjacent points as transfer-prohibited or transfer-allowed.
+  A transfer-controlled or a user part unavailable message that the network
+  addressed to the point code of a server reaches its ASPs as SCON or DUPU. A
+  SCON from an ASP that names a Concerned Destination is sent there as
+  transfer-controlled (3.4.4). Any other management message for the point code
+  of a server, and one an ASP puts in DATA, is discarded and counted.
+- **Errors** (3.8.1). A message that cannot be read or acted on is answered
+  with the Error that says why, with the first 40 octets of it as Diagnostic
+  Information, and counted in `sigtran_rx_discarded_total`. An Error is never
+  answered.
+
+On a `client` association the node is the ASP: it sends ASP Up and, for every
+server the association is in, ASP Active with the server's traffic mode and
+routing context, again every `ack_ms` until acknowledged. It becomes inactive
+when the gateway says an alternate ASP is active, and asks to be active again
+when the gateway says the server is pending, inactive, or short of ASPs.
+
+Not done: routing key management (REG REQ and DEREG REQ are answered with
+Error, "Unsupported Message Class"), the Network Appearance parameter, the
+IPSP models, a check that ASP Identifiers are unique, and a refusal of DATA on
+stream 0 (it is counted and accepted). SUA associations keep the plain
+handshake they had: none of the above applies to them.
 
 ## Service-Indicator-agnostic transit
 
@@ -281,6 +337,12 @@ call. The families:
 | `sigtran_mtp3_procedures_total` | counter | `procedure` |
 | `sigtran_mtp3_retrieved_total` | counter | `fate` |
 | `sigtran_mtp3_discarded_total` | counter | `reason` |
+| `sigtran_as_state` | gauge | `as` |
+| `sigtran_m3ua_management_total` | counter | `dir`, `type` |
+| `sigtran_m3ua_error_total` | counter | `dir`, `code` |
+| `sigtran_m3ua_notify_total` | counter | `dir`, `status` |
+| `sigtran_m3ua_events_total` | counter | `event` |
+| `sigtran_m3ua_discarded_total` | counter | `reason` |
 | `sigtran_loops_detected_total` | counter | `kind` |
 | `sigtran_isup_screened_total` | counter | `reason` |
 
@@ -288,10 +350,40 @@ call. The families:
 before routing: `ppid` (not the adaptation layer's payload protocol identifier),
 `undecodable`, `out-of-state` (traffic from an ASP that is not active),
 `no-payload` (a data message without its user part), `not-unitdata` (addressed
-to a local subsystem and not a UDT) and `link-test` (a signalling link test
+to a local subsystem and not a UDT), `link-test` (a signalling link test
 message for another point code, for a link code the linkset does not have, or
-an acknowledgement of a test that is not running). Each is also a line on
-stderr naming the association. Alert on any of them moving.
+an acknowledgement of a test that is not running), and for M3UA
+`routing-context` (a routing context the association is not configured in),
+`unexpected` (a message the peer's role or the ASP's state does not allow),
+`parameter` (a parameter missing, of a wrong length or with an invalid value)
+and `management` (signalling network management in a DATA message). Each is
+also a line on stderr naming the association. Alert on any of them moving.
+
+The M3UA families ([M3UA management](#m3ua-management)):
+
+- `sigtran_as_state{as}` is `0` down, `1` inactive, `2` active, `3` pending.
+  `sigtran_asp_state{asp,as}` is `1` while the ASP is active in that server.
+- `sigtran_m3ua_management_total{dir,type}` counts every M3UA message that is
+  not DATA by its abbreviation (`ASPUP`, `ASPAC_ACK`, `NTFY`, `ERR`, `DUNA`,
+  `DAVA`, `DAUD`, `SCON`, `DUPU`, `DRST`, `BEAT`, ...).
+- `sigtran_m3ua_error_total{dir,code}` counts Error messages by the name of
+  the code in RFC 4666 3.8.1 (`invalid-routing-context`,
+  `unsupported-traffic-mode-type`, `unexpected-message`, ...). `dir="rx"` is a
+  peer refusing what this node sent: alert on it.
+- `sigtran_m3ua_notify_total{dir,status}`: `as-inactive`, `as-active`,
+  `as-pending`, `insufficient-asp-resources`, `alternate-asp-active`,
+  `asp-failure`.
+- `sigtran_m3ua_events_total{event}`: `recovery-expired` (T(r) ran out with no
+  ASP active), `takeover` (an override server changed hands), `ack-timeout` (an
+  ASP Up or ASP Active of this node was sent again), `beat-timeout` (a silent
+  peer was dropped), `beat-mismatch` (a Heartbeat Ack that does not return what
+  was sent), `changes-lagged` (destination changes came faster than they were
+  read; the ASPs were told the state as it is) and `data-on-stream-0`.
+- `sigtran_m3ua_discarded_total{reason}` counts what was not sent to a
+  server: `pending-full` and `pending-expired` (the queue of a pending
+  server), `management` (a management message for the point code of a server
+  that has no M3UA message) and `not-sent` (a management message the
+  association did not take within 250 ms).
 
 An M2PA link has three families of its own. `sigtran_m2pa_link_state` is `0`
 while the link is out of service or aligning, `1` once level 2 is in service

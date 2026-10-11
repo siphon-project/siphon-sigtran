@@ -506,6 +506,15 @@ pub enum Action {
         /// Whether it can be reached.
         accessible: bool,
     },
+    /// A destination that is accessible became so only by a route its
+    /// adjacent point restricted (13.4), or stopped being so. A destination
+    /// that is inaccessible is not restricted, and nothing says so.
+    Restricted {
+        /// The destination.
+        dpc: u32,
+        /// Whether every route in use is a restricted one.
+        restricted: bool,
+    },
     /// This node's MTP restart began or ended: while it runs, traffic from
     /// the linksets is discarded (9.6.6).
     Restarting(bool),
@@ -603,6 +612,8 @@ struct DestinationState {
     routes: Vec<RouteState>,
     paused: bool,
     accessible: bool,
+    /// Accessible, and every route in use is a restricted one.
+    restricted: bool,
     /// Linksets whose adjacent point was last told transfer-prohibited.
     told: BTreeSet<LinksetId>,
     /// T6 runs: the traffic is held.
@@ -670,6 +681,7 @@ impl Management {
                             .collect(),
                         paused: false,
                         accessible: false,
+                        restricted: false,
                         told: BTreeSet::new(),
                         holding: false,
                         deferred: Vec::new(),
@@ -824,6 +836,20 @@ impl Management {
         !self.in_use(dpc).is_empty()
     }
 
+    /// Whether a destination is reached only by routes their adjacent points
+    /// restricted (13.4): an allowed route of the same priority would be used
+    /// alone.
+    fn only_restricted(&self, dpc: u32) -> bool {
+        let Some(dest) = self.destinations.get(&dpc) else {
+            return false;
+        };
+        let in_use = self.in_use(dpc);
+        !in_use.is_empty()
+            && in_use
+                .iter()
+                .all(|i| self.usable(dest, &dest.routes[*i]) == Usable::Restricted)
+    }
+
     /// Whether a message can reach the adjacent point of a linkset at all: on
     /// one of its links, or by another route.
     fn can_tell(&self, linkset: LinksetId) -> bool {
@@ -856,9 +882,13 @@ impl Management {
         let dpcs: Vec<u32> = self.destinations.keys().copied().collect();
         for dpc in &dpcs {
             let accessible = self.reachable(*dpc);
+            let restricted = accessible && self.only_restricted(*dpc);
             let Some(dest) = self.destinations.get_mut(dpc) else {
                 continue;
             };
+            if !accessible {
+                dest.restricted = false;
+            }
             if dest.accessible != accessible {
                 dest.accessible = accessible;
                 self.out.push(Action::Accessibility {
@@ -868,6 +898,15 @@ impl Management {
                 // 13.2.2 ii): "and timer T8 is started concerning SP X".
                 if !accessible && !self.restarting {
                     self.guard(*dpc);
+                }
+            }
+            if let Some(dest) = self.destinations.get_mut(dpc) {
+                if accessible && dest.restricted != restricted {
+                    dest.restricted = restricted;
+                    self.out.push(Action::Restricted {
+                        dpc: *dpc,
+                        restricted,
+                    });
                 }
             }
         }
