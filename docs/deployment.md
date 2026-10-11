@@ -47,6 +47,15 @@ consequences for any deployment:
   signalling IPs must be stable and cannot be NATed behind a shared egress
   (SNAT also breaks SCTP multihoming). This shapes the Kubernetes model; see
   [Kubernetes & scaling](kubernetes.md#the-signalling-plane).
+- **Inbound associations are accepted by source address.** Give every `server`
+  association the `peer_addrs` of its peer
+  ([configuration](configuration.md#peer-identity)): without them it takes
+  whoever reaches the port first. The check is on the addresses SCTP reports,
+  so it is as good as the path: an address translator in front of the node
+  that rewrites source addresses makes every peer look the same, and a peer
+  behind one presents the translator's address, not its own. Filter the SCTP
+  port at the network edge as well; the check here aborts a stranger after
+  the handshake, a packet filter never answers it.
 
 ## Wiring config
 

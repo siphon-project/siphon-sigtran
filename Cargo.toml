@@ -50,7 +50,7 @@ gsm_cap = "3"
 # for the SSF-SCF dialogue an IN SCP terminates (a TCAP-user peer to CAP).
 inap = "2"
 # Async SCTP (lksctp wrapper). Pulled in now for the phase-2 transport traits.
-async-sctp = "1"
+async-sctp = "1.1"
 # ASN.1 BER. The tcap component/dialogue API exposes `rasn` types directly (an
 # Invoke parameter is a `rasn::types::Any`, an application context a
 # `rasn::types::Oid`), so the dialogue engine names them to build genuine

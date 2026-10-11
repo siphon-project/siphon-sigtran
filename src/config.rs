@@ -14,6 +14,7 @@
 //! HLR/SMSC/STP never writes `tenants:`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -166,6 +167,18 @@ pub struct Association {
     pub addrs: Vec<String>,
     /// SCTP port.
     pub port: u16,
+    /// For a `server` association: every IP address of the peer it accepts
+    /// (all of them for a multihomed peer). A peer is this association's when
+    /// every address it presents is listed; anyone else who reaches the
+    /// endpoint is aborted. Empty, the default, accepts whoever connects
+    /// first, with a warning at start. Associations with a list may share one
+    /// local `addrs` and `port` and are told apart by it.
+    #[serde(default)]
+    pub peer_addrs: Vec<String>,
+    /// For a `server` association with `peer_addrs`: the SCTP port of the
+    /// peer. Absent, any port.
+    #[serde(default)]
+    pub peer_port: Option<u16>,
     /// For m2pa links only: the adjacent point code reached directly over this
     /// link. An adjacent PC is an **implicit full route**, see
     /// [`crate::mtp3::route`].
@@ -179,6 +192,125 @@ pub struct Association {
     /// of this association. Absent means every default of [`M3uaPeer`].
     #[serde(default)]
     pub m3ua: Option<M3uaPeer>,
+}
+
+impl Association {
+    /// `peer_addrs` as addresses, an IPv4-mapped IPv6 address as the IPv4
+    /// address it is.
+    pub fn peer_ips(&self) -> Result<Vec<IpAddr>> {
+        self.peer_addrs
+            .iter()
+            .map(|text| {
+                text.parse::<IpAddr>()
+                    .map(|ip| ip.to_canonical())
+                    .map_err(|_| {
+                        Error::validation(format!(
+                            "association `{}`: `peer_addrs` entry `{text}` is not an IP address",
+                            self.id
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    /// Whether this association and `other` could both claim one peer: a
+    /// common address, and no `peer_port` that tells them apart.
+    fn peer_in_common(&self, other: &Association) -> Result<Option<IpAddr>> {
+        if matches!((self.peer_port, other.peer_port), (Some(a), Some(b)) if a != b) {
+            return Ok(None);
+        }
+        let theirs = other.peer_ips()?;
+        Ok(self.peer_ips()?.into_iter().find(|ip| theirs.contains(ip)))
+    }
+
+    /// The local addresses as written, parsed where they parse.
+    fn local(&self) -> Vec<LocalAddr<'_>> {
+        self.addrs
+            .iter()
+            .map(|text| match text.parse::<IpAddr>() {
+                Ok(ip) => LocalAddr::Ip(ip.to_canonical()),
+                Err(_) => LocalAddr::Text(text),
+            })
+            .collect()
+    }
+}
+
+/// A local address of an association: compared as an address when it is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalAddr<'a> {
+    Ip(IpAddr),
+    Text(&'a str),
+}
+
+impl LocalAddr<'_> {
+    fn is_any(&self) -> bool {
+        matches!(self, LocalAddr::Ip(ip) if ip.is_unspecified())
+    }
+}
+
+/// The listening endpoints of a file: the `server` associations by position,
+/// grouped by the local addresses and port they listen on. Port `0` asks for
+/// a port of its own, so such an association is always alone.
+///
+/// Two associations on one endpoint are told apart by the address of the
+/// peer and by nothing else, so each has to list its peer and no peer may be
+/// in two lists: anything else is an error that names both.
+pub(crate) fn listen_groups(associations: &[Association]) -> Result<Vec<Vec<usize>>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (index, a) in associations.iter().enumerate() {
+        if a.role != Role::Server {
+            continue;
+        }
+        let mine = a.local();
+        let mut home = None;
+        for (number, group) in groups.iter().enumerate() {
+            let Some(first) = group.first().and_then(|i| associations.get(*i)) else {
+                continue;
+            };
+            if a.port == 0 || first.port != a.port {
+                continue;
+            }
+            let theirs = first.local();
+            let same = mine.len() == theirs.len() && mine.iter().all(|l| theirs.contains(l));
+            let touching = mine
+                .iter()
+                .any(|l| l.is_any() || theirs.contains(l) || theirs.iter().any(LocalAddr::is_any));
+            if !touching {
+                continue;
+            }
+            if !same {
+                return Err(Error::validation(format!(
+                    "associations `{}` and `{}` listen on port {} with address lists that \
+                     overlap but differ: give both the same `addrs`, or addresses of their own",
+                    first.id, a.id, a.port
+                )));
+            }
+            for other in group.iter().filter_map(|i| associations.get(*i)) {
+                if a.peer_addrs.is_empty() || other.peer_addrs.is_empty() {
+                    return Err(Error::validation(format!(
+                        "associations `{}` and `{}` listen on the same address and port {}: \
+                         each needs `peer_addrs` to be told apart from the other",
+                        other.id, a.id, a.port
+                    )));
+                }
+                if let Some(ip) = a.peer_in_common(other)? {
+                    return Err(Error::validation(format!(
+                        "associations `{}` and `{}` listen on the same address and port {} \
+                         and both list the peer address {ip}: a connection from it could be \
+                         either's (a different `peer_port` on each tells them apart)",
+                        other.id, a.id, a.port
+                    )));
+                }
+            }
+            home = Some(number);
+            break;
+        }
+        match home.and_then(|number| groups.get_mut(number)) {
+            Some(group) => group.push(index),
+            None => groups.push(vec![index]),
+        }
+    }
+    Ok(groups)
 }
 
 /// The `m3ua:` block of an association: what RFC 4666 leaves to provisioning
@@ -1071,6 +1203,26 @@ impl Config {
                     a.id
                 )));
             }
+            if a.role == Role::Client && (!a.peer_addrs.is_empty() || a.peer_port.is_some()) {
+                return Err(Error::validation(format!(
+                    "association `{}` is a client: its peer is `addrs` and `port`, \
+                     `peer_addrs` and `peer_port` are for a server association",
+                    a.id
+                )));
+            }
+            if a.peer_port.is_some() && a.peer_addrs.is_empty() {
+                return Err(Error::validation(format!(
+                    "association `{}` has a `peer_port` but no `peer_addrs`",
+                    a.id
+                )));
+            }
+            if a.peer_port == Some(0) {
+                return Err(Error::validation(format!(
+                    "association `{}`: `peer_port` must not be 0",
+                    a.id
+                )));
+            }
+            a.peer_ips()?;
             if let Some(pc) = a.adjacent_pc {
                 // adjacent_pc only meaningful for m2pa; still must fit *some*
                 // variant, validated per-tenant below where the variant is
@@ -1118,6 +1270,10 @@ impl Config {
                 }
             }
         }
+
+        // Associations that listen on one endpoint are told apart by their
+        // peers, which they have to list without overlap.
+        listen_groups(&self.associations)?;
 
         let assoc_adapt: BTreeMap<&str, Adaptation> = self
             .associations
@@ -2285,5 +2441,202 @@ sccp:
             "node: { point_code: 1000, variant: ITU }\nassociations:\n  - { id: x1, adaptation: m2pa, role: client, addrs: [192.0.2.1], port: 3565, m3ua: { beat_ms: 500 } }\n",
             "is not an m3ua association",
         );
+    }
+
+    /// A node with these association entries and nothing else.
+    fn listening(associations: &[&str]) -> String {
+        let mut yaml = String::from("node: { point_code: 1000, variant: ITU }\nassociations:\n");
+        for (number, entry) in associations.iter().enumerate() {
+            yaml.push_str(&format!(
+                "  - {{ id: a{number}, adaptation: m3ua, role: server, {entry} }}\n"
+            ));
+        }
+        yaml
+    }
+
+    #[test]
+    fn peer_addrs_and_peer_port_default_to_whoever_connects() {
+        let cfg = Config::parse(SAMPLE).unwrap();
+        assert!(cfg.associations.iter().all(|a| a.peer_addrs.is_empty()));
+        assert!(cfg.associations.iter().all(|a| a.peer_port.is_none()));
+
+        let cfg = Config::parse(&listening(&[
+            "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10, \"2001:db8::10\", \"::ffff:198.51.100.10\"], peer_port: 2905",
+        ]))
+        .unwrap();
+        let a = &cfg.associations[0];
+        assert_eq!(a.peer_port, Some(2905));
+        // An IPv4-mapped address is the IPv4 address.
+        let ips: Vec<String> = a
+            .peer_ips()
+            .unwrap()
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect();
+        assert_eq!(ips, ["192.0.2.10", "2001:db8::10", "198.51.100.10"]);
+    }
+
+    #[test]
+    fn associations_that_listen_on_one_endpoint_must_be_told_apart() {
+        // (the associations, what the error names; `None` loads)
+        let table: [(&[&str], Option<&[&str]>); 12] = [
+            // One endpoint, each with its peer: one listener, two associations.
+            (
+                &[
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10]",
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.20]",
+                ],
+                None,
+            ),
+            // Multihomed, the local addresses in another order.
+            (
+                &[
+                    "addrs: [192.0.2.1, 198.51.100.1], port: 2905, peer_addrs: [192.0.2.10, 198.51.100.10]",
+                    "addrs: [198.51.100.1, 192.0.2.1], port: 2905, peer_addrs: [192.0.2.20]",
+                ],
+                None,
+            ),
+            // The same peer address, told apart by its port.
+            (
+                &[
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10], peer_port: 3000",
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10], peer_port: 3001",
+                ],
+                None,
+            ),
+            // Different local addresses or ports are different endpoints.
+            (
+                &[
+                    "addrs: [192.0.2.1], port: 2905",
+                    "addrs: [192.0.2.2], port: 2905",
+                    "addrs: [192.0.2.1], port: 2906",
+                ],
+                None,
+            ),
+            // Port 0 asks for a port of its own, every time.
+            (
+                &["addrs: [192.0.2.1], port: 0", "addrs: [192.0.2.1], port: 0"],
+                None,
+            ),
+            // A peer in two lists.
+            (
+                &[
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10, 192.0.2.11]",
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.11]",
+                ],
+                Some(&["`a0`", "`a1`", "192.0.2.11"]),
+            ),
+            // The same peer address where only one fixes the port.
+            (
+                &[
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10], peer_port: 3000",
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10]",
+                ],
+                Some(&["`a0`", "`a1`", "192.0.2.10"]),
+            ),
+            // One with a list and one without.
+            (
+                &[
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10]",
+                    "addrs: [192.0.2.1], port: 2905",
+                ],
+                Some(&["`a0`", "`a1`", "peer_addrs"]),
+            ),
+            // Neither with a list: before, the second failed to bind at start.
+            (
+                &["addrs: [192.0.2.1], port: 2905", "addrs: [192.0.2.1], port: 2905"],
+                Some(&["`a0`", "`a1`", "peer_addrs"]),
+            ),
+            // The third against the second.
+            (
+                &[
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10]",
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.20]",
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.20]",
+                ],
+                Some(&["`a1`", "`a2`", "192.0.2.20"]),
+            ),
+            // Address lists that overlap and differ cannot both be bound.
+            (
+                &[
+                    "addrs: [192.0.2.1, 198.51.100.1], port: 2905, peer_addrs: [192.0.2.10]",
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.20]",
+                ],
+                Some(&["`a0`", "`a1`", "overlap"]),
+            ),
+            // Every address covers every other.
+            (
+                &[
+                    "addrs: [0.0.0.0], port: 2905, peer_addrs: [192.0.2.10]",
+                    "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.20]",
+                ],
+                Some(&["`a0`", "`a1`", "overlap"]),
+            ),
+        ];
+        for (associations, names) in table {
+            let outcome = Config::parse(&listening(associations));
+            match names {
+                None => {
+                    outcome.unwrap_or_else(|e| panic!("{associations:?}: {e}"));
+                }
+                Some(names) => {
+                    let error = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+                    for name in names {
+                        assert!(error.contains(name), "{associations:?}: `{error}`");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_listening_endpoints_of_a_file_are_grouped() {
+        let cfg = Config::parse(&listening(&[
+            "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10]",
+            "addrs: [192.0.2.2], port: 2905",
+            "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.20]",
+            "addrs: [192.0.2.1], port: 0",
+            "addrs: [192.0.2.1], port: 0",
+        ]))
+        .unwrap();
+        assert_eq!(
+            listen_groups(&cfg.associations).unwrap(),
+            [vec![0, 2], vec![1], vec![3], vec![4]]
+        );
+        // A client association listens nowhere.
+        let cfg = Config::parse(SAMPLE).unwrap();
+        assert_eq!(
+            listen_groups(&cfg.associations).unwrap(),
+            [vec![0], vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn the_peer_keys_are_checked() {
+        // (the association, what the error says)
+        let table = [
+            (
+                "addrs: [192.0.2.1], port: 2905, peer_addrs: [hlr.example]",
+                "not an IP address",
+            ),
+            (
+                "addrs: [192.0.2.1], port: 2905, peer_port: 2905",
+                "no `peer_addrs`",
+            ),
+            (
+                "addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.10], peer_port: 0",
+                "must not be 0",
+            ),
+        ];
+        for (association, says) in table {
+            let error = Config::parse(&listening(&[association]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(says), "{association}: `{error}`");
+        }
+        // On a client the peer is `addrs` and `port`.
+        let yaml = "node: { point_code: 1000, variant: ITU }\nassociations:\n  - { id: c, adaptation: m3ua, role: client, addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.1] }\n";
+        let error = Config::parse(yaml).unwrap_err().to_string();
+        assert!(error.contains("is a client"), "`{error}`");
     }
 }
