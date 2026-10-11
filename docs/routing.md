@@ -308,6 +308,7 @@ call. The families:
 | Family | Kind | Labels |
 |---|---|---|
 | `sigtran_association_state` | gauge | `assoc`, `adaptation` |
+| `sigtran_association_refused_total` | counter | `reason` |
 | `sigtran_asp_state` | gauge | `asp`, `as` |
 | `sigtran_linkset_available` | gauge | `linkset` |
 | `sigtran_linkset_active_links` | gauge | `linkset` |
@@ -358,6 +359,18 @@ an acknowledgement of a test that is not running), and for M3UA
 `parameter` (a parameter missing, of a wrong length or with an invalid value)
 and `management` (signalling network management in a DATA message). Each is
 also a line on stderr naming the association. Alert on any of them moving.
+
+`sigtran_association_refused_total` counts the SCTP associations a listening
+endpoint aborted ([who a listening association accepts](configuration.md#peer-identity)):
+`unknown-peer` (no association on the endpoint lists any address of the peer),
+`unlisted-address` (the peer presented a listed address and one that is not),
+`peer-port` (the addresses of an association with another `peer_port`),
+`duplicate` (the association is established already and stayed so) and
+`closed` (the peer was gone before its addresses were read). Each is a line on
+stderr with the addresses, at most one a second per endpoint. `unknown-peer`
+moving is someone who is not configured knocking; `duplicate` moving is a peer
+that dials while its association is up, or one that came back from another
+port before the old association had failed.
 
 The M3UA families ([M3UA management](#m3ua-management)):
 

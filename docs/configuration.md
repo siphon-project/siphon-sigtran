@@ -101,7 +101,9 @@ The SCTP transport plane: one entry per association.
 | `adaptation` | *(required)* | `m3ua` (RFC 4666) or `m2pa` (RFC 4165). |
 | `role` | *(required)* | `server` (we listen) or `client` (we connect). |
 | `addrs` | *(required)* | One or more IP addresses. More than one enables SCTP multihoming. |
-| `port` | *(required)* | SCTP port. Convention: 2905 for M3UA, 3565 for M2PA. |
+| `port` | *(required)* | SCTP port. Convention: 2905 for M3UA, 3565 for M2PA. For a `server`, `0` asks the kernel for a port of its own (a test, not a deployment). |
+| `peer_addrs` | `[]` *(server only)* | Every IP address of the peer this association accepts: all of them for a multihomed peer. See [who a listening association accepts](#peer-identity). Empty accepts whoever connects first and logs a warning at start. |
+| `peer_port` | *(none: any port)* *(server only)* | The SCTP port of the peer. Needs `peer_addrs`. Not `0`. |
 | `adjacent_pc` | *(m2pa only)* | The adjacent point code reached directly over this link. An adjacent PC is an **implicit route**; it needs no `mtp3_routes` entry. |
 | `m2pa` | *(m2pa only)* every default below | Level 2 of the link: see [the `m2pa` block](#m2pa-link). |
 | `m3ua` | *(m3ua only)* every default below | The heartbeat and the acknowledgement timer of the peer: see [the `m3ua` block](#m3ua-peer). |
@@ -110,6 +112,64 @@ An `m3ua` association carries traffic only as an ASP of an
 [application server](#application-servers). One that is in no server can come
 up and cannot become active: its ASP Active is answered with Error, "No
 Configured AS for ASP" (RFC 4666 3.8.1).
+
+### Who a listening association accepts { #peer-identity }
+
+For a `server` association `addrs` and `port` are this node's. The peer is
+described by `peer_addrs` and, when its port is fixed, `peer_port`:
+
+```yaml
+associations:
+  - { id: asp-a, adaptation: m3ua, role: server, addrs: [192.0.2.1, 198.51.100.1], port: 2905,
+      peer_addrs: [192.0.2.10, 198.51.100.10] }
+  - { id: asp-b, adaptation: m3ua, role: server, addrs: [192.0.2.1, 198.51.100.1], port: 2905,
+      peer_addrs: [192.0.2.20], peer_port: 2905 }
+```
+
+RFC 4165 4.1.2 asks for it for a signalling link ("Each MTP link corresponds to
+an SCTP association. To prevent duplicate associations from being established,
+it is RECOMMENDED that each endpoint know the IP address (or IP addresses, if
+multi-homing is used) and port number of both endpoints"), and the node applies
+the same to an M3UA and a SUA association.
+
+- **A peer is an association's when every address it presents is listed.** SCTP
+  hands over all the addresses of the peer (RFC 9260 5.1.2: the receiver of an
+  INIT records "all the transport addresses from the received chunk"). One
+  listed address with one that is not listed is refused: traffic would be sent
+  to an address nobody vouched for. A peer whose SCTP socket is not bound to
+  specific addresses offers every address of its host, so list them all or
+  bind the peer.
+- **Anyone else is refused.** The kernel answers an INIT by itself and
+  completes the handshake before the node sees the association, so the refusal
+  is an SCTP ABORT right after the association came up: the peer sees it come
+  up and be aborted. Nothing it sent is read. Each refusal is counted in
+  `sigtran_association_refused_total{reason}` and logged with the addresses
+  (at most one line a second per listening endpoint, which says how many it
+  left out).
+- **Associations may share one local `addrs` and `port`** and are told apart by
+  the address of the peer: one listener serves them all. Two associations on
+  one endpoint whose `peer_addrs` have an address in common (unless a different
+  `peer_port` on each tells them apart), or one of which has no `peer_addrs`,
+  do not load: the error names both. Two associations whose `addrs` overlap
+  without being the same list on one port do not load either.
+- **An established association is not displaced.** A second association for
+  the same `id` waits, unread, for up to two seconds (a peer that closed its
+  association and dials again at once is served as soon as the old one is
+  gone) and is then aborted and counted as `duplicate`. A restart of the same
+  peer from the same addresses and port never gets that far: SCTP handles it
+  inside the association it has (RFC 9260 5.2.4). The cost of not displacing: a
+  peer that lost its association without the node noticing, and comes back
+  from another port, is refused until the old association has failed, which
+  is at the next packet the node sends to it or at the SCTP heartbeat (30
+  seconds by default). `beat_ms` of [the `m3ua` block](#m3ua-peer) shortens
+  that; a fixed source port at the peer, with `peer_port` here, avoids it.
+- **Being accepted makes an association no egress.** Traffic goes to it when
+  its adaptation layer says so: an ASP that is active, a link that is aligned
+  and passed its test.
+
+Without `peer_addrs` an association accepts whoever connects first to its
+port, as every release before this key did, and a line at start says so in
+capitals. It then needs an address and port of its own.
 
 ### The `m3ua` block { #m3ua-peer }
 

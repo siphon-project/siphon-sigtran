@@ -99,6 +99,7 @@ use crate::routing::{Inbound, RouteDecision, Router};
 
 mod forward;
 pub mod framing;
+pub mod identity;
 mod m2pa;
 mod m3ua;
 mod management;
@@ -286,44 +287,83 @@ impl TransportHandle {
             shutdown_rx.clone(),
         )));
 
+        let ctx = TaskCtx {
+            router: router.clone(),
+            registry: registry.clone(),
+            tenant: tenant_id.to_string(),
+            local_tx: local_tx.clone(),
+        };
+
+        // One listener per local endpoint. Associations that share one are
+        // told apart by the address of the peer.
+        let groups = crate::config::listen_groups(&config.associations)
+            .map_err(|e| TransportError::Config(e.to_string()))?;
+        for group in groups {
+            let members: Vec<&Association> = group
+                .iter()
+                .filter_map(|index| config.associations.get(*index))
+                .collect();
+            let Some(first) = members.first() else {
+                continue;
+            };
+            let listener = bind(&socket_addrs(first)?, &sctp_cfg)?;
+            let local = listener.local_addr()?;
+            let mut doors = Vec::new();
+            for assoc in members {
+                let slot = registry
+                    .slot(&assoc.id)
+                    .cloned()
+                    .ok_or_else(|| TransportError::Config(format!("no slot for `{}`", assoc.id)))?;
+                let addrs = assoc
+                    .peer_ips()
+                    .map_err(|e| TransportError::Config(e.to_string()))?;
+                if addrs.is_empty() {
+                    eprintln!(
+                        "siphon-sigtran: WARNING: association `{}` listens on {local} without \
+                         `peer_addrs`: WHOEVER CONNECTS FIRST IS TAKEN FOR ITS PEER. List the \
+                         addresses of the peer.",
+                        assoc.id
+                    );
+                }
+                // A link nobody has connected to yet still has its queue
+                // served.
+                if assoc.adaptation == Adaptation::M2pa {
+                    tasks.push(tokio::spawn(m2pa::idle_link(
+                        slot.clone(),
+                        ctx.clone(),
+                        shutdown_rx.clone(),
+                        0,
+                    )));
+                }
+                bound.insert(assoc.id.clone(), local);
+                doors.push(Door {
+                    slot,
+                    rule: identity::Rule {
+                        addrs,
+                        port: assoc.peer_port,
+                    },
+                });
+            }
+            tasks.push(tokio::spawn(accept_loop(
+                listener,
+                Arc::new(Endpoint::new(local, doors)),
+                ctx.clone(),
+                shutdown_rx.clone(),
+            )));
+        }
+
         for assoc in &config.associations {
+            if assoc.role != Role::Client {
+                continue;
+            }
             let slot = registry
                 .slot(&assoc.id)
                 .cloned()
                 .ok_or_else(|| TransportError::Config(format!("no slot for `{}`", assoc.id)))?;
             let addrs = socket_addrs(assoc)?;
-            let ctx = TaskCtx {
-                router: router.clone(),
-                registry: registry.clone(),
-                tenant: tenant_id.to_string(),
-                local_tx: local_tx.clone(),
-            };
-
-            match (assoc.adaptation, assoc.role) {
-                (Adaptation::M3ua, Role::Server)
-                | (Adaptation::M2pa, Role::Server)
-                | (Adaptation::Sua, Role::Server) => {
-                    // A link nobody has connected to yet still has its queue
-                    // served.
-                    if assoc.adaptation == Adaptation::M2pa {
-                        tasks.push(tokio::spawn(m2pa::idle_link(
-                            slot.clone(),
-                            ctx.clone(),
-                            shutdown_rx.clone(),
-                            0,
-                        )));
-                    }
-                    let listener = bind(&addrs, &sctp_cfg)?;
-                    bound.insert(assoc.id.clone(), listener.local_addr()?);
-                    tasks.push(tokio::spawn(accept_loop(
-                        listener,
-                        slot,
-                        ctx,
-                        shutdown_rx.clone(),
-                        assoc.adaptation,
-                    )));
-                }
-                (Adaptation::M3ua, Role::Client) => {
+            let ctx = ctx.clone();
+            match assoc.adaptation {
+                Adaptation::M3ua => {
                     let conn = Arc::new(connect(&addrs, &sctp_cfg).await?);
                     slot.set_sender(conn.clone());
                     tasks.push(tokio::spawn(m3ua::run_asp(
@@ -333,7 +373,7 @@ impl TransportHandle {
                         shutdown_rx.clone(),
                     )));
                 }
-                (Adaptation::Sua, Role::Client) => {
+                Adaptation::Sua => {
                     let conn = Arc::new(connect(&addrs, &sctp_cfg).await?);
                     slot.set_sender(conn.clone());
                     let membership = registry.as_membership(&assoc.id);
@@ -345,7 +385,7 @@ impl TransportHandle {
                         shutdown_rx.clone(),
                     )));
                 }
-                (Adaptation::M2pa, Role::Client) => {
+                Adaptation::M2pa => {
                     let conn = Arc::new(connect(&addrs, &sctp_cfg).await?);
                     slot.set_sender(conn.clone());
                     tasks.push(tokio::spawn(m2pa::run_link(
@@ -501,42 +541,203 @@ impl Drop for TransportHandle {
     }
 }
 
-/// Accept loop for a `server` association: each accepted peer gets its own
-/// adaptation task and becomes the association's live sender.
+/// One association of a listening endpoint: its slot, and whom it accepts.
+struct Door {
+    slot: Arc<registry::AssocSlot>,
+    rule: identity::Rule,
+}
+
+/// A listening endpoint: one local address set and port, and the associations
+/// configured on it.
+struct Endpoint {
+    local: SocketAddr,
+    doors: Vec<Door>,
+    rules: Vec<identity::Rule>,
+    /// A refused peer is counted every time and logged at most this often:
+    /// anyone can connect as often as they like.
+    refusals: std::sync::Mutex<identity::Throttle>,
+}
+
+/// How often a listening endpoint writes a line about a refused association.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(1);
+/// How long an accepted association waits for the slot while another
+/// association has it: the time the shutdown of the one before may take when
+/// a peer closes and dials again at once, with room for a SHUTDOWN that is
+/// lost and sent again after one retransmission timeout (RFC 9260 9.2 and
+/// 16: RTO.Initial is 1 second). An association that is still established
+/// after that is not going away.
+const HANDOVER: Duration = Duration::from_secs(2);
+
+impl Endpoint {
+    fn new(local: SocketAddr, doors: Vec<Door>) -> Self {
+        Self {
+            local,
+            rules: doors.iter().map(|door| door.rule.clone()).collect(),
+            doors,
+            refusals: std::sync::Mutex::new(identity::Throttle::new(REFUSAL_LOG_INTERVAL)),
+        }
+    }
+
+    /// Refuse an association the kernel has established already: count it,
+    /// log it, and abort it. Nothing it sent is read. The peer sees its
+    /// association come up and then an SCTP ABORT.
+    async fn refuse(
+        &self,
+        assoc: &SctpAssociation,
+        from: SocketAddr,
+        reason: identity::Refusal,
+        detail: &str,
+    ) {
+        metrics::association_refused(reason);
+        let line = self
+            .refusals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .event(Instant::now());
+        if let Some(left_out) = line {
+            let more = if left_out > 0 {
+                format!(" ({left_out} more refused here since the last line)")
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "siphon-sigtran: refused an association from {from} on {} ({}): {detail}{more}",
+                self.local,
+                reason.label()
+            );
+        }
+        // An abort that cannot be sent leaves the close of the socket, which
+        // ends the association as well.
+        let _ = tokio::time::timeout(Duration::from_secs(1), assoc.abort()).await;
+    }
+}
+
+/// Accept loop of a listening endpoint: every association the kernel hands
+/// over is checked and served in a task of its own.
 async fn accept_loop(
     listener: SctpListener,
-    slot: Arc<registry::AssocSlot>,
+    endpoint: Arc<Endpoint>,
     ctx: TaskCtx,
     mut shutdown: watch::Receiver<bool>,
-    adaptation: Adaptation,
 ) {
+    let mut failures = identity::Throttle::new(REFUSAL_LOG_INTERVAL);
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
-            r = listener.accept() => {
-                let (assoc, _peer) = match r {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                let assoc = Arc::new(assoc);
-                slot.set_sender(assoc.clone());
-                let child_ctx = ctx.clone();
-                let child_slot = slot.clone();
-                let child_sd = shutdown.clone();
-                match adaptation {
-                    Adaptation::M3ua => {
-                        tokio::spawn(m3ua::run_sg(assoc, child_slot, child_ctx, child_sd));
+            r = listener.accept() => match r {
+                Ok((assoc, from)) => {
+                    tokio::spawn(admit(
+                        Arc::new(assoc),
+                        from,
+                        endpoint.clone(),
+                        ctx.clone(),
+                        shutdown.clone(),
+                    ));
+                }
+                Err(error) => {
+                    // The endpoint keeps listening: an association that
+                    // could not be taken (no descriptor left, a peer that
+                    // was gone already) says nothing about the next.
+                    if failures.event(Instant::now()).is_some() {
+                        eprintln!(
+                            "siphon-sigtran: accept on {} failed: {error}",
+                            endpoint.local
+                        );
                     }
-                    Adaptation::M2pa => {
-                        tokio::spawn(m2pa::run_link(assoc, child_slot, child_ctx, child_sd));
-                    }
-                    Adaptation::Sua => {
-                        tokio::spawn(sua::run_sg(assoc, child_slot, child_ctx, child_sd));
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                     }
                 }
-            }
+            },
         }
     }
+}
+
+/// Decide whose peer an accepted association is, and serve it as that
+/// association until it ends; or refuse it.
+async fn admit(
+    assoc: Arc<SctpAssociation>,
+    from: SocketAddr,
+    endpoint: Arc<Endpoint>,
+    ctx: TaskCtx,
+    shutdown: watch::Receiver<bool>,
+) {
+    // Every address of a multihomed peer, as its INIT listed them.
+    let presented = assoc.peer_addrs().unwrap_or_default();
+    let door = match identity::admit(&endpoint.rules, &presented)
+        .map(|position| endpoint.doors.get(position))
+    {
+        Ok(Some(door)) => door,
+        Ok(None) => return,
+        Err(reason) => {
+            let detail = match reason {
+                identity::Refusal::Closed => {
+                    "it was gone before its addresses were read".to_string()
+                }
+                identity::Refusal::PeerPort => {
+                    format!("the association that lists {presented:?} has another `peer_port`")
+                }
+                identity::Refusal::UnlistedAddress => format!(
+                    "of the addresses {presented:?} an association lists some and not all: \
+                     a peer is known by every address it has"
+                ),
+                _ => format!("no association here lists {presented:?}"),
+            };
+            endpoint.refuse(&assoc, from, reason, &detail).await;
+            return;
+        }
+    };
+    let slot = &door.slot;
+
+    // The slot is one association at a time. One that is established is not
+    // displaced. The newcomer is not a restart of it: an INIT from the same
+    // addresses and port is processed inside the association the endpoint
+    // has (RFC 9260 5.2, "the endpoint processes such a chunk as part of its
+    // current association"; 5.2.4 A, "A RESTART notification SHOULD be sent
+    // to the ULP") and `accept` returns nothing for it. So the newcomer came
+    // from another port and is another association. A peer that closed its
+    // association and dials again at once is not refused for that: the
+    // newcomer waits, unread, for as long as the shutdown of the one before
+    // may take.
+    let deadline = tokio::time::Instant::now() + HANDOVER;
+    let occupancy = loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if let Some(occupancy) = slot.occupy(&assoc) {
+            break occupancy;
+        }
+        let freed = tokio::time::timeout_at(deadline, slot.vacated()).await;
+        if freed.is_err() {
+            endpoint
+                .refuse(
+                    &assoc,
+                    from,
+                    identity::Refusal::Duplicate,
+                    &format!(
+                        "association `{}` is established already and is not displaced",
+                        slot.id
+                    ),
+                )
+                .await;
+            return;
+        }
+    };
+
+    // Not an egress by being accepted: the adaptation layer makes it one.
+    ctx.registry.quiesce(slot);
+    slot.set_sender(assoc.clone());
+    eprintln!(
+        "siphon-sigtran: association `{}` accepted from {presented:?} on {}",
+        slot.id, endpoint.local
+    );
+    match slot.adaptation {
+        Adaptation::M3ua => m3ua::run_sg(assoc, slot.clone(), ctx, shutdown).await,
+        Adaptation::M2pa => m2pa::run_link(assoc, slot.clone(), ctx, shutdown).await,
+        Adaptation::Sua => sua::run_sg(assoc, slot.clone(), ctx, shutdown).await,
+    }
+    drop(occupancy);
 }
 
 /// Count and log one message received on `assoc` and dropped before routing. A
