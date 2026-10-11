@@ -25,13 +25,63 @@ All notable changes are documented here. The format follows
   linkset (`enabled`, `t1_ms`, `t2_ms`, `pattern`) and `slc:` on a link are new
   keys, all with defaults.
 - **The buffers a failed link holds can be retrieved** (`transport::M2paLink`:
-  `bsnt`, `retrieve`), as RFC 4165 4.2.3 needs for changeover. Nothing calls
-  them yet: until changeover exists, what a failed link had sent and not seen
-  acknowledged is counted as lost.
+  `bsnt`, `retrieve`), as RFC 4165 4.2.3 needs for changeover, which uses
+  them (see below).
 - `sigtran_m2pa_discarded_total{reason}`, `sigtran_m2pa_link_failures_total{reason}`,
   `sigtran_link_tests_total{result}`, and `link-test` as a `reason` of
   `sigtran_rx_discarded_total`. Every message a link receives or is handed and
   does not carry is in one of them, with a line on stderr.
+- **Signalling network management of a transfer point** (ITU-T Q.704), one
+  task per routing domain, for linksets:
+  - *Changeover and changeback* (clauses 5 and 6). When a link fails, its
+    traffic is buffered, an extended changeover order (XCO / XCA of Q.2210
+    9.8.1, as RFC 4165 4.2.3 has M2PA links use) carries the last sequence
+    number accepted, and on the acknowledgement the messages the far end does
+    not have go out again on the alternative links ahead of the buffer: none
+    lost, none twice. T1 (time-controlled) and T2 cover a far end that cannot
+    be asked or does not answer; an order from the far end is obeyed and
+    acknowledged; ECO, ECA, COO and COA are answered as 5.6 and 5.7 say. When
+    the link returns, a changeback declaration goes out on each link that
+    carried its traffic and the buffer follows the acknowledgements (T4, T5);
+    a linkset that returns takes its traffic back after T3.
+  - *Route management* (clause 13). Transfer-prohibited and transfer-allowed
+    are sent to the adjacent points when a destination becomes inaccessible or
+    accessible through this node (broadcast method), when this node starts or
+    stops routing a destination through a point (13.2.2 i, 13.3.2 i), and in
+    answer to a message that cannot be transferred (response method, T8).
+    Received ones mark that one route: traffic moves at once on a
+    transfer-prohibited (forced rerouting, clause 7) and after T6 on a
+    transfer-allowed or -restricted (controlled rerouting, clause 8). A
+    prohibited or restricted route is tested every T10, and a route set test
+    from a neighbour is answered.
+  - *MTP restart* (clause 9): this node's own (T18, T20, traffic from the
+    linksets discarded until it ends), that of an adjacent point (T21: no
+    traffic to it before its traffic restart allowed), and T19.
+  - *Management inhibiting* (clause 10) at the far end's request: granted or
+    denied, the link taken out of traffic and put back, the inhibit tests run
+    and answered. This node never asks to inhibit a link itself.
+  - Transfer-controlled is counted and published; none is sent.
+- **Routes of equal priority share the load** by signalling link selection
+  (Q.704 2.3.2 b): `Router::route_for` and `RouteResolver::resolve_for` take
+  the selection code, `route_in` and `resolve` are the same with code 0. Each
+  code has a normal route and a normal link; when one fails only its codes
+  move. A linkset in a combined linkset picks its links by the bits the choice
+  of the linkset left over.
+- An `mtp3:` block per routing domain: every Q.704 timer the above runs
+  (`t1_ms` to `t6_ms`, `t8_ms`, `t10_ms`, `t12_ms`, `t13_ms`, `t18_ms` to
+  `t21_ms`, `t23_ms`), `tfp_for_unknown_destination` and `rerouting_buffer`,
+  all with the Q.704 16.8 values as defaults.
+- `Registry::destination_changes`: every destination that becomes accessible
+  or inaccessible through this node, and every transfer-controlled, is
+  published there once (`transport::DestinationChange`).
+- `mtp3::management`, the state machine behind all of it, without I/O:
+  `Management`, its `Input` and `Action`, `Topology`, `Timers`.
+- `sigtran_mtp3_management_total{dir,type}`,
+  `sigtran_mtp3_procedures_total{procedure}`,
+  `sigtran_mtp3_retrieved_total{fate}`, `sigtran_mtp3_discarded_total{reason}`,
+  `sigtran_mtp3_link_traffic{link}` and `sigtran_mtp3_restarting`.
+  `sigtran_mtp3mg_events_total` now also counts `tfp` and `tfa` received from a
+  linkset.
 
 ### Changed
 
@@ -56,6 +106,30 @@ All notable changes are documented here. The format follows
   after it; a loop the handler leaves with nothing pending is now kept for the
   next one (16 us down to under 5 us per call for a short handler). A loop left
   with a task still pending is closed, as before.
+- **A linkset carries traffic later than it did.** A node whose first link
+  comes into service runs the MTP restart procedure and discards what arrives
+  on its linksets until every adjacent point has sent traffic restart allowed,
+  or `mtp3.t18_ms` (20 s) is over; an adjacent point that returns is waited for
+  under `mtp3.t21_ms` (64 s). A conformant peer answers within milliseconds. A
+  peer that never sends traffic restart allowed costs the whole timer: lower
+  the two for it.
+- A node now sends management messages on its linksets (transfer-prohibited
+  for what it routes through each adjacent point, traffic restart allowed),
+  where it sent nothing before.
+- What a failed link had sent and not seen acknowledged is counted in
+  `sigtran_m2pa_discarded_total{reason="tx-lost-on-failure"}` only when the
+  changeover could not establish that the far end has it (no acknowledgement,
+  or one without a sequence number); what is sent again or confirmed is in
+  `sigtran_mtp3_retrieved_total`. A message handed to a link that is out of
+  service is buffered and diverted, no longer counted `tx-not-in-service`.
+- `sigtran_linkset_available` is `1` while level 3 routes traffic to a link of
+  the linkset, which is later than level 2 being in service.
+- The link of a linkset is chosen by a fixed assignment of selection codes to
+  links, and falls back to the links that carry traffic. It used to be the
+  code modulo the number of links in service, which moved every code when one
+  link failed.
+- The route state is recomputed when a link's availability changes, no longer
+  after every message a link receives.
 
 ### Fixed
 
@@ -75,11 +149,31 @@ All notable changes are documented here. The format follows
 - All senders now hand an MSU for a linkset to the link's own task, which is the
   only writer of User Data on the association: the FSN order is the order on
   the stream.
+- **A message that could not be routed was answered at SCCP level only.**
+  Nothing told the adjacent point that sent it, which went on sending. It now
+  gets a transfer-prohibited (Q.704 2.4.1, 13.2.2 iii), in addition to the SCCP
+  return, and the message is counted
+  (`sigtran_mtp3_discarded_total{reason="no-route"}`).
+- **Route state changes were not announced** to adjacent signalling points.
+- **A transfer-prohibited from a linkset was ignored**, as was every other
+  management message for this node arriving on a link: service indicator 0
+  was handed to SCCP routing and dropped.
+- **Routes of equal priority did not share**: the first one listed carried
+  everything.
+- **A link that failed lost what it held.** Its unacknowledged and unsent
+  messages were dropped and counted; they are now retrieved and sent on the
+  alternative links.
+- An adjacent point reached through a linkset of several links had one route
+  per link, so the links counted as a combined linkset of themselves.
 
 An M2PA link between this release and 3.0.0 does not come into service: 3.0.0
 does not answer the link test or acknowledge User Data. Upgrade both ends, or
 set `link_test: { enabled: false }` and expect T7 to fail the link under
 traffic.
+
+Two nodes of this release that start at the same moment each wait `t18_ms` for
+the other's traffic restart allowed, as Q.704 9.2.2 has a restarting node do.
+In a lab, set `mtp3: { t18_ms: ... }` to what the wait is worth there.
 
 ## [4.1.0] — 2026-10-18
 

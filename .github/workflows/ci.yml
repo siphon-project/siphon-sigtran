@@ -127,6 +127,14 @@ jobs:
           SIGTRAN_REQUIRE_TSHARK: "1"
         run: cargo test --test wire_m2pa
 
+      # Level 3 of a transfer point against hand-written adjacent points:
+      # every management message the node sends (ITU-T Q.704) is read back by
+      # Wireshark.
+      - name: MTP3 management (tshark field assertions)
+        env:
+          SIGTRAN_REQUIRE_TSHARK: "1"
+        run: cargo test --test wire_mtp3
+
       # Every message the dialogue engine emits in answer to a damaged or
       # unexpected one, dissected by Wireshark with assertions on the fields.
       - name: Abnormal procedures (tshark field assertions)

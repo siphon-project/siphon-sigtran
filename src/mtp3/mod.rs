@@ -9,6 +9,7 @@
 //!
 //! [`mtp3_routes`]: crate::config::Mtp3Route
 
+pub mod management;
 pub mod route;
 
-pub use route::{Destination, LinksetId, RouteResolver, RouteState};
+pub use route::{Destination, LinksetId, RouteResolver, RouteState, RouteStatus};
