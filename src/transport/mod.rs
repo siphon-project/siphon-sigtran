@@ -16,14 +16,21 @@
 //!             framing::wrap → SCTP       dialogue SAP
 //! ```
 //!
-//! ## What the M3UA subset does
+//! ## What M3UA does
 //!
-//! It runs the ASPSM + ASPTM handshake so an AS becomes active (ASP-UP ↔ -ACK,
-//! ASP-ACTIVE ↔ -ACK honouring the AS traffic mode), acks BEAT, carries DATA in
-//! both directions, and folds SSNM (DUNA/DAVA → PAUSE/RESUME, DAUD answered from
-//! the live route state, SCON/DUPU noted) into the router. It does **not** do
-//! Routing Key Management (dynamic REG/DEREG), the ERR round-trip, or multiple
-//! ASPs multiplexed on one SCTP association, those are out of scope this phase.
+//! Toward the ASPs of its application servers the node is a signalling
+//! gateway as RFC 4666 has one. One task per routing domain keeps the state of
+//! every ASP and every Application Server ([`Aspm`] is the state machine):
+//! ASP Up, Down, Active and Inactive are answered, the routing contexts and
+//! the traffic mode of a request are checked, a server whose last active ASP
+//! left is pending for T(r) with its traffic queued, and every change is told
+//! to the ASPs in a Notify. What level 3 finds out about a destination reaches
+//! the active ASPs as DUNA, DAVA, DRST or SCON, and what an ASP says about one
+//! reaches the adjacent points; a message that cannot be acted on is answered
+//! with the Error of 3.8.1 that says why. On a `client` association the node
+//! is the ASP. It does **not** do Routing Key Management (REG/DEREG), the
+//! Network Appearance parameter, the IPSP models, or several ASPs on one SCTP
+//! association.
 //!
 //! ## What the SUA subset does
 //!
@@ -105,7 +112,13 @@ pub use m2pa::link::{
 };
 #[allow(deprecated)]
 pub use m2pa::next_status;
-pub use registry::{DestinationChange, Registry};
+pub use m3ua::aspm::{
+    Action as AspmAction, AsState, AspSpec as AspmAsp, AspState, Aspm, Input as AspmInput,
+    Layout as AspmLayout, Message as AspmMessage, ServerSpec as AspmServer, Status as NotifyStatus,
+    Timer as AspmTimer,
+};
+pub use m3ua::{Discard as M3uaDiscard, Event as M3uaEvent};
+pub use registry::{DestinationChange, Membership, Registry};
 
 /// The lifecycle state an association's adaptation layer exposes.
 ///
@@ -257,6 +270,22 @@ impl TransportHandle {
             shutdown_rx.clone(),
         )));
 
+        // ASP state maintenance of the domain (RFC 4666 4.3): one task, fed by
+        // the M3UA association tasks.
+        let (requests, request_rx) = mpsc::unbounded_channel();
+        registry.attach_layer(requests);
+        tasks.push(tokio::spawn(m3ua::run_layer(
+            Aspm::new(AspmLayout::build(tenant, &config.associations)),
+            request_rx,
+            TaskCtx {
+                router: router.clone(),
+                registry: registry.clone(),
+                tenant: tenant_id.to_string(),
+                local_tx: local_tx.clone(),
+            },
+            shutdown_rx.clone(),
+        )));
+
         for assoc in &config.associations {
             let slot = registry
                 .slot(&assoc.id)
@@ -297,11 +326,9 @@ impl TransportHandle {
                 (Adaptation::M3ua, Role::Client) => {
                     let conn = Arc::new(connect(&addrs, &sctp_cfg).await?);
                     slot.set_sender(conn.clone());
-                    let membership = registry.as_membership(&assoc.id);
                     tasks.push(tokio::spawn(m3ua::run_asp(
                         conn,
                         slot,
-                        membership,
                         ctx,
                         shutdown_rx.clone(),
                     )));

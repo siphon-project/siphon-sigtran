@@ -33,11 +33,12 @@
 //!
 //! ## State machine
 //!
-//! Unlike M3UA (whose `m3ua` crate ships the `m3ua::Asp` state machine
-//! [`super::m3ua`] drives), the `sua` crate is **wire-format only** and ships no
-//! state machine, so the small composite ASPSM/ASPTM machine below ([`AspState`])
-//! is local. SUA reuses M3UA's state model (RFC 3868 §4 defers to RFC 4666), so
-//! it is a faithful, minimal transcription of the same transitions.
+//! The `sua` crate is **wire-format only** and ships no state machine, so the
+//! small composite ASPSM/ASPTM machine below ([`AspState`]) is local: the plain
+//! handshake, per association. SUA reuses M3UA's state model (RFC 3868 §4
+//! defers to RFC 4666), but what [`super::m3ua`] does on top of the handshake
+//! (the state of the Application Server, Notify, Error, the checks of routing
+//! context and traffic mode) is not done here.
 
 use std::sync::Arc;
 

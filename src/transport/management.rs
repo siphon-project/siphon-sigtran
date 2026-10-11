@@ -158,6 +158,23 @@ impl Runtime {
                 registry.announce(change);
                 self.ctx.router.refresh_route_metrics(&self.ctx.tenant);
             }
+            // What the user parts and the application servers are told
+            // (RFC 4666 3.4.6): restricted, or available again.
+            Action::Restricted { dpc, restricted } => {
+                eprintln!(
+                    "siphon-sigtran: mtp3: dpc {dpc} is {}",
+                    if restricted {
+                        "reached by a restricted route only"
+                    } else {
+                        "not restricted any more"
+                    }
+                );
+                registry.announce(if restricted {
+                    DestinationChange::Restricted { dpc }
+                } else {
+                    DestinationChange::Accessible { dpc }
+                });
+            }
             Action::Restarting(on) => {
                 registry.set_restarting(on);
                 eprintln!(

@@ -26,7 +26,7 @@ exclude = [".github/", "docs/", "scripts/", "examples/*.py"]
 # Point codes + the MTP3-user SAP (routing label, availability events).
 mtp3 = "1.2"
 # M3UA (RFC 4666): IP adaptation of the MTP3-user service. Phase-2 transport.
-m3ua = "1"
+m3ua = "1.1"
 # M2PA (RFC 4165): MTP3 over SCTP. Phase-2 transport.
 m2pa = "1.1"
 # SCCP (Q.71x): global titles, addresses, UDT. Drives the GTT resolver.

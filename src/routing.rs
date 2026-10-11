@@ -250,6 +250,23 @@ impl Router {
             .unwrap_or(false)
     }
 
+    /// Whether a DPC is reached only by a route its adjacent point restricted
+    /// (ITU-T Q.704 13.4): what an M3UA audit is answered with a DRST for.
+    pub fn is_restricted(&self, tenant: &str, dpc_value: u32) -> bool {
+        let Some(rt) = self.tenancy.get(tenant) else {
+            return false;
+        };
+        let Ok(dpc) = mtp3::PointCode::from_value(dpc_value, rt.variant) else {
+            return false;
+        };
+        let state = rt.state_read();
+        rt.routes
+            .resolve_avoiding(dpc, 0, &state, None)
+            .is_some_and(|via| {
+                state.route_status(dpc_value, &via) == crate::mtp3::route::RouteStatus::Restricted
+            })
+    }
+
     /// The egress a message for `dpc` with selection code `sls` leaves on,
     /// without the routes through `avoid`. For a message this node sends or
     /// sends again (management, traffic diverted at changeover), which is
