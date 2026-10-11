@@ -117,7 +117,7 @@ content_routing:
 | Block | Fields |
 |---|---|
 | `node` | `point_code` (decimal), `variant` (`itu`/`ansi`/`china`), `network_indicator` |
-| `associations` | `id`, `adaptation` (`m3ua`/`m2pa`), `role` (`server`/`client`), `addrs`, `port`, `adjacent_pc` (m2pa) |
+| `associations` | `id`, `adaptation` (`m3ua`/`m2pa`), `role` (`server`/`client`), `addrs`, `port`, `adjacent_pc` (m2pa), `m2pa` (link timers and proving) |
 | `application_servers` | `name`, `traffic_mode` (`loadshare`/`override`/`broadcast`), `routing_context`, `asps` (m3ua association ids) |
 | `linksets` | `name`, `links` (`assoc`); M2PA only, adjacent PC comes from the association |
 | `mtp3_routes` | `dpc`, `as` or `linkset`, `priority` (1 = primary) |

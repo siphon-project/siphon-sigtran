@@ -114,8 +114,26 @@ pub fn wrap_m3ua(msu: &Msu, routing_context: Option<u32>) -> Vec<u8> {
     M3uaMessage::data(None, routing_context, pd, None).encode()
 }
 
+/// Encode an [`Msu`] as an ITU MTP3 message signal unit (SIO and SIF, by
+/// [`Mtp3Msu`]): what an M2PA link is handed for transmission. The link numbers
+/// it and puts it in a User Data message.
+pub fn mtp3_msu(msu: &Msu) -> Result<Vec<u8>, TransportError> {
+    Ok(Mtp3Msu {
+        si: ServiceIndicator(msu.si),
+        ni: NetworkIndicator::from_bits(msu.ni),
+        mp: msu.mp,
+        opc: itu_pc(msu.opc)?,
+        dpc: itu_pc(msu.dpc)?,
+        sls: msu.sls,
+        data: msu.payload.clone(),
+    }
+    .encode(Variant::Itu))
+}
+
 /// Wrap an [`Msu`] in an **M2PA User Data** message carrying an ITU MTP3 MSU
-/// (encoded by [`Mtp3Msu`]). SCTP stream 1, PPID 5. BSN/FSN idle (`0xFFFFFF`).
+/// (encoded by [`Mtp3Msu`]), with both sequence numbers at their initial value
+/// (`0xFFFFFF`). A codec helper for tools and tests: a running link numbers its
+/// own User Data (RFC 4165 2.2), see [`mtp3_msu`].
 pub fn wrap_m2pa(msu: &Msu) -> Result<Vec<u8>, TransportError> {
     let raw = Mtp3Msu {
         si: ServiceIndicator(msu.si),

@@ -24,10 +24,8 @@ use crate::sccp::gtt::GttSelector;
 /// stream 0 for the ASPSM/SSNM control messages, matching the peers we drive).
 const M3UA_DATA_STREAM: u16 = 1;
 const M3UA_CTRL_STREAM: u16 = 0;
-const M2PA_DATA_STREAM: u16 = 1;
 const SUA_DATA_STREAM: u16 = 1;
 const PPID_M3UA: u32 = 3;
-const PPID_M2PA: u32 = 5;
 const PPID_SUA: u32 = 4;
 
 /// Build the router [`Inbound`] from an MSU. The DPC alone routes a transit MSU
@@ -514,19 +512,42 @@ pub(crate) async fn send_via(via: &Destination, msu: &Msu, registry: &Registry) 
                     continue;
                 }
             },
-            Destination::Linkset(_) => match framing::wrap_m2pa(msu) {
-                Ok(b) => (b, M2PA_DATA_STREAM, PPID_M2PA),
-                Err(e) => {
-                    eprintln!("siphon-sigtran: m2pa framing failed: {e}");
-                    continue;
-                }
-            },
+            // An M2PA link numbers and sends its own User Data: hand the MSU
+            // to the link, which counts it when it goes out.
+            Destination::Linkset(_) => {
+                send_on_link(&sel.slot, msu);
+                continue;
+            }
         };
         if let Err(e) = sel.assoc.send(&bytes, stream, ppid).await {
             eprintln!("siphon-sigtran: egress send on {via} failed: {e}");
         } else {
             metrics::msu(metrics::Dir::Tx, msu.si);
         }
+    }
+}
+
+/// Hand an MSU to the M2PA link an association is, for transmission. A full
+/// transmit queue is counted by the link port; anything else that keeps the MSU
+/// off the link is logged here.
+pub(crate) fn send_on_link(slot: &super::registry::AssocSlot, msu: &Msu) {
+    let Some(link) = slot.link() else {
+        eprintln!(
+            "siphon-sigtran: `{}` is not an m2pa link, MSU for dpc {} dropped",
+            slot.id, msu.dpc
+        );
+        return;
+    };
+    match framing::mtp3_msu(msu) {
+        Ok(raw) => {
+            if !link.offer(raw) {
+                eprintln!(
+                    "siphon-sigtran: m2pa link `{}`: transmit queue full, MSU for dpc {} dropped",
+                    slot.id, msu.dpc
+                );
+            }
+        }
+        Err(e) => eprintln!("siphon-sigtran: m2pa framing failed: {e}"),
     }
 }
 

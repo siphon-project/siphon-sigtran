@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use crate::transport::{M2paDiscard, M2paFailure};
+
 // ── Loop guards (phase 2) ────────────────────────────────────────────────────
 
 /// Why the transfer path decided an inbound MSU was a loop and dropped it.
@@ -543,15 +545,20 @@ pub enum RxDiscard {
     /// Addressed to a subsystem of this node, and not a unitdata message the
     /// dialogue engine reads.
     NotUnitdata,
+    /// A signalling link test message that cannot be acted on: not for this
+    /// node, for a link code this linkset does not have, or an acknowledgement
+    /// of a test that is not running (ITU-T Q.707 2.2).
+    LinkTest,
 }
 
 impl RxDiscard {
-    const ALL: [RxDiscard; 5] = [
+    const ALL: [RxDiscard; 6] = [
         Self::Ppid,
         Self::Undecodable,
         Self::OutOfState,
         Self::NoPayload,
         Self::NotUnitdata,
+        Self::LinkTest,
     ];
 
     /// The `reason` label value.
@@ -562,11 +569,12 @@ impl RxDiscard {
             Self::OutOfState => "out-of-state",
             Self::NoPayload => "no-payload",
             Self::NotUnitdata => "not-unitdata",
+            Self::LinkTest => "link-test",
         }
     }
 }
 
-static RX_DISCARDS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static RX_DISCARDS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Count one received message dropped before routing.
 pub fn rx_discard(reason: RxDiscard) {
@@ -576,6 +584,68 @@ pub fn rx_discard(reason: RxDiscard) {
 /// The count of received messages dropped before routing for the given reason.
 pub fn rx_discards(reason: RxDiscard) -> u64 {
     RX_DISCARDS[reason as usize].load(Ordering::Relaxed)
+}
+
+// ── M2PA link (level 2) and the signalling link test ─────────────────────────
+
+static M2PA_DISCARDS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static M2PA_FAILURES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static LINK_TESTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Count `count` messages an M2PA link did not carry
+/// (`sigtran_m2pa_discarded_total{reason}`).
+pub fn m2pa_discard(reason: M2paDiscard, count: u64) {
+    M2PA_DISCARDS[reason.index()].fetch_add(count, Ordering::Relaxed);
+}
+
+/// The count of messages an M2PA link did not carry for the given reason.
+pub fn m2pa_discards(reason: M2paDiscard) -> u64 {
+    M2PA_DISCARDS[reason.index()].load(Ordering::Relaxed)
+}
+
+/// Count one M2PA link leaving service or failing to align
+/// (`sigtran_m2pa_link_failures_total{reason}`).
+pub fn m2pa_link_failure(reason: M2paFailure) {
+    M2PA_FAILURES[reason as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of M2PA link failures for the given reason.
+pub fn m2pa_link_failures(reason: M2paFailure) -> u64 {
+    M2PA_FAILURES[reason as usize].load(Ordering::Relaxed)
+}
+
+/// The outcome of one signalling link test attempt, for [`link_test`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkTestResult {
+    /// A test message was sent.
+    Sent,
+    /// Its acknowledgement arrived and was correct.
+    Passed,
+    /// No acknowledgement within T1, or a wrong one (ITU-T Q.707 2.2).
+    Failed,
+}
+
+impl LinkTestResult {
+    const ALL: [LinkTestResult; 3] = [Self::Sent, Self::Passed, Self::Failed];
+
+    /// The `result` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Count one signalling link test event (`sigtran_link_tests_total{result}`).
+pub fn link_test(result: LinkTestResult) {
+    LINK_TESTS[result as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of signalling link test events with the given result.
+pub fn link_tests(result: LinkTestResult) -> u64 {
+    LINK_TESTS[result as usize].load(Ordering::Relaxed)
 }
 
 static TCAP_SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -999,6 +1069,48 @@ pub fn render() -> String {
     }
     help(
         &mut out,
+        "sigtran_m2pa_discarded_total",
+        "Messages an M2PA link received or was handed and did not carry, by reason.",
+        "counter",
+    );
+    for reason in M2paDiscard::ALL {
+        line(
+            &mut out,
+            "sigtran_m2pa_discarded_total",
+            &[("reason", reason.label())],
+            m2pa_discards(reason),
+        );
+    }
+    help(
+        &mut out,
+        "sigtran_m2pa_link_failures_total",
+        "M2PA links that left service or could not be aligned, by reason.",
+        "counter",
+    );
+    for reason in M2paFailure::ALL {
+        line(
+            &mut out,
+            "sigtran_m2pa_link_failures_total",
+            &[("reason", reason.label())],
+            m2pa_link_failures(reason),
+        );
+    }
+    help(
+        &mut out,
+        "sigtran_link_tests_total",
+        "Signalling link test messages sent, and their outcome (ITU-T Q.707).",
+        "counter",
+    );
+    for result in LinkTestResult::ALL {
+        line(
+            &mut out,
+            "sigtran_link_tests_total",
+            &[("result", result.label())],
+            link_tests(result),
+        );
+    }
+    help(
+        &mut out,
         "sigtran_tcap_send_errors_total",
         "TCAP messages the dialogue engine could not encode and did not send.",
         "counter",
@@ -1075,7 +1187,7 @@ pub fn render() -> String {
         help(
             &mut out,
             "sigtran_m2pa_link_state",
-            "M2PA link state (0 failed, 1 aligned, 2 in-service).",
+            "M2PA link state (0 out of service or aligning, 1 aligned at level 2, 2 available for traffic).",
             "gauge",
         );
         for (name, v) in &m.m2pa_link_state {
