@@ -150,6 +150,20 @@ pub struct Association {
     /// peer. Absent, any port.
     #[serde(default)]
     pub peer_port: Option<u16>,
+    /// For a `client` association: the local IP addresses the association is
+    /// dialled from (more than one for a multihomed endpoint). Empty, the
+    /// default, leaves the choice to the kernel, which then offers the peer
+    /// every address of the host.
+    #[serde(default)]
+    pub local_addrs: Vec<String>,
+    /// For a `client` association: the local SCTP port it is dialled from.
+    /// Absent, any port.
+    #[serde(default)]
+    pub local_port: Option<u16>,
+    /// For a `client` association: how it is dialled and dialled again.
+    /// Absent means every default of [`Dial`].
+    #[serde(default)]
+    pub dial: Option<Dial>,
     /// For m2pa links only: the adjacent point code reached directly over this
     /// link. An adjacent PC is an **implicit full route**, see
     /// [`crate::mtp3::route`].
@@ -180,6 +194,21 @@ impl Association {
                             self.id
                         ))
                     })
+            })
+            .collect()
+    }
+
+    /// `local_addrs` as addresses.
+    pub fn local_ips(&self) -> Result<Vec<IpAddr>> {
+        self.local_addrs
+            .iter()
+            .map(|text| {
+                text.parse::<IpAddr>().map_err(|_| {
+                    Error::validation(format!(
+                        "association `{}`: `local_addrs` entry `{text}` is not an IP address",
+                        self.id
+                    ))
+                })
             })
             .collect()
     }
@@ -282,6 +311,42 @@ pub(crate) fn listen_groups(associations: &[Association]) -> Result<Vec<Vec<usiz
         }
     }
     Ok(groups)
+}
+
+/// The `dial:` block of a `client` association: how long an attempt to
+/// establish it may take, and how long the node waits before the next one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Dial {
+    /// How long one attempt may take before it is given up, in milliseconds.
+    /// The default lets the INIT and its first two retransmissions out at
+    /// the kernel's initial retransmission timeout of 3 seconds (at 0, 3 and
+    /// 9 seconds) and does not sit through all eight.
+    pub connect_timeout_ms: u64,
+    /// The wait before the association is dialled again after the first
+    /// attempt that failed, and after an association that had been up was
+    /// lost, in milliseconds. It doubles with every further failure. The
+    /// default is that of `restart_ms` of an M2PA link (ITU-T Q.704 12.2.2,
+    /// T17, "delay to avoid oscillation of initial alignment failure and
+    /// link restart").
+    pub backoff_initial_ms: u64,
+    /// The longest wait, in milliseconds. The default is the interval at
+    /// which SCTP itself probes an idle path (RFC 9260 16, HB.interval).
+    pub backoff_max_ms: u64,
+    /// How much of every wait is taken off at random, in percent, so that
+    /// associations that fail together are not dialled together.
+    pub backoff_jitter_percent: u8,
+}
+
+impl Default for Dial {
+    fn default() -> Self {
+        Self {
+            connect_timeout_ms: 10_000,
+            backoff_initial_ms: 1_000,
+            backoff_max_ms: 30_000,
+            backoff_jitter_percent: 20,
+        }
+    }
 }
 
 /// The `m3ua:` block of an association: what RFC 4666 leaves to provisioning
@@ -1194,6 +1259,47 @@ impl Config {
                 )));
             }
             a.peer_ips()?;
+            if a.role == Role::Server
+                && (!a.local_addrs.is_empty() || a.local_port.is_some() || a.dial.is_some())
+            {
+                return Err(Error::validation(format!(
+                    "association `{}` is a server: it listens on `addrs` and `port`, \
+                     `local_addrs`, `local_port` and `dial` are for a client association",
+                    a.id
+                )));
+            }
+            a.local_ips()?;
+            if a.local_port == Some(0) {
+                return Err(Error::validation(format!(
+                    "association `{}`: `local_port` must not be 0 (leave it out for any port)",
+                    a.id
+                )));
+            }
+            if let Some(dial) = &a.dial {
+                let zero = [
+                    ("connect_timeout_ms", dial.connect_timeout_ms),
+                    ("backoff_initial_ms", dial.backoff_initial_ms),
+                    ("backoff_max_ms", dial.backoff_max_ms),
+                ];
+                if let Some((name, _)) = zero.iter().find(|(_, value)| *value == 0) {
+                    return Err(Error::validation(format!(
+                        "association `{}`: dial `{name}` must not be 0",
+                        a.id
+                    )));
+                }
+                if dial.backoff_max_ms < dial.backoff_initial_ms {
+                    return Err(Error::validation(format!(
+                        "association `{}`: dial `backoff_max_ms` is below `backoff_initial_ms`",
+                        a.id
+                    )));
+                }
+                if dial.backoff_jitter_percent > 100 {
+                    return Err(Error::validation(format!(
+                        "association `{}`: dial `backoff_jitter_percent` is more than 100",
+                        a.id
+                    )));
+                }
+            }
             if let Some(pc) = a.adjacent_pc {
                 // adjacent_pc only meaningful for m2pa; still must fit *some*
                 // variant, validated per-tenant below where the variant is
@@ -2542,5 +2648,85 @@ tenants:
         let yaml = "node: { point_code: 1000, variant: ITU }\nassociations:\n  - { id: c, adaptation: m3ua, role: client, addrs: [192.0.2.1], port: 2905, peer_addrs: [192.0.2.1] }\n";
         let error = Config::parse(yaml).unwrap_err().to_string();
         assert!(error.contains("is a client"), "`{error}`");
+    }
+
+    /// A node with one client association with these further keys.
+    fn dialling(keys: &str) -> String {
+        format!(
+            "node: {{ point_code: 1000, variant: ITU }}\nassociations:\n  - {{ id: c, adaptation: m3ua, role: client, addrs: [192.0.2.1], port: 2905{keys} }}\n"
+        )
+    }
+
+    #[test]
+    fn a_client_association_has_dial_settings_and_local_addresses() {
+        let cfg = Config::parse(&dialling("")).unwrap();
+        let a = &cfg.associations[0];
+        assert!(a.local_addrs.is_empty() && a.local_port.is_none() && a.dial.is_none());
+        let defaults = Dial::default();
+        assert_eq!(
+            (
+                defaults.connect_timeout_ms,
+                defaults.backoff_initial_ms,
+                defaults.backoff_max_ms,
+                defaults.backoff_jitter_percent
+            ),
+            (10_000, 1_000, 30_000, 20)
+        );
+
+        let cfg = Config::parse(&dialling(
+            ", local_addrs: [192.0.2.7, \"2001:db8::7\"], local_port: 2906, dial: { backoff_max_ms: 5000, backoff_jitter_percent: 0 }",
+        ))
+        .unwrap();
+        let a = &cfg.associations[0];
+        assert_eq!(a.local_ips().unwrap().len(), 2);
+        assert_eq!(a.local_port, Some(2906));
+        // A key that is left out keeps its default.
+        assert_eq!(
+            a.dial,
+            Some(Dial {
+                backoff_max_ms: 5_000,
+                backoff_jitter_percent: 0,
+                ..Dial::default()
+            })
+        );
+    }
+
+    #[test]
+    fn the_dial_keys_are_checked() {
+        // (the keys, what the error says)
+        let table = [
+            (", local_addrs: [gateway.example]", "not an IP address"),
+            (", local_port: 0", "must not be 0"),
+            (
+                ", dial: { connect_timeout_ms: 0 }",
+                "`connect_timeout_ms` must not be 0",
+            ),
+            (
+                ", dial: { backoff_initial_ms: 0 }",
+                "`backoff_initial_ms` must not be 0",
+            ),
+            (
+                ", dial: { backoff_max_ms: 0 }",
+                "`backoff_max_ms` must not be 0",
+            ),
+            (
+                ", dial: { backoff_initial_ms: 2000, backoff_max_ms: 1000 }",
+                "below `backoff_initial_ms`",
+            ),
+            (", dial: { backoff_jitter_percent: 101 }", "more than 100"),
+        ];
+        for (keys, says) in table {
+            let error = Config::parse(&dialling(keys)).unwrap_err().to_string();
+            assert!(error.contains(says), "{keys}: `{error}`");
+        }
+        // On a server the local end is `addrs` and `port`.
+        for keys in ["local_addrs: [192.0.2.7]", "local_port: 2906", "dial: {}"] {
+            let error = Config::parse(&listening(&[&format!(
+                "addrs: [192.0.2.1], port: 2905, {keys}"
+            )]))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("is a server"), "{keys}: `{error}`");
+        }
     }
 }

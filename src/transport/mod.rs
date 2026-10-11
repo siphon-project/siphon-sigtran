@@ -1,8 +1,10 @@
 //! The transport plane: SIGTRAN over real kernel SCTP (async-sctp).
 //!
 //! [`TransportHandle::start`] turns a validated [`Config`] into a running node:
-//! it binds/connects every association, runs the per-association adaptation-layer
-//! task (M3UA ASPSM/ASPTM or M2PA link alignment), and wires each one to the
+//! it binds every listening endpoint, starts a task that dials each `client`
+//! association (until it is up, and again after it is lost: see [`dial`]),
+//! runs the per-association adaptation-layer task (M3UA ASPSM/ASPTM or M2PA
+//! link alignment), and wires each one to the
 //! shared [`Router`] so live ASP/link/SSNM state drives route availability and
 //! inbound DATA is routed and forwarded.
 //!
@@ -97,6 +99,7 @@ use crate::mtp3::management::{Management, Timers, Topology};
 use crate::mtp3::route::Destination;
 use crate::routing::{Inbound, RouteDecision, Router};
 
+pub mod dial;
 mod forward;
 pub mod framing;
 pub mod identity;
@@ -352,6 +355,9 @@ impl TransportHandle {
             )));
         }
 
+        // Every association this node opens is dialled by a task of its own,
+        // until it is up and again after it is lost: an absent peer delays
+        // nothing and stops nothing.
         for assoc in &config.associations {
             if assoc.role != Role::Client {
                 continue;
@@ -360,42 +366,28 @@ impl TransportHandle {
                 .slot(&assoc.id)
                 .cloned()
                 .ok_or_else(|| TransportError::Config(format!("no slot for `{}`", assoc.id)))?;
-            let addrs = socket_addrs(assoc)?;
-            let ctx = ctx.clone();
-            match assoc.adaptation {
-                Adaptation::M3ua => {
-                    let conn = Arc::new(connect(&addrs, &sctp_cfg).await?);
-                    slot.set_sender(conn.clone());
-                    tasks.push(tokio::spawn(m3ua::run_asp(
-                        conn,
-                        slot,
-                        ctx,
-                        shutdown_rx.clone(),
-                    )));
-                }
-                Adaptation::Sua => {
-                    let conn = Arc::new(connect(&addrs, &sctp_cfg).await?);
-                    slot.set_sender(conn.clone());
-                    let membership = registry.as_membership(&assoc.id);
-                    tasks.push(tokio::spawn(sua::run_asp(
-                        conn,
-                        slot,
-                        membership,
-                        ctx,
-                        shutdown_rx.clone(),
-                    )));
-                }
-                Adaptation::M2pa => {
-                    let conn = Arc::new(connect(&addrs, &sctp_cfg).await?);
-                    slot.set_sender(conn.clone());
-                    tasks.push(tokio::spawn(m2pa::run_link(
-                        conn,
-                        slot,
-                        ctx,
-                        shutdown_rx.clone(),
-                    )));
-                }
+            // A link that is not connected yet still has its queue served.
+            if assoc.adaptation == Adaptation::M2pa {
+                tasks.push(tokio::spawn(m2pa::idle_link(
+                    slot.clone(),
+                    ctx.clone(),
+                    shutdown_rx.clone(),
+                    0,
+                )));
             }
+            let dialled = Dialled {
+                peer: socket_addrs(assoc)?,
+                local: local_addrs(assoc)?,
+                settings: dial_settings(assoc),
+                sctp: sctp_cfg.clone(),
+                membership: registry.as_membership(&assoc.id),
+                slot,
+            };
+            tasks.push(tokio::spawn(dial_association(
+                dialled,
+                ctx.clone(),
+                shutdown_rx.clone(),
+            )));
         }
 
         Ok(Self {
@@ -855,12 +847,344 @@ async fn send_reply(registry: &Registry, assoc_id: &str, msu: &Msu) {
     }
 }
 
-/// Connect an association, single- or multi-homed.
-async fn connect(addrs: &[SocketAddr], cfg: &SctpConfig) -> Result<SctpAssociation> {
-    let conn = if addrs.len() == 1 {
-        SctpAssociation::connect_with(addrs[0], cfg).await?
-    } else {
-        SctpAssociation::connect_multi_with(addrs, cfg).await?
+/// What the task of a dialled association needs.
+struct Dialled {
+    slot: Arc<registry::AssocSlot>,
+    /// The addresses of the far end (`addrs` and `port`).
+    peer: Vec<SocketAddr>,
+    /// The addresses to dial from; empty leaves them to the kernel.
+    local: Vec<SocketAddr>,
+    settings: dial::Settings,
+    sctp: SctpConfig,
+    /// For a SUA association: the server it is an ASP of.
+    membership: Option<(u32, crate::config::TrafficMode)>,
+}
+
+/// The timers of a `client` association from its `dial:` block.
+fn dial_settings(a: &Association) -> dial::Settings {
+    let block = a.dial.clone().unwrap_or_default();
+    dial::Settings {
+        connect_timeout: Duration::from_millis(block.connect_timeout_ms),
+        initial: Duration::from_millis(block.backoff_initial_ms),
+        max: Duration::from_millis(block.backoff_max_ms),
+        jitter_percent: block.backoff_jitter_percent,
+        log_every: dial::LOG_EVERY,
+    }
+}
+
+/// The local addresses a `client` association is dialled from: `local_addrs`
+/// with `local_port`, or every address when only the port is given.
+fn local_addrs(a: &Association) -> Result<Vec<SocketAddr>> {
+    let port = a.local_port.unwrap_or(0);
+    let ips = a
+        .local_ips()
+        .map_err(|e| TransportError::Config(e.to_string()))?;
+    if ips.is_empty() && port != 0 {
+        let v6 = a
+            .addrs
+            .iter()
+            .any(|text| text.parse::<std::net::Ipv6Addr>().is_ok());
+        let any: std::net::IpAddr = if v6 {
+            std::net::Ipv6Addr::UNSPECIFIED.into()
+        } else {
+            std::net::Ipv4Addr::UNSPECIFIED.into()
+        };
+        return Ok(vec![SocketAddr::new(any, port)]);
+    }
+    Ok(ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect())
+}
+
+/// One attempt to establish an association: the outcome of `connect` if it
+/// has one within `limit`, a timeout otherwise. Dropping the attempt (the
+/// limit, a shutdown) closes its socket.
+pub(crate) async fn attempt<T>(
+    connect: impl std::future::Future<Output = std::result::Result<T, async_sctp::SctpError>>,
+    limit: Duration,
+) -> std::result::Result<T, (dial::Failure, String)> {
+    match tokio::time::timeout(limit, connect).await {
+        Ok(Ok(established)) => Ok(established),
+        Ok(Err(error)) => Err((failure(&error), error.to_string())),
+        Err(_) => Err((
+            dial::Failure::Timeout,
+            format!("no answer within {limit:?}"),
+        )),
+    }
+}
+
+/// Why a connect failed, for the `reason` of the failure counter.
+fn failure(error: &async_sctp::SctpError) -> dial::Failure {
+    use std::io::ErrorKind;
+    // The values every Linux architecture with the generic errno numbers
+    // has for ENETDOWN, ENETUNREACH, EHOSTDOWN and EHOSTUNREACH. Elsewhere
+    // such an error is counted as `other`, and logged with its text.
+    const UNREACHABLE: [i32; 4] = [100, 101, 112, 113];
+    match error {
+        async_sctp::SctpError::Io(io) => match io.kind() {
+            ErrorKind::ConnectionRefused => dial::Failure::Refused,
+            ErrorKind::TimedOut => dial::Failure::Timeout,
+            ErrorKind::AddrInUse | ErrorKind::AddrNotAvailable | ErrorKind::PermissionDenied => {
+                dial::Failure::Local
+            }
+            _ if io.raw_os_error().is_some_and(|n| UNREACHABLE.contains(&n)) => {
+                dial::Failure::Unreachable
+            }
+            _ => dial::Failure::Other,
+        },
+        async_sctp::SctpError::InvalidAddress(_) => dial::Failure::Local,
+        _ => dial::Failure::Other,
+    }
+}
+
+/// Puts the back-off gauge of an association back to zero when its task
+/// ends, however it ends.
+struct BackoffGauge(String);
+
+impl Drop for BackoffGauge {
+    fn drop(&mut self) {
+        metrics::set_dial_backoff(&self.0, Duration::ZERO);
+    }
+}
+
+/// The task of one `client` association: dial it, serve it until it ends,
+/// wait, and dial again, as [`dial::Dial`] says, until the node stops.
+async fn dial_association(dialled: Dialled, ctx: TaskCtx, mut shutdown: watch::Receiver<bool>) {
+    let Dialled {
+        slot,
+        peer,
+        local,
+        settings,
+        sctp,
+        membership,
+    } = dialled;
+    let id = slot.id.clone();
+    let _gauge = BackoffGauge(id.clone());
+    let mut machine = dial::Dial::new(settings, dial::Jitter::for_association(&id));
+    let mut actions = machine.handle(dial::Input::Start, Instant::now());
+    let mut established: Option<Arc<SctpAssociation>> = None;
+    let mut error = String::new();
+    loop {
+        let mut input = None;
+        for action in actions {
+            match action {
+                dial::Action::Log(line) => match line {
+                    dial::Line::Established { failed } => {
+                        let after = if failed > 0 {
+                            format!(" after {failed} attempt(s) that failed")
+                        } else {
+                            String::new()
+                        };
+                        eprintln!(
+                            "siphon-sigtran: association `{id}` is established with {peer:?}{after}"
+                        );
+                    }
+                    dial::Line::Failing {
+                        reason,
+                        quiet,
+                        next,
+                    } => {
+                        let more = if quiet > 0 {
+                            format!(" ({quiet} more attempt(s) failed since the last line)")
+                        } else {
+                            String::new()
+                        };
+                        eprintln!(
+                            "siphon-sigtran: association `{id}`: dialling {peer:?} failed ({}): {error}; \
+                             the next attempt is in {next:?}{more}",
+                            reason.label()
+                        );
+                    }
+                    dial::Line::Lost { up, next } => eprintln!(
+                        "siphon-sigtran: association `{id}` ended after {up:?}; it is dialled again in {next:?}"
+                    ),
+                },
+                dial::Action::Connect => {
+                    metrics::set_dial_backoff(&id, Duration::ZERO);
+                    metrics::dial_attempt(&id);
+                    let connect = SctpAssociation::connect_from(&local, &peer, &sctp);
+                    let outcome = tokio::select! {
+                        _ = shutdown.changed() => return,
+                        outcome = attempt(connect, settings.connect_timeout) => outcome,
+                    };
+                    input = Some(match outcome {
+                        Ok(association) => {
+                            established = Some(Arc::new(association));
+                            dial::Input::Connected
+                        }
+                        Err((reason, text)) => {
+                            metrics::dial_failure(&id, reason);
+                            error = text;
+                            dial::Input::Failed(reason)
+                        }
+                    });
+                }
+                dial::Action::Wait(wait) => {
+                    metrics::set_dial_backoff(&id, wait);
+                    tokio::select! {
+                        _ = shutdown.changed() => return,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    input = Some(dial::Input::Elapsed);
+                }
+                dial::Action::Serve => {
+                    if let Some(association) = established.take() {
+                        serve_dialled(association, &slot, membership, &ctx, &shutdown).await;
+                    }
+                    if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                        return;
+                    }
+                    input = Some(dial::Input::Lost);
+                }
+            }
+        }
+        let Some(input) = input else {
+            return;
+        };
+        actions = machine.handle(input, Instant::now());
+    }
+}
+
+/// Serve an association this node dialled until it ends: the ASP Up and ASP
+/// Active sequence, or the alignment and the test of the link, run as on any
+/// other first association.
+async fn serve_dialled(
+    association: Arc<SctpAssociation>,
+    slot: &Arc<registry::AssocSlot>,
+    membership: Option<(u32, crate::config::TrafficMode)>,
+    ctx: &TaskCtx,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let Some(occupancy) = slot.occupy(&association) else {
+        // Only this task dials the association: it cannot have one already.
+        eprintln!(
+            "siphon-sigtran: association `{}` has an association already, the new one is closed",
+            slot.id
+        );
+        return;
     };
-    Ok(conn)
+    // Not an egress by being established: the adaptation layer makes it one.
+    ctx.registry.quiesce(slot);
+    slot.set_sender(association.clone());
+    ctx.registry.recompute(&ctx.router);
+    let (slot, ctx, shutdown) = (slot.clone(), ctx.clone(), shutdown.clone());
+    match slot.adaptation {
+        Adaptation::M3ua => m3ua::run_asp(association, slot, ctx, shutdown).await,
+        Adaptation::Sua => sua::run_asp(association, slot, membership, ctx, shutdown).await,
+        Adaptation::M2pa => m2pa::run_link(association, slot, ctx, shutdown).await,
+    }
+    drop(occupancy);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_sctp::SctpError;
+    use std::io;
+
+    fn refused() -> SctpError {
+        SctpError::Io(io::Error::from(io::ErrorKind::ConnectionRefused))
+    }
+
+    /// An attempt ends with what the connect says, or with a timeout when
+    /// the connect says nothing: a far end that answers no INIT.
+    #[tokio::test]
+    async fn an_attempt_ends_with_the_outcome_of_the_connect_or_at_its_limit() {
+        let limit = Duration::from_millis(250);
+
+        let up = attempt(async { Ok::<_, SctpError>(7u8) }, limit).await;
+        assert_eq!(up.ok(), Some(7));
+
+        let said_no = attempt(async { Err::<u8, _>(refused()) }, limit).await;
+        assert_eq!(
+            said_no.err().map(|(reason, _)| reason),
+            Some(dial::Failure::Refused)
+        );
+
+        let began = Instant::now();
+        let silent = attempt(
+            std::future::pending::<std::result::Result<u8, SctpError>>(),
+            limit,
+        )
+        .await
+        .err();
+        let waited = began.elapsed();
+        assert!(waited >= limit, "given up before the limit: {waited:?}");
+        assert!(waited < limit * 8, "given up long after it: {waited:?}");
+        let (reason, text) = silent.expect("a failure");
+        assert_eq!(reason, dial::Failure::Timeout);
+        assert!(text.contains("250ms"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_connect_is_counted_by_what_went_wrong() {
+        let os = |number: i32| SctpError::Io(io::Error::from_raw_os_error(number));
+        let kind = |kind: io::ErrorKind| SctpError::Io(io::Error::from(kind));
+        // (the error of the connect, the reason it is counted as)
+        let table = [
+            (refused(), dial::Failure::Refused),
+            (kind(io::ErrorKind::TimedOut), dial::Failure::Timeout),
+            (kind(io::ErrorKind::AddrInUse), dial::Failure::Local),
+            (kind(io::ErrorKind::AddrNotAvailable), dial::Failure::Local),
+            (kind(io::ErrorKind::PermissionDenied), dial::Failure::Local),
+            (
+                SctpError::InvalidAddress("two ports".to_string()),
+                dial::Failure::Local,
+            ),
+            // ENETDOWN, ENETUNREACH, EHOSTDOWN, EHOSTUNREACH.
+            (os(100), dial::Failure::Unreachable),
+            (os(101), dial::Failure::Unreachable),
+            (os(112), dial::Failure::Unreachable),
+            (os(113), dial::Failure::Unreachable),
+            (kind(io::ErrorKind::InvalidInput), dial::Failure::Other),
+            (SctpError::NotConnected, dial::Failure::Other),
+            (SctpError::PeerShutdown, dial::Failure::Other),
+        ];
+        for (error, reason) in table {
+            assert_eq!(failure(&error), reason, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_client_is_dialled_from_its_local_addresses_or_from_any() {
+        let association = |keys: &str| {
+            let yaml = format!(
+                "node: {{ point_code: 1000, variant: ITU }}\nassociations:\n  - {{ id: c, adaptation: m3ua, role: client, {keys} }}\n"
+            );
+            crate::config::Config::parse(&yaml)
+                .map(|cfg| cfg.associations[0].clone())
+                .map_err(|e| e.to_string())
+        };
+        // (the keys, the addresses the socket is bound to)
+        let table: [(&str, &[&str]); 5] = [
+            ("addrs: [192.0.2.1], port: 2905", &[]),
+            (
+                "addrs: [192.0.2.1], port: 2905, local_addrs: [192.0.2.7, 198.51.100.7]",
+                &["192.0.2.7:0", "198.51.100.7:0"],
+            ),
+            (
+                "addrs: [192.0.2.1], port: 2905, local_addrs: [192.0.2.7], local_port: 2906",
+                &["192.0.2.7:2906"],
+            ),
+            // The port alone: every address of the family of the far end.
+            (
+                "addrs: [192.0.2.1], port: 2905, local_port: 2906",
+                &["0.0.0.0:2906"],
+            ),
+            (
+                "addrs: [\"2001:db8::1\"], port: 2905, local_port: 2906",
+                &["[::]:2906"],
+            ),
+        ];
+        for (keys, expected) in table {
+            let a = association(keys).unwrap_or_else(|e| panic!("{keys}: {e}"));
+            let bound: Vec<String> = local_addrs(&a)
+                .unwrap_or_else(|e| panic!("{keys}: {e}"))
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect();
+            assert_eq!(bound, expected, "{keys}");
+        }
+    }
 }
