@@ -39,10 +39,14 @@
 //!
 //! ## What the M2PA subset does
 //!
-//! It aligns a link to in-service (Alignment → Proving → Ready) with the
-//! published state machine and then carries MTP3 MSUs in User Data. Link
-//! up/down feeds the resolver. Retransmission/flow-control on BSN/FSN is not
-//! modelled (the SCTP association already gives reliable, ordered delivery).
+//! It runs level 2 of a signalling link as RFC 4165 and ITU-T Q.703 have it:
+//! the Link Status exchange with its timers, numbered and acknowledged User
+//! Data with a retransmission buffer kept for changeover, remote processor
+//! outage and remote congestion, link failure and realignment. On top of it,
+//! the signalling link test of Q.707: a link is an egress only after its test
+//! passed, and a test message from the peer is always answered. See
+//! [`M2paLink`] for the state machine. Level 3 management (changeover,
+//! transfer-prohibited, ...) is not part of this layer.
 //!
 //! ## Transfer is Service-Indicator-agnostic
 //!
@@ -83,6 +87,11 @@ mod sua;
 
 pub(crate) use forward::sccp_return;
 pub use framing::Msu;
+pub use m2pa::link::{
+    Discard as M2paDiscard, Failure as M2paFailure, Link as M2paLink, LinkTimers as M2paTimers,
+    Proving as M2paProving, State as M2paLinkState,
+};
+#[allow(deprecated)]
 pub use m2pa::next_status;
 pub use registry::Registry;
 
@@ -584,13 +593,10 @@ async fn send_reply(registry: &Registry, assoc_id: &str, msu: &Msu) {
             let rc = registry.as_membership(assoc_id).map(|(rc, _)| rc);
             (framing::wrap_m3ua(msu, rc), 1u16, 3u32)
         }
-        Adaptation::M2pa => match framing::wrap_m2pa(msu) {
-            Ok(b) => (b, 1u16, 5u32),
-            Err(e) => {
-                eprintln!("siphon-sigtran: dialogue reply m2pa framing failed: {e}");
-                return;
-            }
-        },
+        Adaptation::M2pa => {
+            forward::send_on_link(slot, msu);
+            return;
+        }
         Adaptation::Sua => {
             let rc = registry
                 .as_membership(assoc_id)

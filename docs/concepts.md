@@ -14,7 +14,7 @@ glue on top is what this crate adds.
 | Layer | Published crate | What siphon-sigtran adds |
 |---|---|---|
 | Point codes + the MTP3-user SAP | `mtp3` | the route resolver: DPC to AS/linkset by priority + availability |
-| M3UA (RFC 4666) / M2PA (RFC 4165) | `m3ua`, `m2pa` | the transport serving loop, ASPSM/ASPTM handshake, link alignment, linkset state |
+| M3UA (RFC 4666) / M2PA (RFC 4165) | `m3ua`, `m2pa` | the transport serving loop, ASPSM/ASPTM handshake, level 2 of an M2PA link (alignment with its timers, numbered and acknowledged User Data, failure and realignment), the signalling link test, linkset state |
 | SCTP (RFC 4960) | `async-sctp` | association binding + demultiplexing |
 | SCCP addresses / GTT / UDT (ITU-T Q.714) | `sccp` | the GTT rule engine + the E.214/E.164 converter |
 | TCAP (ITU-T Q.771 to Q.775) | `tcap` | the dialogue engine: transactions, timers, termination handlers |

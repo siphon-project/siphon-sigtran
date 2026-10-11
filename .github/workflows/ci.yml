@@ -120,6 +120,13 @@ jobs:
       - name: Wire tests (SCTP loopback, M3UA/M2PA/SUA, tshark gate)
         run: cargo test --test routing --test wire
 
+      # An M2PA link against a hand-written peer: every Link Status, sequence
+      # number and link test message the node sends is read back by Wireshark.
+      - name: M2PA link (tshark field assertions)
+        env:
+          SIGTRAN_REQUIRE_TSHARK: "1"
+        run: cargo test --test wire_m2pa
+
       # Every message the dialogue engine emits in answer to a damaged or
       # unexpected one, dissected by Wireshark with assertions on the fields.
       - name: Abnormal procedures (tshark field assertions)
