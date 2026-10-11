@@ -141,6 +141,81 @@ Three things make this work for a dialogue that waits minutes for its next event
 a damaged message arrived for it, or it sat idle: release what you tied to it
 there, as well as on `event.is_end`.
 
+## Prepaid: grant, bill, grant again
+
+Credit control is a loop between two operations. ApplyCharging hands the gsmSSF
+a period; ApplyChargingReport says how much of the call has been used and
+whether the leg is still up. The script bills what the report says, grants again
+while there is credit, and releases the call when there is none. The reports
+arrive as components of the turn, each with a typed view:
+
+```python
+GRANT = 600                                      # 60 s, in units of 100 ms
+calls = {}                                       # our transaction id -> call state
+
+@gsm_cap.on_operation("initial-dp")
+def prepaid(dlg, event):
+    if not event.is_peer_turn:                   # the InitialDP
+        left = credit_of(event.imsi)
+        if left <= 0:
+            dlg.invoke(gsm_cap.release_call(cause=b"\x80\x9f"))
+            dlg.end()
+            return
+        calls[bytes(dlg.otid)] = {"imsi": event.imsi, "billed": 0}
+        dlg.set_idle_timeout(4 * 3600)
+        dlg.invoke(gsm_cap.request_report_bcsm_event(events=[(7, 1, 2), (9, 0, 1), (9, 0, 2)]))
+        dlg.invoke(gsm_cap.apply_charging(max_call_period_duration=min(GRANT, left),
+                                          party_to_charge=1))
+        dlg.invoke(gsm_cap.continue_())
+        dlg.send()
+        return
+    call = calls.get(bytes(dlg.otid))
+    if call is None:
+        return
+    release = resume = False
+    grant = None
+    for component in event.components:
+        report = component.apply_charging_report
+        if report is not None:
+            used = report.time_if_no_tariff_switch           # counted from the answer
+            left = debit(call["imsi"], used - call["billed"])
+            call["billed"] = used
+            if report.leg_active:
+                release, grant = left <= 0, min(GRANT, left)
+        happened = component.event_report_bcsm
+        if happened is not None and happened.is_request:
+            resume = True                        # a disconnect: the call waits for us
+    if event.is_end:                             # the gsmSSF's End, or it ended otherwise
+        del calls[bytes(dlg.otid)]
+    elif release:
+        dlg.invoke(gsm_cap.release_call(cause=b"\x80\x90"))
+        dlg.end()
+    elif resume:
+        dlg.invoke(gsm_cap.continue_())
+        dlg.end()
+    elif grant:
+        dlg.invoke(gsm_cap.apply_charging(max_call_period_duration=grant,
+                                          tone=True, party_to_charge=1))
+        dlg.send()
+```
+
+- `event.imsi` names the account; `event.location_information`,
+  `event.call_reference_number` and `event.msc_address` are there for rating
+  and for the charging record. See [the InitialDP
+  members](../script-api.md#initial-dp).
+- `time_if_no_tariff_switch` is counted from the answer, so each report is
+  billed as the difference to the one before.
+- `is_request` on an event report says whether the gsmSSF holds the call at the
+  detection point. An event armed as interrupted (`monitor_mode` 0) has to be
+  answered; one armed as notify-and-continue must not be.
+- `dlg.camel_phase` tells the phases apart where the script has to
+  (`apply_charging` already encodes for phase 3 or 4 by itself).
+- A report that does not decode raises `MistypedParameter`; let it go and the
+  node rejects that Invoke and ends the dialogue.
+
+Keep the balance where two calls on one account cannot both read it and write
+it back: in whatever owns the account, not in a dictionary of the script.
+
 For a routing-heavy node that mixes call control with transit SS7, pair this with
 the [STP recipe](stp.md); to terminate SMS instead, see
 [Building an SMSC](smsc.md).
