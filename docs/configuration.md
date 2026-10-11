@@ -96,6 +96,31 @@ The SCTP transport plane: one entry per association.
 | `addrs` | *(required)* | One or more IP addresses. More than one enables SCTP multihoming. |
 | `port` | *(required)* | SCTP port. Convention: 2905 for M3UA, 3565 for M2PA. |
 | `adjacent_pc` | *(m2pa only)* | The adjacent point code reached directly over this link. An adjacent PC is an **implicit route**; it needs no `mtp3_routes` entry. |
+| `m2pa` | *(m2pa only)* every default below | Level 2 of the link: see [the `m2pa` block](#m2pa-link). |
+
+### The `m2pa` block { #m2pa-link }
+
+Level 2 of one M2PA link (RFC 4165), on an `m2pa` association. The timers are
+those of ITU-T Q.703 12.3; the defaults are inside the ranges it gives for a
+64 kbit/s link, which RFC 4165 clause 4 has M2PA use. All of them are in
+milliseconds and none may be `0`.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `proving` | `normal` | The proving period this end asks for at alignment: `normal` (Link Status Proving Normal, `t4n_ms`) or `emergency` (Proving Emergency, `t4e_ms`). When the peer asks for the emergency period it is used whatever is set here (Q.703 7.2). |
+| `t1_ms` | `45000` | T1, alignment ready (Q.703: 40 to 50 s): how long to wait, after proving, for the peer to finish its own. |
+| `t2_ms` | `30000` | T2, not aligned (5 to 150 s): how long to wait for the peer to start alignment. |
+| `t3_ms` | `1500` | T3, aligned (1 to 2 s): how long to wait for the peer to start proving. |
+| `t4n_ms` | `8200` | T4, the normal proving period (7.5 to 9.5 s). |
+| `t4e_ms` | `500` | T4, the emergency proving period (400 to 600 ms). |
+| `t6_ms` | `4500` | T6, remote congestion (3 to 6 s): how long the peer may stay busy with messages unacknowledged (RFC 4165 4.1.5). |
+| `t7_ms` | `2000` | T7, excessive delay of acknowledgement (0.5 to 2 s): a User Data message unacknowledged for this long fails the link (RFC 4165 4.2.1). |
+| `proving_interval_ms` | `100` | The interval between Link Status Proving messages while T4 runs (RFC 4165 4.1.3, `Proving_Interval`). |
+| `restart_ms` | `1000` | The delay before alignment is started again after it failed or the link failed (ITU-T Q.704 12.2.2, timer T17, 800 to 1500 ms). |
+| `tx_queue` | `4096` | MSUs the link holds for transmission (waiting for the link's task, or because the peer is busy or in processor outage) before further ones are discarded and counted (Q.704 3.8). |
+
+A link starts alignment as soon as its association is up, and starts it again
+after every failure for as long as the association lasts.
 
 The value `sua` selects SUA (RFC 3868) for connectionless SCCP-user traffic:
 like `m3ua` it terminates SCTP and feeds the SCCP messages this node routes and
@@ -124,7 +149,29 @@ here.
 | Field | Meaning |
 |---|---|
 | `name` | Linkset name, referenced by `mtp3_routes` (`linkset:`). |
-| `links` | The member links, each `{assoc}`. Each `assoc` must be an `m2pa` association; its adjacent PC comes from the association's `adjacent_pc`. |
+| `links` | The member links, each `{assoc, slc}`, at most 16. Each `assoc` must be an `m2pa` association; its adjacent PC comes from the association's `adjacent_pc`. `slc` is the signalling link code, 0 to 15, unique in the linkset; it defaults to the position of the link in the list. Both ends of a link must use the same code (RFC 4165 4.1.2). |
+| `link_test` | The signalling link test of ITU-T Q.707 2.2 on every link of the linkset: see below. |
+
+### `link_test` { #link-test }
+
+After alignment a link is tested before it carries traffic, and again at an
+interval while it is in service (Q.707 2.2: "The signalling link becomes
+available only if the test is successful"). A test that is not acknowledged
+within `t1_ms`, or is acknowledged with another pattern, from another point
+code or for another link code, is repeated once; the second failure takes the
+link out of service and alignment starts again. Q.707 leaves the action on a
+failed periodic test for further study; here it is the same as at activation.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Whether this node tests its links. A test message from the peer is answered either way. |
+| `t1_ms` | `8000` | T1, supervision of the acknowledgement (Q.707 5.5: 4 to 12 s, and not less than `t6_ms`). |
+| `t2_ms` | `60000` | T2, the interval between tests (30 to 90 s). |
+| `pattern` | `a5a5a5a5a5a5a5a5` | The test pattern: 1 to 15 octets in hexadecimal. |
+
+The test is addressed to the link's `adjacent_pc`. A link without one, or with
+`enabled: false`, is not tested: it is available as soon as it is aligned, and
+the node says so in a warning when the link starts.
 
 ## `mtp3_routes` { #mtp3-routes }
 

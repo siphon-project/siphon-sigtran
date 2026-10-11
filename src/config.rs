@@ -142,6 +142,114 @@ pub struct Association {
     /// [`crate::mtp3::route`].
     #[serde(default)]
     pub adjacent_pc: Option<RawPc>,
+    /// For m2pa links only: the level-2 timers and proving of this link. Absent
+    /// means every default of [`M2paLink`].
+    #[serde(default)]
+    pub m2pa: Option<M2paLink>,
+}
+
+/// Which proving period a link asks for at alignment (ITU-T Q.703 7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvingMode {
+    /// The normal proving period (`t4n_ms`).
+    #[default]
+    Normal,
+    /// The emergency proving period (`t4e_ms`).
+    Emergency,
+}
+
+/// The `m2pa:` block of an association: level 2 of one M2PA link (RFC 4165,
+/// with the timers of ITU-T Q.703 12.3 for a 64 kbit/s link as defaults).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct M2paLink {
+    /// The proving period this end asks for. The peer asking for the emergency
+    /// one shortens it whatever is set here (Q.703 7.2).
+    pub proving: ProvingMode,
+    /// T1, alignment ready (40 to 50 s).
+    pub t1_ms: u64,
+    /// T2, not aligned (5 to 150 s).
+    pub t2_ms: u64,
+    /// T3, aligned (1 to 2 s).
+    pub t3_ms: u64,
+    /// T4, normal proving period (7.5 to 9.5 s).
+    pub t4n_ms: u64,
+    /// T4, emergency proving period (400 to 600 ms).
+    pub t4e_ms: u64,
+    /// T6, remote congestion (3 to 6 s).
+    pub t6_ms: u64,
+    /// T7, excessive delay of acknowledgement (0.5 to 2 s).
+    pub t7_ms: u64,
+    /// Interval between Link Status Proving messages (RFC 4165 4.1.3).
+    pub proving_interval_ms: u64,
+    /// Delay before alignment is tried again after it failed or the link
+    /// failed (ITU-T Q.704 12.2.2, timer T17, 800 to 1500 ms).
+    pub restart_ms: u64,
+    /// MSUs the link holds for transmission before it discards (Q.704 3.8).
+    pub tx_queue: usize,
+}
+
+impl Default for M2paLink {
+    fn default() -> Self {
+        Self {
+            proving: ProvingMode::Normal,
+            t1_ms: 45_000,
+            t2_ms: 30_000,
+            t3_ms: 1_500,
+            t4n_ms: 8_200,
+            t4e_ms: 500,
+            t6_ms: 4_500,
+            t7_ms: 2_000,
+            proving_interval_ms: 100,
+            restart_ms: 1_000,
+            tx_queue: 4_096,
+        }
+    }
+}
+
+/// The `link_test:` block of a linkset: the signalling link test of ITU-T
+/// Q.707 2.2, run on every link of the linkset.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct LinkTest {
+    /// Whether this node tests its links. A test message from the peer is
+    /// answered either way (Q.707 2.2: the ability "must always be provided").
+    pub enabled: bool,
+    /// T1, supervision of the acknowledgement (4 to 12 s).
+    pub t1_ms: u64,
+    /// T2, interval between tests (30 to 90 s).
+    pub t2_ms: u64,
+    /// The test pattern, 1 to 15 octets in hexadecimal.
+    pub pattern: String,
+}
+
+impl Default for LinkTest {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            t1_ms: 8_000,
+            t2_ms: 60_000,
+            pattern: "a5a5a5a5a5a5a5a5".to_string(),
+        }
+    }
+}
+
+impl LinkTest {
+    /// The test pattern as octets. `None` if it is not 1 to 15 octets of
+    /// hexadecimal (rejected at load).
+    pub fn pattern_octets(&self) -> Option<Vec<u8>> {
+        let text = self.pattern.as_bytes();
+        if text.len() % 2 != 0 || !(2..=30).contains(&text.len()) {
+            return None;
+        }
+        text.chunks(2)
+            .map(|pair| {
+                let hex = std::str::from_utf8(pair).ok()?;
+                u8::from_str_radix(hex, 16).ok()
+            })
+            .collect()
+    }
 }
 
 // ── Application Servers (M3UA) / Linksets (M2PA) ────────────────────────────
@@ -183,6 +291,10 @@ pub struct ApplicationServer {
 pub struct Link {
     /// The association id this link rides.
     pub assoc: String,
+    /// The signalling link code, 0 to 15, which both ends of the link must
+    /// agree on (RFC 4165 4.1.2). Absent: the position of the link in `links`.
+    #[serde(default)]
+    pub slc: Option<u8>,
 }
 
 /// One `linksets:` entry: an **M2PA linkset** (RFC 4165). M2PA replaces MTP2, so
@@ -195,6 +307,20 @@ pub struct Linkset {
     pub name: String,
     /// The member links (each an m2pa association).
     pub links: Vec<Link>,
+    /// The signalling link test run on each link (ITU-T Q.707).
+    #[serde(default)]
+    pub link_test: LinkTest,
+}
+
+impl Linkset {
+    /// The signalling link code of the link at `index`: its `slc`, or its
+    /// position in the list.
+    pub fn slc_of(&self, index: usize) -> u8 {
+        self.links
+            .get(index)
+            .and_then(|l| l.slc)
+            .unwrap_or((index & 0x0F) as u8)
+    }
 }
 
 // ── MTP3 routes ─────────────────────────────────────────────────────────────
@@ -744,6 +870,32 @@ impl Config {
                 // known. Here just a sanity bound against the widest (ANSI).
                 pc.resolve(Variant::Ansi)?;
             }
+            if let Some(m2pa) = &a.m2pa {
+                if a.adaptation != Adaptation::M2pa {
+                    return Err(Error::validation(format!(
+                        "association `{}` has an `m2pa:` block but is not an m2pa association",
+                        a.id
+                    )));
+                }
+                let timers = [
+                    ("t1_ms", m2pa.t1_ms),
+                    ("t2_ms", m2pa.t2_ms),
+                    ("t3_ms", m2pa.t3_ms),
+                    ("t4n_ms", m2pa.t4n_ms),
+                    ("t4e_ms", m2pa.t4e_ms),
+                    ("t6_ms", m2pa.t6_ms),
+                    ("t7_ms", m2pa.t7_ms),
+                    ("proving_interval_ms", m2pa.proving_interval_ms),
+                    ("restart_ms", m2pa.restart_ms),
+                    ("tx_queue", m2pa.tx_queue as u64),
+                ];
+                if let Some((name, _)) = timers.iter().find(|(_, value)| *value == 0) {
+                    return Err(Error::validation(format!(
+                        "association `{}`: m2pa `{name}` must not be 0",
+                        a.id
+                    )));
+                }
+            }
         }
 
         let assoc_adapt: BTreeMap<&str, Adaptation> = self
@@ -837,6 +989,43 @@ impl Config {
             linkset_names.insert(ls.name.as_str());
             if ls.links.is_empty() {
                 return Err(where_(format!("linkset `{}` has no links", ls.name)));
+            }
+            // The signalling link code is 4 bits (Q.704 15.2) and names one link
+            // of the linkset.
+            if ls.links.len() > 16 {
+                return Err(where_(format!(
+                    "linkset `{}` has {} links, a linkset has at most 16",
+                    ls.name,
+                    ls.links.len()
+                )));
+            }
+            let mut codes = BTreeSet::new();
+            for index in 0..ls.links.len() {
+                let slc = ls.slc_of(index);
+                if slc > 15 {
+                    return Err(where_(format!(
+                        "linkset `{}` link `{}`: slc {slc} is not 0 to 15",
+                        ls.name, ls.links[index].assoc
+                    )));
+                }
+                if !codes.insert(slc) {
+                    return Err(where_(format!(
+                        "linkset `{}` has two links with slc {slc}",
+                        ls.name
+                    )));
+                }
+            }
+            if ls.link_test.pattern_octets().is_none() {
+                return Err(where_(format!(
+                    "linkset `{}`: link_test pattern `{}` is not 1 to 15 octets of hexadecimal",
+                    ls.name, ls.link_test.pattern
+                )));
+            }
+            if ls.link_test.t1_ms == 0 || ls.link_test.t2_ms == 0 {
+                return Err(where_(format!(
+                    "linkset `{}`: link_test timers must not be 0",
+                    ls.name
+                )));
             }
             for link in &ls.links {
                 match assoc_adapt.get(link.assoc.as_str()) {
@@ -1331,6 +1520,119 @@ linksets:
 "#;
         let err = Config::parse(yaml).unwrap_err();
         assert!(err.to_string().contains("carries m2pa links"));
+    }
+
+    /// A node with one m2pa link, the association and the linkset written by
+    /// the caller.
+    fn m2pa_node(association: &str, linkset: &str) -> String {
+        format!(
+            "node: {{ point_code: 1000, variant: ITU }}\nassociations:\n  - {association}\nlinksets:\n  - {linkset}\n"
+        )
+    }
+
+    const M2PA_ASSOC: &str =
+        "{ id: x1, adaptation: m2pa, role: client, addrs: [192.0.2.1], port: 3565, adjacent_pc: 3000 }";
+
+    #[test]
+    fn an_m2pa_link_defaults_to_the_q703_timers_and_a_tested_link() {
+        // No `m2pa:`, `slc:` or `link_test:` key: a 3.0 file loads unchanged and
+        // gets the values of Q.703 12.3 and Q.707 5.5.
+        let cfg =
+            Config::parse(&m2pa_node(M2PA_ASSOC, "{ name: ls, links: [{assoc: x1}] }")).unwrap();
+        assert!(cfg.associations[0].m2pa.is_none());
+        let link = M2paLink::default();
+        assert_eq!(link.proving, ProvingMode::Normal);
+        assert_eq!(
+            (
+                link.t1_ms,
+                link.t2_ms,
+                link.t3_ms,
+                link.t4n_ms,
+                link.t4e_ms,
+                link.t6_ms,
+                link.t7_ms
+            ),
+            (45_000, 30_000, 1_500, 8_200, 500, 4_500, 2_000)
+        );
+        assert_eq!(
+            (link.proving_interval_ms, link.restart_ms, link.tx_queue),
+            (100, 1_000, 4_096)
+        );
+        let ls = &cfg.default_tenant().unwrap().linksets[0];
+        assert!(ls.link_test.enabled);
+        assert_eq!((ls.link_test.t1_ms, ls.link_test.t2_ms), (8_000, 60_000));
+        assert_eq!(ls.link_test.pattern_octets().unwrap(), [0xA5; 8]);
+        assert_eq!(ls.slc_of(0), 0, "the position in the list");
+    }
+
+    #[test]
+    fn the_m2pa_block_sets_the_timers_and_keeps_the_other_defaults() {
+        let assoc = "{ id: x1, adaptation: m2pa, role: client, addrs: [192.0.2.1], port: 3565, \
+                     m2pa: { proving: emergency, t4e_ms: 450, t7_ms: 800 } }";
+        let linkset = "{ name: ls, links: [{assoc: x1, slc: 7}], \
+                       link_test: { enabled: false, t1_ms: 5000, pattern: \"0f1e2d\" } }";
+        let cfg = Config::parse(&m2pa_node(assoc, linkset)).unwrap();
+        let link = cfg.associations[0].m2pa.clone().unwrap();
+        assert_eq!(link.proving, ProvingMode::Emergency);
+        assert_eq!((link.t4e_ms, link.t7_ms, link.t1_ms), (450, 800, 45_000));
+        let ls = &cfg.default_tenant().unwrap().linksets[0];
+        assert_eq!(ls.slc_of(0), 7);
+        assert!(!ls.link_test.enabled);
+        assert_eq!((ls.link_test.t1_ms, ls.link_test.t2_ms), (5_000, 60_000));
+        assert_eq!(ls.link_test.pattern_octets().unwrap(), [0x0F, 0x1E, 0x2D]);
+    }
+
+    #[test]
+    fn rejects_m2pa_link_settings_that_cannot_work() {
+        let bad = |association: &str, linkset: &str, expect: &str| {
+            let err = Config::parse(&m2pa_node(association, linkset)).unwrap_err();
+            assert!(
+                err.to_string().contains(expect),
+                "{err} does not say `{expect}`"
+            );
+        };
+        let plain = "{ name: ls, links: [{assoc: x1}] }";
+        // A timer of 0 would fire at once, forever.
+        bad(
+            "{ id: x1, adaptation: m2pa, role: client, addrs: [192.0.2.1], port: 3565, m2pa: { t7_ms: 0 } }",
+            plain,
+            "`t7_ms` must not be 0",
+        );
+        // The signalling link code is 4 bits, and names one link.
+        bad(
+            M2PA_ASSOC,
+            "{ name: ls, links: [{assoc: x1, slc: 16}] }",
+            "slc 16 is not 0 to 15",
+        );
+        let two = format!(
+            "{M2PA_ASSOC}\n  - {{ id: x2, adaptation: m2pa, role: client, addrs: [192.0.2.2], port: 3565 }}"
+        );
+        bad(
+            &two,
+            "{ name: ls, links: [{assoc: x1, slc: 1}, {assoc: x2}] }",
+            "two links with slc 1",
+        );
+        // Q.707 5.4: a test pattern is 1 to 15 octets.
+        for pattern in ["\"\"", "abc", "zz", "00112233445566778899aabbccddeeff"] {
+            bad(
+                M2PA_ASSOC,
+                &format!(
+                    "{{ name: ls, links: [{{assoc: x1}}], link_test: {{ pattern: {pattern} }} }}"
+                ),
+                "not 1 to 15 octets",
+            );
+        }
+        bad(
+            M2PA_ASSOC,
+            "{ name: ls, links: [{assoc: x1}], link_test: { t1_ms: 0 } }",
+            "link_test timers",
+        );
+        // The block belongs to an m2pa association.
+        let err = Config::parse(
+            "node: { point_code: 1000, variant: ITU }\nassociations:\n  - { id: a1, adaptation: m3ua, role: server, addrs: [192.0.2.1], port: 2905, m2pa: { t7_ms: 500 } }\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("is not an m2pa association"));
     }
 
     #[test]

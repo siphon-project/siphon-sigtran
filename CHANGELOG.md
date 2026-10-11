@@ -7,6 +7,68 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Level 2 of an M2PA link** as RFC 4165 and ITU-T Q.703 have it. The Link
+  Status exchange runs on timers: Out of Service when the association comes up,
+  Alignment, Proving Normal or Emergency repeated for the proving period, Ready;
+  T1, T2, T3, T4 (normal and emergency), T6 and T7 are per-link keys in a new
+  `m2pa:` block of an association, in milliseconds, with the Q.703 12.3 values
+  as defaults. A link that fails or cannot be aligned starts alignment again
+  after `restart_ms` (Q.704 12.2.2, T17). Processor Outage / Recovered and Busy
+  / Busy Ended from the peer are acted on (traffic is held, T6 and T7 are
+  handled as 4.1.4 and 4.1.5 say); this node never originates them.
+- **The signalling link test** (ITU-T Q.707 2.2). A test message from the peer
+  is answered with its pattern. The node tests each link after alignment and
+  every T2 after that; a link is an egress for routing only once its test has
+  passed, and two failures in a row take it out of service. `link_test:` on a
+  linkset (`enabled`, `t1_ms`, `t2_ms`, `pattern`) and `slc:` on a link are new
+  keys, all with defaults.
+- **The buffers a failed link holds can be retrieved** (`transport::M2paLink`:
+  `bsnt`, `retrieve`), as RFC 4165 4.2.3 needs for changeover. Nothing calls
+  them yet: until changeover exists, what a failed link had sent and not seen
+  acknowledged is counted as lost.
+- `sigtran_m2pa_discarded_total{reason}`, `sigtran_m2pa_link_failures_total{reason}`,
+  `sigtran_link_tests_total{result}`, and `link-test` as a `reason` of
+  `sigtran_rx_discarded_total`. Every message a link receives or is handed and
+  does not carry is in one of them, with a line on stderr.
+
+### Changed
+
+- Needs `m2pa` 1.1 (Link Status Out of Service, the acknowledgement-only User
+  Data message, the priority in its RFC 4165 bit position) and `mtp3` 1.2 (the
+  management and link test message codec).
+- `sigtran_m2pa_link_state` is `1` only once level 2 is in service; it used to
+  be `1` for any link with an association. User data on a link that is not in
+  service is counted in `sigtran_m2pa_discarded_total{reason="rx-not-in-service"}`,
+  no longer as `out-of-state` in `sigtran_rx_discarded_total`.
+- `transport::next_status` is deprecated: alignment is no longer one status
+  answered with another.
+
+### Fixed
+
+- **An M2PA link did not stay in service against a conformant peer.** Every
+  User Data message went out with BSN and FSN `0xFFFFFF`, and received ones were
+  never acknowledged, so the far end saw each message after the first as out of
+  sequence and ran into its T7 (RFC 4165 2.2, 4.2.1). User Data is now numbered
+  from 0 after alignment, carries the FSN last received, and is acknowledged
+  with an empty User Data message when nothing else is going out. Sent messages
+  are kept until acknowledged, and one that stays unacknowledged for T7 fails
+  the link.
+- **The signalling link test was not answered**: a test message for this node
+  was handed to SCCP routing and dropped, so a peer that tests its links took
+  the link out after the second attempt.
+- **A status the peer repeats took the link out of service** (a second
+  Alignment, a third Ready), and there were no alignment or proving timers.
+- All senders now hand an MSU for a linkset to the link's own task, which is the
+  only writer of User Data on the association: the FSN order is the order on
+  the stream.
+
+An M2PA link between this release and 3.0.0 does not come into service: 3.0.0
+does not answer the link test or acknowledge User Data. Upgrade both ends, or
+set `link_test: { enabled: false }` and expect T7 to fail the link under
+traffic.
+
 ## [3.0.0] — 2026-10-10
 
 ### Added
