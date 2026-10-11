@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::mtp3::management::Procedure;
-use crate::transport::{M2paDiscard, M2paFailure};
+use crate::transport::{AsState, M2paDiscard, M2paFailure, M3uaDiscard, M3uaEvent};
 
 // ── Loop guards (phase 2) ────────────────────────────────────────────────────
 
@@ -551,16 +551,32 @@ pub enum RxDiscard {
     /// node, for a link code this linkset does not have, or an acknowledgement
     /// of a test that is not running (ITU-T Q.707 2.2).
     LinkTest,
+    /// An M3UA message that names a Routing Context the association is not
+    /// configured in (RFC 4666 3.8.1, "Invalid Routing Context").
+    RoutingContext,
+    /// An M3UA message that is not expected in the state the ASP is in, or
+    /// from the role the peer has (RFC 4666 3.8.1, "Unexpected Message").
+    Unexpected,
+    /// An M3UA message with a parameter that is missing, has a wrong length
+    /// or an invalid value (RFC 4666 3.8.1).
+    Parameter,
+    /// A signalling network management message in a DATA message, which is
+    /// never transferred to or from an ASP (RFC 4666 1.4.3.2).
+    Management,
 }
 
 impl RxDiscard {
-    const ALL: [RxDiscard; 6] = [
+    const ALL: [RxDiscard; 10] = [
         Self::Ppid,
         Self::Undecodable,
         Self::OutOfState,
         Self::NoPayload,
         Self::NotUnitdata,
         Self::LinkTest,
+        Self::RoutingContext,
+        Self::Unexpected,
+        Self::Parameter,
+        Self::Management,
     ];
 
     /// The `reason` label value.
@@ -572,11 +588,15 @@ impl RxDiscard {
             Self::NoPayload => "no-payload",
             Self::NotUnitdata => "not-unitdata",
             Self::LinkTest => "link-test",
+            Self::RoutingContext => "routing-context",
+            Self::Unexpected => "unexpected",
+            Self::Parameter => "parameter",
+            Self::Management => "management",
         }
     }
 }
 
-static RX_DISCARDS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static RX_DISCARDS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// Count one received message dropped before routing.
 pub fn rx_discard(reason: RxDiscard) {
@@ -586,6 +606,110 @@ pub fn rx_discard(reason: RxDiscard) {
 /// The count of received messages dropped before routing for the given reason.
 pub fn rx_discards(reason: RxDiscard) -> u64 {
     RX_DISCARDS[reason as usize].load(Ordering::Relaxed)
+}
+
+// ── M3UA management (RFC 4666) ───────────────────────────────────────────────
+
+static M3UA_DISCARDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static M3UA_EVENTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Count `count` messages the M3UA layer did not send to an Application
+/// Server (`sigtran_m3ua_discarded_total{reason}`).
+pub fn m3ua_discard(reason: M3uaDiscard, count: u64) {
+    M3UA_DISCARDS[reason as usize].fetch_add(count, Ordering::Relaxed);
+}
+
+/// The count of messages the M3UA layer did not send for the given reason.
+pub fn m3ua_discards(reason: M3uaDiscard) -> u64 {
+    M3UA_DISCARDS[reason as usize].load(Ordering::Relaxed)
+}
+
+/// Count one event of M3UA management (`sigtran_m3ua_events_total{event}`).
+pub fn m3ua_event(event: M3uaEvent) {
+    M3UA_EVENTS[event as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The count of one event of M3UA management.
+pub fn m3ua_events(event: M3uaEvent) -> u64 {
+    M3UA_EVENTS[event as usize].load(Ordering::Relaxed)
+}
+
+/// Count one M3UA message that is not DATA, by its abbreviation in RFC 4666
+/// 3.1.2 (`sigtran_m3ua_management_total{dir,type}`).
+pub fn m3ua_management(dir: Dir, name: &'static str) {
+    if let Some(m) = labelled().as_mut() {
+        *m.m3ua_management.entry((dir.label(), name)).or_insert(0) += 1;
+    }
+}
+
+/// The count of M3UA messages of one type in one direction.
+pub fn m3ua_management_total(dir: Dir, name: &str) -> u64 {
+    labelled()
+        .as_ref()
+        .and_then(|m| {
+            m.m3ua_management
+                .iter()
+                .find(|((d, n), _)| *d == dir.label() && *n == name)
+                .map(|(_, v)| *v)
+        })
+        .unwrap_or(0)
+}
+
+/// Count one Error message by what it says
+/// (`sigtran_m3ua_error_total{dir,code}`, the code as a name of RFC 4666
+/// 3.8.1).
+pub fn m3ua_error(dir: Dir, code: &'static str) {
+    if let Some(m) = labelled().as_mut() {
+        *m.m3ua_errors.entry((dir.label(), code)).or_insert(0) += 1;
+    }
+}
+
+/// The count of Error messages with one code in one direction.
+pub fn m3ua_errors(dir: Dir, code: &str) -> u64 {
+    labelled()
+        .as_ref()
+        .and_then(|m| {
+            m.m3ua_errors
+                .iter()
+                .find(|((d, c), _)| *d == dir.label() && *c == code)
+                .map(|(_, v)| *v)
+        })
+        .unwrap_or(0)
+}
+
+/// Count one Notify message by its status
+/// (`sigtran_m3ua_notify_total{dir,status}`).
+pub fn m3ua_notify(dir: Dir, status: &'static str) {
+    if let Some(m) = labelled().as_mut() {
+        *m.m3ua_notifies.entry((dir.label(), status)).or_insert(0) += 1;
+    }
+}
+
+/// The count of Notify messages with one status in one direction.
+pub fn m3ua_notifies(dir: Dir, status: &str) -> u64 {
+    labelled()
+        .as_ref()
+        .and_then(|m| {
+            m.m3ua_notifies
+                .iter()
+                .find(|((d, s), _)| *d == dir.label() && *s == status)
+                .map(|(_, v)| *v)
+        })
+        .unwrap_or(0)
+}
+
+/// Set the `sigtran_as_state{as}` gauge (0 down, 1 inactive, 2 active,
+/// 3 pending; RFC 4666 4.3.2).
+pub fn set_as_state(name: &str, state: AsState) {
+    let value = match state {
+        AsState::Down => 0,
+        AsState::Inactive => 1,
+        AsState::Active => 2,
+        AsState::Pending => 3,
+    };
+    if let Some(m) = labelled().as_mut() {
+        m.as_state.insert(name.to_string(), value);
+    }
 }
 
 // ── M2PA link (level 2) and the signalling link test ─────────────────────────
@@ -840,6 +964,14 @@ struct Labelled {
     mtp3mg_events: BTreeMap<(u32, &'static str), u64>,
     /// `sigtran_mtp3_management_total{dir,type}`.
     mtp3_management: BTreeMap<(&'static str, &'static str), u64>,
+    /// `sigtran_m3ua_management_total{dir,type}`.
+    m3ua_management: BTreeMap<(&'static str, &'static str), u64>,
+    /// `sigtran_m3ua_error_total{dir,code}`.
+    m3ua_errors: BTreeMap<(&'static str, &'static str), u64>,
+    /// `sigtran_m3ua_notify_total{dir,status}`.
+    m3ua_notifies: BTreeMap<(&'static str, &'static str), u64>,
+    /// `sigtran_as_state{as}` (0 down, 1 inactive, 2 active, 3 pending).
+    as_state: BTreeMap<String, i64>,
     /// `sigtran_mtp3_link_traffic{link}` (0/1).
     mtp3_link_traffic: BTreeMap<String, i64>,
     /// `sigtran_content_rule_hits_total{rule,action}`.
@@ -1280,6 +1412,34 @@ pub fn render() -> String {
     }
     help(
         &mut out,
+        "sigtran_m3ua_discarded_total",
+        "Messages the M3UA layer did not send to an Application Server, by reason (RFC 4666).",
+        "counter",
+    );
+    for reason in M3uaDiscard::ALL {
+        line(
+            &mut out,
+            "sigtran_m3ua_discarded_total",
+            &[("reason", reason.label())],
+            m3ua_discards(reason),
+        );
+    }
+    help(
+        &mut out,
+        "sigtran_m3ua_events_total",
+        "Events of M3UA management: timers that ran out, takeovers, heartbeats missed.",
+        "counter",
+    );
+    for event in M3uaEvent::ALL {
+        line(
+            &mut out,
+            "sigtran_m3ua_events_total",
+            &[("event", event.label())],
+            m3ua_events(event),
+        );
+    }
+    help(
+        &mut out,
         "sigtran_m2pa_discarded_total",
         "Messages an M2PA link received or was handed and did not carry, by reason.",
         "counter",
@@ -1506,6 +1666,61 @@ pub fn render() -> String {
 
         help(
             &mut out,
+            "sigtran_m3ua_management_total",
+            "M3UA messages other than DATA, by direction and type.",
+            "counter",
+        );
+        for ((dir, name), v) in &m.m3ua_management {
+            line(
+                &mut out,
+                "sigtran_m3ua_management_total",
+                &[("dir", dir), ("type", name)],
+                *v,
+            );
+        }
+
+        help(
+            &mut out,
+            "sigtran_m3ua_error_total",
+            "M3UA Error messages, by direction and error code.",
+            "counter",
+        );
+        for ((dir, code), v) in &m.m3ua_errors {
+            line(
+                &mut out,
+                "sigtran_m3ua_error_total",
+                &[("dir", dir), ("code", code)],
+                *v,
+            );
+        }
+
+        help(
+            &mut out,
+            "sigtran_m3ua_notify_total",
+            "M3UA Notify messages, by direction and status.",
+            "counter",
+        );
+        for ((dir, status), v) in &m.m3ua_notifies {
+            line(
+                &mut out,
+                "sigtran_m3ua_notify_total",
+                &[("dir", dir), ("status", status)],
+                *v,
+            );
+        }
+
+        help(
+            &mut out,
+            "sigtran_as_state",
+            "Application Server state (0 down, 1 inactive, 2 active, 3 pending).",
+            "gauge",
+        );
+        for (name, v) in &m.as_state {
+            line_i(&mut out, "sigtran_as_state", &[("as", name)], *v);
+        }
+
+        help(
+            &mut out,
             "sigtran_mtp3_link_traffic",
             "Whether level 3 routes traffic to a link (0/1).",
             "gauge",
@@ -1666,6 +1881,12 @@ mod tests {
             "sigtran_mtp3_procedures_total",
             "sigtran_mtp3_restarting",
             "sigtran_mtp3_management_total",
+            "sigtran_m3ua_discarded_total",
+            "sigtran_m3ua_events_total",
+            "sigtran_m3ua_management_total",
+            "sigtran_m3ua_error_total",
+            "sigtran_m3ua_notify_total",
+            "sigtran_as_state",
             "sigtran_mtp3_link_traffic",
             "sigtran_content_rule_hits_total",
             "sigtran_invoke_timeouts_total",

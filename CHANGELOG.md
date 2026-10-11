@@ -71,11 +71,58 @@ All notable changes are documented here. The format follows
   (`t1_ms` to `t6_ms`, `t8_ms`, `t10_ms`, `t12_ms`, `t13_ms`, `t18_ms` to
   `t21_ms`, `t23_ms`), `tfp_for_unknown_destination` and `rerouting_buffer`,
   all with the Q.704 16.8 values as defaults.
-- `Registry::destination_changes`: every destination that becomes accessible
-  or inaccessible through this node, and every transfer-controlled, is
-  published there once (`transport::DestinationChange`).
+- `Registry::destination_changes`: every destination that becomes accessible,
+  inaccessible, or reached by a restricted route only through this node, and
+  every transfer-controlled, is published there once
+  (`transport::DestinationChange`).
 - `mtp3::management`, the state machine behind all of it, without I/O:
   `Management`, its `Input` and `Action`, `Topology`, `Timers`.
+- **M3UA management of a signalling gateway** (RFC 4666), one task per routing
+  domain, for the ASPs of its application servers:
+  - *ASP and AS state* (4.3). The state of every ASP in every server it is
+    configured in, and of every server: inactive, active, pending for T(r)
+    (`recovery_ms`, default 2000) with its traffic queued (`pending_queue`),
+    and "n" ASPs before a server is active (`required_asps`). All three are
+    new keys of an application server.
+  - *Notify* (4.3.4.5): AS-INACTIVE, AS-ACTIVE and AS-PENDING to every ASP of
+    the server that is not down, after the acknowledgement they follow from;
+    the state of the server to an ASP that comes up; Alternate ASP Active,
+    ASP Failure and Insufficient ASP Resources Active in AS.
+  - *Routing contexts and traffic modes are checked.* An ASP Active or ASP
+    Inactive for a routing context the association is not configured in is
+    answered with Error, "Invalid Routing Context"; a Traffic Mode Type that is
+    not the server's with "Unsupported Traffic Mode Type". In an override
+    server the ASP that asks last takes the traffic.
+  - *Destinations* (4.5, 4.6). DUNA, DAVA, DRST and SCON are sent to every
+    active ASP when level 3 finds a destination inaccessible, accessible,
+    restricted or congested, and to an ASP that becomes active for what is
+    unavailable then; a DAUD is answered per destination, ranges included;
+    while this node's MTP restart runs the destinations behind linksets are
+    unavailable to the ASPs.
+  - *Between an ASP and a linkset* (1.4.3.2). A transfer-controlled or user
+    part unavailable message for the point code of a server becomes a SCON or
+    a DUPU; a SCON from an ASP with a Concerned Destination becomes a
+    transfer-controlled; DUNA and DAVA from an ASP reach the adjacent points
+    as transfer-prohibited and transfer-allowed, as before.
+  - *Error* (3.8.1) for what cannot be read or acted on: invalid version,
+    unsupported message class or type, unsupported traffic mode type,
+    unexpected message, protocol error, invalid parameter value, parameter
+    field error, missing parameter, invalid routing context, no configured AS
+    for ASP.
+  - *Heartbeat* (4.3.4.6): the Heartbeat Data is returned in the
+    acknowledgement, and with `m3ua.beat_ms` set this node sends Heartbeat and
+    aborts the association of a peer that says nothing for twice that long.
+  - *As an ASP* (a `client` association): ASP Up and ASP Active are sent again
+    every `m3ua.ack_ms` (T(ack), default 2000) until acknowledged, with
+    `m3ua.asp_id` as ASP Identifier; a Notify from the gateway is acted on.
+- `transport::Aspm`, the state machine behind ASP and AS state, without I/O,
+  with its `AspmInput`, `AspmAction` and `AspmLayout`; `AsState`, `AspState`,
+  `NotifyStatus`; `Registry::server_state`; `Router::is_restricted`.
+- `sigtran_as_state{as}`, `sigtran_m3ua_management_total{dir,type}`,
+  `sigtran_m3ua_error_total{dir,code}`, `sigtran_m3ua_notify_total{dir,status}`,
+  `sigtran_m3ua_events_total{event}`, `sigtran_m3ua_discarded_total{reason}`,
+  and `routing-context`, `unexpected`, `parameter` and `management` as a
+  `reason` of `sigtran_rx_discarded_total`.
 - `sigtran_mtp3_management_total{dir,type}`,
   `sigtran_mtp3_procedures_total{procedure}`,
   `sigtran_mtp3_retrieved_total{fate}`, `sigtran_mtp3_discarded_total{reason}`,
@@ -86,8 +133,36 @@ All notable changes are documented here. The format follows
 ### Changed
 
 - Needs `m2pa` 1.1 (Link Status Out of Service, the acknowledgement-only User
-  Data message, the priority in its RFC 4165 bit position) and `mtp3` 1.2 (the
-  management and link test message codec).
+  Data message, the priority in its RFC 4165 bit position), `mtp3` 1.2 (the
+  management and link test message codec) and `m3ua` 1.1 (the SCON, DUPU and
+  DRST builders, the accessors of the management parameters).
+- **An M3UA association carries traffic only as an ASP of an application
+  server.** A `server` association that is in no `application_servers` entry
+  used to become active on any ASP Active and have its DATA routed; its ASP
+  Active is now answered with Error, "No Configured AS for ASP", or "Invalid
+  Routing Context" when it names one. Put the association in a server.
+- **A peer ASP has to name the routing context and traffic mode the server
+  has**, or none. An ASP Active with another routing context or mode used to
+  be acknowledged, and DATA with any routing context routed; both are now
+  answered with Error and the DATA is not routed.
+- DATA from an ASP that is not active is answered with Error, "Unexpected
+  Message", where it was only counted.
+- A server whose last active ASP leaves stays a route for `recovery_ms` (2 s)
+  and queues what arrives, where its route went at once: an alternate route
+  takes over that much later. Set `recovery_ms: 0` for the old behaviour.
+- Signalling network management (service indicator 0) addressed to the point
+  code of an application server is no longer sent to its ASPs in DATA, and
+  none is accepted from an ASP in DATA (RFC 4666 1.4.3.2).
+- As an ASP the node no longer puts ASP Identifier 1 in every ASP Up: the
+  parameter is left out unless `m3ua.asp_id` is set (3.5.1 wants it unique
+  among the ASPs of a server). It sends one ASP Active per server.
+- The Heartbeat Data of a peer's Heartbeat is returned in the acknowledgement;
+  it was dropped.
+- A DAUD, DUNA or DAVA entry with a mask is applied to the destinations of
+  the routing table in that range; such an entry used to be dropped, the mask
+  octet being read as part of the point code.
+- SUA associations are unchanged: they keep the plain handshake, without
+  Notify, Error or the checks above.
 - `sigtran_m2pa_link_state` is `1` only once level 2 is in service; it used to
   be `1` for any link with an association. User data on a link that is not in
   service is counted in `sigtran_m2pa_discarded_total{reason="rx-not-in-service"}`,

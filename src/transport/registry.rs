@@ -3,7 +3,8 @@
 //!
 //! Association tasks update their slot (sender + adaptation-active flag) as the
 //! handshake progresses; [`Registry::recompute`] then folds that into the
-//! router's route state (an AS is up while ≥ 1 ASP is active, a linkset while
+//! router's route state (an AS of M3UA ASPs is up while ASP state maintenance
+//! has it active or pending, any other while ≥ 1 ASP is active, a linkset while
 //! level 3 routes traffic to ≥ 1 of its links). [`Registry::select`] answers
 //! the egress question: given a resolved [`Destination`], which association(s)
 //! carry the MSU, honouring the AS traffic mode and the SLS.
@@ -15,7 +16,7 @@
 //! atomic load while no destination is held.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -26,7 +27,11 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use super::framing::Msu;
 use super::m2pa::link::{Discard, LinkTimers, Proving};
 use super::m2pa::traffic::LinkTraffic;
-use crate::config::{Adaptation, Config, M2paLink, ProvingMode, TenantId, TrafficMode};
+use super::m3ua::aspm::{AsState, Layout};
+use super::m3ua::{Discard as M3uaDiscard, Request};
+use crate::config::{
+    Adaptation, Config, M2paLink, M3uaPeer, ProvingMode, Role, TenantId, TrafficMode,
+};
 use crate::metrics;
 use crate::mtp3::management::{Input, Topology};
 use crate::mtp3::route::{Destination, RouteResolver};
@@ -55,6 +60,37 @@ pub enum DestinationChange {
         /// The congestion status the message carried.
         status: u8,
     },
+    /// The destination can be reached, but only by a route its adjacent point
+    /// restricted (Q.704 13.4). When that ends, [`Accessible`](Self::Accessible)
+    /// or [`Inaccessible`](Self::Inaccessible) follows.
+    Restricted {
+        /// Its point code.
+        dpc: u32,
+    },
+}
+
+/// Whether an M3UA association takes traffic for a Routing Context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// The ASP is active in the server of that context.
+    Active,
+    /// The ASP is not active, in that server or in any.
+    NotActive,
+    /// The association is not configured in a server with that context.
+    Unconfigured,
+}
+
+/// One Application Server an M3UA association is configured in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Membership {
+    /// The server, by its position in the configuration.
+    pub server: usize,
+    /// The association's position among the ASPs of that server.
+    pub position: usize,
+    /// The Routing Context of the server.
+    pub context: u32,
+    /// The traffic mode of the server.
+    pub mode: TrafficMode,
 }
 
 /// What level 3 tells the task that serves a link.
@@ -218,17 +254,39 @@ pub struct AssocSlot {
     active: AtomicBool,
     /// For an m2pa association: the link it is.
     link: Option<LinkPort>,
+    /// Whether this node listens for the association or dials it.
+    pub role: Role,
+    /// For an m3ua association: its number in ASP state maintenance.
+    pub(crate) asp: Option<usize>,
+    /// For an m3ua association: the servers it is configured in.
+    memberships: Vec<Membership>,
+    /// For an m3ua association: its `m3ua:` block.
+    pub(crate) m3ua: M3uaPeer,
 }
 
 impl AssocSlot {
-    fn new(id: String, adaptation: Adaptation, link: Option<LinkPort>) -> Self {
+    fn new(id: String, adaptation: Adaptation, link: Option<LinkPort>, role: Role) -> Self {
         Self {
             id,
             adaptation,
             sender: RwLock::new(None),
             active: AtomicBool::new(false),
             link,
+            role,
+            asp: None,
+            memberships: Vec::new(),
+            m3ua: M3uaPeer::default(),
         }
+    }
+
+    /// The Application Servers this M3UA association is configured in.
+    pub fn memberships(&self) -> &[Membership] {
+        &self.memberships
+    }
+
+    /// Whether `assoc` is the live association of this slot.
+    pub(crate) fn is_sender(&self, assoc: &Arc<SctpAssociation>) -> bool {
+        self.sender().is_some_and(|live| Arc::ptr_eq(&live, assoc))
     }
 
     /// The M2PA link this association is, if it is one.
@@ -267,14 +325,61 @@ impl AssocSlot {
 
 /// A compiled Application Server: its traffic mode, routing context, and the
 /// ordered association ids of its ASPs.
-#[derive(Debug)]
 struct AsEntry {
     name: String,
     traffic_mode: TrafficMode,
     routing_context: u32,
     asps: Vec<String>,
+    /// The slots of `asps`, in the same order.
+    members: Vec<Arc<AssocSlot>>,
     /// Whether it was in service at the last recompute.
     up: AtomicBool,
+    /// Served by M3UA ASPs: ASP state maintenance decides which of them are
+    /// active in it and what state it is in (RFC 4666 4.3).
+    managed: bool,
+    /// For a managed server: which of `members` are ASP-ACTIVE in it.
+    active: Vec<AtomicBool>,
+    /// For a managed server: its state, an [`AsState`] as a number.
+    state: AtomicU8,
+    /// What is queued for it while it is pending (RFC 4666 4.3.2).
+    pending: Mutex<VecDeque<Msu>>,
+    pending_limit: usize,
+}
+
+fn state_number(state: AsState) -> u8 {
+    match state {
+        AsState::Down => 0,
+        AsState::Inactive => 1,
+        AsState::Active => 2,
+        AsState::Pending => 3,
+    }
+}
+
+impl AsEntry {
+    fn state(&self) -> AsState {
+        match self.state.load(Ordering::Acquire) {
+            1 => AsState::Inactive,
+            2 => AsState::Active,
+            3 => AsState::Pending,
+            _ => AsState::Down,
+        }
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, VecDeque<Msu>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the member at `position` takes traffic of this server.
+    fn carries(&self, position: usize) -> bool {
+        let Some(slot) = self.members.get(position) else {
+            return false;
+        };
+        if self.managed {
+            self.active[position].load(Ordering::Relaxed) && slot.sender().is_some()
+        } else {
+            slot.is_carrying()
+        }
+    }
 }
 
 /// A compiled linkset: its links in configuration order.
@@ -328,6 +433,13 @@ pub struct Registry {
     /// Messages held per destination before further ones are discarded.
     rerouting_buffer: usize,
     changes: broadcast::Sender<DestinationChange>,
+    /// Where ASP state maintenance takes its requests, once it runs.
+    layer: OnceLock<mpsc::UnboundedSender<Request>>,
+    /// The same flag as `restarting`, for whoever waits for it to change.
+    restart: watch::Sender<bool>,
+    /// Every destination of the routing table, with the Application Servers
+    /// that are a route to it.
+    destinations: BTreeMap<u32, Vec<usize>>,
     /// One recompute at a time: each reads the links and writes the route
     /// state, and the one that read last has to be the one that writes last.
     recomputing: Mutex<()>,
@@ -343,6 +455,7 @@ impl Registry {
             .map(|pc| pc.value())
             .unwrap_or(tenant.point_code.0);
         let topology = Topology::build(tenant, &config.associations);
+        let layout = Layout::build(tenant, &config.associations);
         let assocs: HashMap<String, Arc<AssocSlot>> = config
             .associations
             .iter()
@@ -382,21 +495,66 @@ impl Registry {
                         index: topology.links.iter().position(|l| l.name == a.id),
                     })
                 });
-                (
-                    a.id.clone(),
-                    Arc::new(AssocSlot::new(a.id.clone(), a.adaptation, link)),
-                )
+                let mut slot = AssocSlot::new(a.id.clone(), a.adaptation, link, a.role);
+                if a.adaptation == Adaptation::M3ua {
+                    slot.asp = layout.asps.iter().position(|asp| asp.name == a.id);
+                    slot.m3ua = a.m3ua.clone().unwrap_or_default();
+                    slot.memberships = tenant
+                        .application_servers
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(server, entry)| {
+                            let position = entry.asps.iter().position(|id| *id == a.id)?;
+                            Some(Membership {
+                                server,
+                                position,
+                                context: entry.routing_context,
+                                mode: entry.traffic_mode,
+                            })
+                        })
+                        .collect();
+                }
+                (a.id.clone(), Arc::new(slot))
             })
             .collect();
         let application_servers = tenant
             .application_servers
             .iter()
-            .map(|a| AsEntry {
-                name: a.name.clone(),
-                traffic_mode: a.traffic_mode,
-                routing_context: a.routing_context,
-                asps: a.asps.clone(),
-                up: AtomicBool::new(false),
+            .map(|a| {
+                let members: Vec<Arc<AssocSlot>> = a
+                    .asps
+                    .iter()
+                    .filter_map(|id| assocs.get(id).cloned())
+                    .collect();
+                AsEntry {
+                    name: a.name.clone(),
+                    traffic_mode: a.traffic_mode,
+                    routing_context: a.routing_context,
+                    asps: a.asps.clone(),
+                    up: AtomicBool::new(false),
+                    managed: !members.is_empty()
+                        && members.len() == a.asps.len()
+                        && members.iter().all(|m| m.adaptation == Adaptation::M3ua),
+                    active: members.iter().map(|_| AtomicBool::new(false)).collect(),
+                    state: AtomicU8::new(0),
+                    pending: Mutex::new(VecDeque::new()),
+                    pending_limit: a.pending_queue,
+                    members,
+                }
+            })
+            .collect();
+        let destinations = topology
+            .routes
+            .iter()
+            .map(|(dpc, routes)| {
+                let servers = routes
+                    .iter()
+                    .filter_map(|r| match r.via {
+                        crate::mtp3::management::Via::Server(index) => Some(index),
+                        crate::mtp3::management::Via::Linkset(_) => None,
+                    })
+                    .collect();
+                (*dpc, servers)
             })
             .collect();
         let resolver = RouteResolver::build(tenant, &config.associations);
@@ -432,6 +590,9 @@ impl Registry {
             held: Mutex::new(Held::new()),
             rerouting_buffer: tenant.mtp3.rerouting_buffer,
             changes: broadcast::channel(256).0,
+            layer: OnceLock::new(),
+            restart: watch::channel(false).0,
+            destinations,
             recomputing: Mutex::new(()),
         })
     }
@@ -498,6 +659,171 @@ impl Registry {
     pub(crate) fn set_restarting(&self, on: bool) {
         self.restarting.store(on, Ordering::Relaxed);
         metrics::set_mtp3_restarting(on);
+        self.restart.send_replace(on);
+    }
+
+    /// Follow this node's MTP restart: the value changes when it begins and
+    /// when it ends.
+    pub(crate) fn restart_changes(&self) -> watch::Receiver<bool> {
+        self.restart.subscribe()
+    }
+
+    // ── ASP state maintenance (RFC 4666 4.3) ────────────────────────────────
+
+    /// Where ASP state maintenance of this domain takes its requests. Set
+    /// once, when its task starts.
+    pub(crate) fn attach_layer(&self, requests: mpsc::UnboundedSender<Request>) {
+        let _ = self.layer.set(requests);
+    }
+
+    /// Hand a request to ASP state maintenance. `false` while none runs (a
+    /// registry built without a transport).
+    pub(crate) fn request(&self, request: Request) -> bool {
+        self.layer
+            .get()
+            .is_some_and(|requests| requests.send(request).is_ok())
+    }
+
+    /// Every destination of the routing table, with the Application Servers
+    /// that are a route to it.
+    pub(crate) fn destinations(&self) -> &BTreeMap<u32, Vec<usize>> {
+        &self.destinations
+    }
+
+    /// The M3UA association with this number in ASP state maintenance.
+    pub(crate) fn asp_slot(&self, asp: usize) -> Option<&Arc<AssocSlot>> {
+        self.assocs.values().find(|slot| slot.asp == Some(asp))
+    }
+
+    /// How many Application Servers the domain has.
+    pub(crate) fn server_count(&self) -> usize {
+        self.application_servers.len()
+    }
+
+    /// The name and Routing Context of an Application Server.
+    pub(crate) fn server(&self, server: usize) -> Option<(&str, u32)> {
+        self.application_servers
+            .get(server)
+            .map(|a| (a.name.as_str(), a.routing_context))
+    }
+
+    /// The position of the Application Server with this name.
+    pub(crate) fn server_index(&self, name: &str) -> Option<usize> {
+        self.application_servers.iter().position(|a| a.name == name)
+    }
+
+    /// The ASPs that are active in a server and have a live association.
+    pub(crate) fn active_asps(&self, server: usize) -> Vec<Arc<AssocSlot>> {
+        let Some(entry) = self.application_servers.get(server) else {
+            return Vec::new();
+        };
+        entry
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| entry.carries(*position))
+            .map(|(_, slot)| slot.clone())
+            .collect()
+    }
+
+    /// Record whether an ASP is ASP-ACTIVE in a server (RFC 4666 4.3.1). The
+    /// transfer path reads it on every message.
+    pub(crate) fn set_asp_active(&self, slot: &AssocSlot, server: usize, active: bool) {
+        let Some(entry) = self.application_servers.get(server) else {
+            return;
+        };
+        for membership in slot.memberships.iter().filter(|m| m.server == server) {
+            if let Some(flag) = entry.active.get(membership.position) {
+                flag.store(active, Ordering::Relaxed);
+            }
+        }
+        let anywhere = slot.memberships.iter().any(|m| self.member_active(m));
+        slot.set_active(anywhere);
+        metrics::set_asp_state(&slot.id, &entry.name, active);
+    }
+
+    fn member_active(&self, membership: &Membership) -> bool {
+        self.application_servers
+            .get(membership.server)
+            .and_then(|entry| entry.active.get(membership.position))
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    /// Whether an M3UA association takes traffic that names this Routing
+    /// Context, or none.
+    pub(crate) fn admits(&self, slot: &AssocSlot, context: Option<u32>) -> Admission {
+        let mut active = slot
+            .memberships
+            .iter()
+            .filter(|m| self.member_active(m))
+            .peekable();
+        if active.peek().is_none() {
+            return Admission::NotActive;
+        }
+        match context {
+            None => Admission::Active,
+            Some(context) if active.any(|m| m.context == context) => Admission::Active,
+            Some(context) if slot.memberships.iter().any(|m| m.context == context) => {
+                Admission::NotActive
+            }
+            Some(_) => Admission::Unconfigured,
+        }
+    }
+
+    /// The state of an Application Server served by M3UA ASPs.
+    pub fn server_state(&self, name: &str) -> Option<AsState> {
+        self.application_servers
+            .iter()
+            .find(|a| a.name == name && a.managed)
+            .map(AsEntry::state)
+    }
+
+    /// Record the state of an Application Server (RFC 4666 4.3.2). Returns
+    /// what was queued for it when it is not pending any more: to be sent if
+    /// it is active, counted as discarded otherwise.
+    pub(crate) fn set_server_state(&self, server: usize, state: AsState) -> VecDeque<Msu> {
+        let Some(entry) = self.application_servers.get(server) else {
+            return VecDeque::new();
+        };
+        // The state first, then the queue under its lock: a message is either
+        // in what is returned here, or sees the new state and is not queued.
+        entry.state.store(state_number(state), Ordering::Release);
+        metrics::set_as_state(&entry.name, state);
+        if state == AsState::Pending {
+            return VecDeque::new();
+        }
+        std::mem::take(&mut *entry.pending())
+    }
+
+    /// Queue `msu` for an Application Server that is pending (RFC 4666 4.3.2:
+    /// "all incoming signalling messages SHOULD be queued by the SGP").
+    /// `false` when the server is not pending, and the message has no egress.
+    pub(crate) fn queue_if_pending(&self, name: &str, msu: &Msu) -> bool {
+        let Some(entry) = self
+            .application_servers
+            .iter()
+            .find(|a| a.name == name && a.managed)
+        else {
+            return false;
+        };
+        if entry.state() != AsState::Pending {
+            return false;
+        }
+        let mut pending = entry.pending();
+        if entry.state() != AsState::Pending {
+            return false;
+        }
+        if pending.len() >= entry.pending_limit {
+            drop(pending);
+            metrics::m3ua_discard(M3uaDiscard::PendingFull, 1);
+            eprintln!(
+                "siphon-sigtran: the queue of pending application server `{name}` is full, message for dpc {} dropped",
+                msu.dpc
+            );
+        } else {
+            pending.push_back(msu.clone());
+        }
+        true
     }
 
     /// Subscribe to the destinations that become accessible or inaccessible
@@ -651,19 +977,21 @@ impl Registry {
         }
 
         for (index, a) in self.application_servers.iter().enumerate() {
-            let up = a
-                .asps
-                .iter()
-                .filter_map(|id| self.assocs.get(id))
-                .any(|s| s.is_carrying());
+            // A server of M3UA ASPs is a route while it is active, and while
+            // it is pending: its traffic is queued then, for T(r) (RFC 4666
+            // 4.3.2). Any other is one while an ASP carries.
+            let up = if a.managed {
+                matches!(a.state(), AsState::Active | AsState::Pending)
+            } else {
+                a.members.iter().any(|s| s.is_carrying())
+            };
             // Signalling route management follows the application servers
             // too: a destination behind one is announced like any other.
             if a.up.swap(up, Ordering::Relaxed) != up {
                 self.manage(Input::Server { index, up });
             }
-            for asp in &a.asps {
-                let active = self.assocs.get(asp).is_some_and(|s| s.is_carrying());
-                metrics::set_asp_state(asp, &a.name, active);
+            for (position, asp) in a.asps.iter().enumerate() {
+                metrics::set_asp_state(asp, &a.name, a.carries(position));
             }
             if up {
                 router.note_as_up(&self.tenant, &a.name);
@@ -701,9 +1029,8 @@ impl Registry {
                 let Some(a) = self.application_servers.iter().find(|a| a.name == *name) else {
                     return Vec::new();
                 };
-                let slots: Vec<&Arc<AssocSlot>> =
-                    a.asps.iter().filter_map(|id| self.assocs.get(id)).collect();
-                let active: Vec<bool> = slots.iter().map(|s| s.is_carrying()).collect();
+                let slots = &a.members;
+                let active: Vec<bool> = (0..slots.len()).map(|i| a.carries(i)).collect();
                 choose(a.traffic_mode, &active, sls)
                     .into_iter()
                     .filter_map(|i| {
@@ -1009,6 +1336,171 @@ mtp3_routes:
         assert!(hint_rx.try_recv().is_err());
         r.manage(Input::LinkUp { link: 0 });
         assert_eq!(input_rx.try_recv().ok(), Some(Input::LinkUp { link: 0 }));
+    }
+
+    const SERVERS: &str = r#"
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: a, adaptation: m3ua, role: server, addrs: [192.0.2.1], port: 2905 }
+  - { id: b, adaptation: m3ua, role: client, addrs: [192.0.2.2], port: 2905, m3ua: { beat_ms: 500 } }
+  - { id: spare, adaptation: m3ua, role: server, addrs: [192.0.2.3], port: 2905 }
+  - { id: s, adaptation: sua, role: server, addrs: [192.0.2.4], port: 14001 }
+application_servers:
+  - { name: one, traffic_mode: loadshare, routing_context: 100, asps: [a, b], pending_queue: 2 }
+  - { name: two, traffic_mode: override, routing_context: 200, asps: [a] }
+  - { name: user, traffic_mode: override, routing_context: 300, asps: [s] }
+mtp3_routes:
+  - { dpc: 2000, as: one, priority: 1 }
+  - { dpc: 2000, as: two, priority: 2 }
+  - { dpc: 2100, as: user, priority: 1 }
+"#;
+
+    fn servers() -> Registry {
+        let cfg = Config::parse(SERVERS).expect("config parses");
+        Registry::build(&cfg, "default").expect("the default tenant")
+    }
+
+    #[test]
+    fn an_m3ua_association_knows_the_servers_it_is_configured_in() {
+        let r = servers();
+        let a = r.slot("a").unwrap();
+        assert_eq!(a.role, Role::Server);
+        assert_eq!(
+            a.memberships(),
+            [
+                Membership {
+                    server: 0,
+                    position: 0,
+                    context: 100,
+                    mode: TrafficMode::Loadshare
+                },
+                Membership {
+                    server: 1,
+                    position: 0,
+                    context: 200,
+                    mode: TrafficMode::Override
+                },
+            ]
+        );
+        let b = r.slot("b").unwrap();
+        assert_eq!((b.role, b.m3ua.beat_ms), (Role::Client, 500));
+        assert_eq!(b.memberships().len(), 1);
+        assert!(r.slot("spare").unwrap().memberships().is_empty());
+        // The numbering is that of ASP state maintenance.
+        let layout = Layout::build(
+            Config::parse(SERVERS).unwrap().default_tenant().unwrap(),
+            &Config::parse(SERVERS).unwrap().associations,
+        );
+        for (index, asp) in layout.asps.iter().enumerate() {
+            assert_eq!(
+                r.asp_slot(index).map(|s| s.id.as_str()),
+                Some(asp.name.as_str())
+            );
+        }
+        assert_eq!(layout.servers[0].asps, [0, 1]);
+        assert!(layout.servers[2].asps.is_empty(), "served over SUA");
+        assert!(r.slot("s").unwrap().asp.is_none());
+        assert_eq!(r.server(1), Some(("two", 200)));
+        assert_eq!(r.server_index("user"), Some(2));
+        assert_eq!(r.server_count(), 3);
+        // The servers that are a route to a destination.
+        assert_eq!(r.destinations().get(&2000), Some(&vec![0, 1]));
+    }
+
+    #[test]
+    fn traffic_is_admitted_by_the_server_of_its_routing_context() {
+        let r = servers();
+        let a = r.slot("a").unwrap();
+        // Active nowhere: whatever it names.
+        for context in [None, Some(100), Some(999)] {
+            assert_eq!(r.admits(a, context), Admission::NotActive);
+        }
+        r.set_asp_active(a, 0, true);
+        assert!(a.active.load(Ordering::Relaxed));
+        assert_eq!(r.admits(a, None), Admission::Active);
+        assert_eq!(r.admits(a, Some(100)), Admission::Active);
+        // Configured in the server of 200, not active in it.
+        assert_eq!(r.admits(a, Some(200)), Admission::NotActive);
+        assert_eq!(r.admits(a, Some(999)), Admission::Unconfigured);
+        // An association in no server is never active.
+        let spare = r.slot("spare").unwrap();
+        r.set_asp_active(spare, 0, true);
+        assert_eq!(r.admits(spare, None), Admission::NotActive);
+        r.set_asp_active(a, 0, false);
+        assert!(!a.active.load(Ordering::Relaxed));
+        assert_eq!(r.admits(a, Some(100)), Admission::NotActive);
+        // A server this domain does not have.
+        r.set_asp_active(a, 9, true);
+        assert_eq!(r.admits(a, None), Admission::NotActive);
+    }
+
+    #[test]
+    fn a_pending_server_queues_up_to_its_limit_and_hands_the_queue_over() {
+        let r = servers();
+        assert_eq!(r.server_state("one"), Some(AsState::Down));
+        assert_eq!(r.server_state("user"), None, "not served by M3UA ASPs");
+        // Not pending: nothing is queued.
+        assert!(!r.queue_if_pending("one", &msu(2000, 1)));
+        assert!(r.set_server_state(0, AsState::Active).is_empty());
+        assert!(!r.queue_if_pending("one", &msu(2000, 1)));
+
+        assert!(r.set_server_state(0, AsState::Pending).is_empty());
+        assert_eq!(r.server_state("one"), Some(AsState::Pending));
+        let full = metrics::m3ua_discards(M3uaDiscard::PendingFull);
+        for tag in 1..=3 {
+            assert!(r.queue_if_pending("one", &msu(2000, tag)), "taken");
+        }
+        assert!(metrics::m3ua_discards(M3uaDiscard::PendingFull) > full);
+        assert!(!r.queue_if_pending("two", &msu(2000, 9)), "another server");
+        assert!(!r.queue_if_pending("user", &msu(2100, 9)));
+        assert!(!r.queue_if_pending("no-such-server", &msu(2000, 9)));
+
+        let queued = r.set_server_state(0, AsState::Active);
+        let tags: Vec<u8> = queued.iter().map(|m| m.payload[0]).collect();
+        assert_eq!(tags, [1, 2], "the limit is two, in order");
+        assert!(r.set_server_state(0, AsState::Inactive).is_empty());
+        assert!(r.set_server_state(9, AsState::Active).is_empty());
+    }
+
+    #[test]
+    fn a_server_is_a_route_while_it_is_active_or_pending() {
+        let cfg = Config::parse(SERVERS).unwrap();
+        let r = Registry::build(&cfg, "default").unwrap();
+        let router = Router::new(&cfg);
+        router.reset_availability_down("default");
+        r.recompute(&router);
+        assert!(!router.is_reachable("default", 2000));
+        for (state, route) in [
+            (AsState::Inactive, false),
+            (AsState::Active, true),
+            (AsState::Pending, true),
+            (AsState::Down, false),
+        ] {
+            r.set_server_state(0, state);
+            r.recompute(&router);
+            assert_eq!(router.is_reachable("default", 2000), route, "{state:?}");
+        }
+        // Nobody has an association: nobody is selected, active or not.
+        r.set_asp_active(r.slot("a").unwrap(), 0, true);
+        assert!(r.active_asps(0).is_empty());
+        assert!(r.active_asps(9).is_empty());
+        assert!(r
+            .select(&Destination::ApplicationServer("one".into()), 0)
+            .is_empty());
+    }
+
+    #[test]
+    fn the_restart_is_followed_by_whoever_waits_for_it() {
+        let r = registry();
+        let mut restart = r.restart_changes();
+        assert!(!*restart.borrow_and_update());
+        r.set_restarting(true);
+        assert!(restart.has_changed().unwrap());
+        assert!(*restart.borrow_and_update());
+        r.set_restarting(false);
+        assert!(!*restart.borrow_and_update());
+        // No task serves requests in a registry without a transport.
+        assert!(r.layer.get().is_none());
     }
 
     #[test]

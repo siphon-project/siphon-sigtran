@@ -1,11 +1,7 @@
 //! The per-message pipeline: an inbound [`Msu`] becomes a routing decision and
 //! is acted on (forwarded to the resolved egress, delivered locally, or dropped
-//! with a logged reason). Plus the M3UA SSNM handler that folds DUNA/DAVA/DAUD
-//! into the router's route state.
+//! with a logged reason).
 
-use async_sctp::SctpAssociation;
-use m3ua::{M3uaMessage, MessageType};
-use mtp3::{Mtp3Event, PointCode};
 use sccp::{
     ExtendedUnitDataService, GlobalTitle, LongUnitDataService, ReturnCause, SccpMessage,
     UnitDataService,
@@ -17,7 +13,6 @@ use crate::admission::{self, Gate};
 use crate::config::Adaptation;
 use crate::isup::{IsupScreen, Screened};
 use crate::metrics::{self, AdmissionAction, LoopKind, Mtp3Discard};
-use crate::mtp3::management::Input;
 use crate::mtp3::route::Destination;
 use crate::routing::{Inbound, RouteDecision};
 use crate::sccp::gtt::GttSelector;
@@ -25,10 +20,11 @@ use crate::sccp::gtt::GttSelector;
 /// SCTP stream for M3UA management/data here (we use stream 1 for DATA and
 /// stream 0 for the ASPSM/SSNM control messages, matching the peers we drive).
 const M3UA_DATA_STREAM: u16 = 1;
-const M3UA_CTRL_STREAM: u16 = 0;
 const SUA_DATA_STREAM: u16 = 1;
 const PPID_M3UA: u32 = 3;
 const PPID_SUA: u32 = 4;
+/// The service indicator of signalling network management (Q.704 14.2.1).
+const SI_MANAGEMENT: u8 = 0;
 
 /// Build the router [`Inbound`] from an MSU. The DPC alone routes a transit MSU
 /// of any Service Indicator; only an SCCP MSU (`SI=3`) is decoded further so
@@ -587,9 +583,19 @@ async fn send_now(via: &Destination, msu: &Msu, registry: &Registry) {
         }
         return;
     }
+    // Signalling network management does not go to an ASP as DATA (RFC 4666
+    // 1.4.3.2): what has an M3UA message of its own is sent as that.
+    if msu.si == SI_MANAGEMENT {
+        super::m3ua::management_for_server(via.name(), msu, registry).await;
+        return;
+    }
     let selected = registry.select(via, msu.sls);
     if selected.is_empty() {
-        no_egress(via, msu);
+        // A server whose last active ASP just left is pending: its traffic
+        // waits for T(r) (RFC 4666 4.3.2).
+        if !registry.queue_if_pending(via.name(), msu) {
+            no_egress(via, msu);
+        }
         return;
     }
     for sel in selected {
@@ -734,106 +740,6 @@ pub(crate) fn send_on_link(slot: &super::registry::AssocSlot, msu: &Msu) {
             }
         }
         Err(e) => eprintln!("siphon-sigtran: m2pa framing failed: {e}"),
-    }
-}
-
-/// Whether an M3UA message type is an SSNM (SS7 network management) message the
-/// ASP/ASPSM state machine does not itself handle.
-pub fn is_ssnm(mt: MessageType) -> bool {
-    matches!(
-        mt,
-        MessageType::Duna
-            | MessageType::Dava
-            | MessageType::Daud
-            | MessageType::Scon
-            | MessageType::Dupu
-            | MessageType::Drst
-    )
-}
-
-/// Handle an inbound M3UA SSNM message: translate DUNA/DAVA to MTP3
-/// Pause/Resume, answer a DAUD audit from the live route state, and note SCON /
-/// DUPU. `reply` is the association to answer a DAUD on.
-pub async fn handle_ssnm(msg: &M3uaMessage, ctx: &TaskCtx, reply: &SctpAssociation) {
-    let variant = ctx.registry.variant();
-    let to_pc = |v: u32| PointCode::from_value(v, variant).ok();
-    match msg.message_type {
-        MessageType::Duna => {
-            for pc in msg.affected_point_codes() {
-                if let Some(p) = to_pc(pc) {
-                    ctx.router
-                        .apply_mtp3_event(&ctx.tenant, &Mtp3Event::Pause { affected: p });
-                    // Signalling route management announces it to the
-                    // adjacent points like any other inaccessibility.
-                    ctx.registry.manage(Input::Paused {
-                        dpc: pc,
-                        paused: true,
-                    });
-                }
-            }
-        }
-        MessageType::Dava | MessageType::Drst => {
-            for pc in msg.affected_point_codes() {
-                if let Some(p) = to_pc(pc) {
-                    ctx.router
-                        .apply_mtp3_event(&ctx.tenant, &Mtp3Event::Resume { affected: p });
-                    ctx.registry.manage(Input::Paused {
-                        dpc: pc,
-                        paused: false,
-                    });
-                }
-            }
-        }
-        MessageType::Daud => {
-            // Audit: answer DAVA for the point codes we can currently reach and
-            // DUNA for those we cannot, from the live route state.
-            let rc = msg.routing_context();
-            let (mut avail, mut unavail) = (Vec::new(), Vec::new());
-            for pc in msg.affected_point_codes() {
-                if ctx.router.is_reachable(&ctx.tenant, pc) {
-                    avail.push(pc);
-                } else {
-                    unavail.push(pc);
-                }
-            }
-            if !avail.is_empty() {
-                let _ = reply
-                    .send(
-                        &M3uaMessage::dava(rc, avail).encode(),
-                        M3UA_CTRL_STREAM,
-                        PPID_M3UA,
-                    )
-                    .await;
-            }
-            if !unavail.is_empty() {
-                let _ = reply
-                    .send(
-                        &M3uaMessage::duna(rc, unavail).encode(),
-                        M3UA_CTRL_STREAM,
-                        PPID_M3UA,
-                    )
-                    .await;
-            }
-        }
-        MessageType::Scon => {
-            // Congestion: fold in a level-1 status for each affected PC. (The
-            // detailed congestion level parameter is not parsed here yet.)
-            for pc in msg.affected_point_codes() {
-                if let Some(p) = to_pc(pc) {
-                    ctx.router.apply_mtp3_event(
-                        &ctx.tenant,
-                        &Mtp3Event::Status {
-                            affected: p,
-                            status: mtp3::Mtp3Status::Congested { level: 1 },
-                        },
-                    );
-                }
-            }
-        }
-        MessageType::Dupu => {
-            eprintln!("siphon-sigtran: DUPU (destination user part unavailable) noted");
-        }
-        _ => {}
     }
 }
 

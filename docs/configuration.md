@@ -104,6 +104,23 @@ The SCTP transport plane: one entry per association.
 | `port` | *(required)* | SCTP port. Convention: 2905 for M3UA, 3565 for M2PA. |
 | `adjacent_pc` | *(m2pa only)* | The adjacent point code reached directly over this link. An adjacent PC is an **implicit route**; it needs no `mtp3_routes` entry. |
 | `m2pa` | *(m2pa only)* every default below | Level 2 of the link: see [the `m2pa` block](#m2pa-link). |
+| `m3ua` | *(m3ua only)* every default below | The heartbeat and the acknowledgement timer of the peer: see [the `m3ua` block](#m3ua-peer). |
+
+An `m3ua` association carries traffic only as an ASP of an
+[application server](#application-servers). One that is in no server can come
+up and cannot become active: its ASP Active is answered with Error, "No
+Configured AS for ASP" (RFC 4666 3.8.1).
+
+### The `m3ua` block { #m3ua-peer }
+
+What RFC 4666 leaves to provisioning for one M3UA peer, on an `m3ua`
+association. The timers are in milliseconds.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `beat_ms` | `0` | T(beat) of RFC 4666 4.3.4.6: the interval at which this node sends Heartbeat. `0` sends none, which is the default because SCTP has a heartbeat of its own; set it to notice a peer whose process hangs while its SCTP stack still answers. When nothing at all arrives from the peer for twice the interval ("If no Heartbeat Ack message (or any other M3UA message) is received from the M3UA peer within 2*T(beat), the remote M3UA peer is considered unavailable") the association is aborted: for a `server` association the ASP is then down and may connect again, a `client` association is not dialled again by this release. A Heartbeat from the peer is always acknowledged with its data unchanged, whatever is set here. |
+| `ack_ms` | `2000` | T(ack) of RFC 4666 4.3.4.1 and 4.3.4.3 ("provisionable, with a default of 2 seconds"): on a `client` association, an ASP Up or ASP Active that is not acknowledged is sent again every `ack_ms`. Not `0`. |
+| `asp_id` | *(none)* | The ASP Identifier this node puts in its ASP Up on a `client` association (RFC 4666 3.5.1: "a unique value that is locally significant among the ASPs that support an AS"). Left out when not set. A gateway quotes it in the Notify that tells the other ASPs of a takeover or a failure. |
 
 ### The `m2pa` block { #m2pa-link }
 
@@ -145,6 +162,18 @@ ASPSM/ASPTM state machine brings it up.
 | `traffic_mode` | `loadshare` (SLS-keyed spread over the active ASPs), `override` (one active, others standby), or `broadcast` (every active ASP). An AS property, not per-ASP. |
 | `routing_context` | The Routing Context identifying this AS in ASPAC/DATA. |
 | `asps` | The member ASPs: association ids. Each must be an `m3ua` association. |
+| `recovery_ms` | T(r) of RFC 4666 4.3.2 and 4.3.4.4, in milliseconds, default `2000` (the RFC has it "configurable by the network operator" and names no value). When the last active ASP of the server leaves, the server is pending for this long: it stays a route, what arrives for it is queued, and the ASP that becomes active in time gets the queue. When the timer runs out the queue is discarded and the server is inactive or down. `0` switches the pending state off. Only a server this node is the signalling gateway of (one with a `server` association) is ever pending. |
+| `pending_queue` | Messages queued for the server while it is pending, default `4096`. Further ones are discarded and counted. Not `0`. |
+| `required_asps` | "n" of RFC 4666 4.3.2, default `1`: the number of ASPs that have to be active before the server is, and so before it is a route. Once active the server stays active until its last ASP leaves; while it has fewer than `required_asps` its inactive ASPs are told ("Insufficient ASP Resources Active in AS"). `1` for an `override` server, at most the number of `asps` otherwise. |
+
+The traffic mode and the routing context are enforced. An ASP Active that
+names a Traffic Mode Type other than the server's is answered with Error,
+"Unsupported Traffic Mode Type"; one that names a routing context the
+association is not configured in, with "Invalid Routing Context" (RFC 4666
+4.3.4.3, 3.8.1). The same goes for DATA: it is routed only from an ASP that is
+active in the server whose context it names, or in any server when it names
+none. In an `override` server the ASP that asks last takes all the traffic, and
+the one that had it is told ("Alternate ASP Active").
 
 ## `linksets` { #linksets }
 

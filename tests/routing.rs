@@ -730,9 +730,15 @@ async fn phase2_wire_local_termination_over_m3ua() {
 node: { point_code: 1000, variant: ITU, network_indicator: international }
 associations:
   - { id: in, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+application_servers:
+  - { name: ingress, traffic_mode: loadshare, routing_context: 1, asps: [in] }
 sccp:
   local_ssns: [8]
 "#;
+    // The association is in an application server, and the ASP names its
+    // routing context: RFC 4666 3.8.1 has "No Configured AS for ASP" for an
+    // ASP Active from an ASP that is configured in none, and "Invalid Routing
+    // Context" for "an invalid (unconfigured) Routing Context value".
     let cfg = Config::parse(yaml).expect("config parses");
     let router = Arc::new(Router::new(&cfg));
 
@@ -759,7 +765,7 @@ sccp:
         .await
         .expect("send ASP-UP");
     wait_for_m3ua(&asp, MessageType::AspUpAck).await;
-    asp.send(&M3uaMessage::asp_active(Some(2), Some(0)).encode(), 0, 3)
+    asp.send(&M3uaMessage::asp_active(Some(2), Some(1)).encode(), 0, 3)
         .await
         .expect("send ASP-ACTIVE");
     wait_for_m3ua(&asp, MessageType::AspActiveAck).await;
