@@ -7,6 +7,8 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-10-16
+
 ### Added
 
 - **An admission policy for new TCAP dialogues** (`admission` module,
