@@ -1850,6 +1850,23 @@ fn send_abort(abort: &Abort, a: &Addressing) -> Vec<Msu> {
     }
 }
 
+/// Answer a `Begin` the [admission policy](crate::admission) refused at this
+/// node with an Abort carrying the P-Abort cause "resource limitation" (Q.772
+/// 2.3.5), addressed back to the originator: the answer [`DialogueEngine`] gives
+/// a `Begin` over its `max_dialogues` ceiling. `None` when the inbound message is
+/// not a UDT (the only message the engine terminates) or the Abort cannot be
+/// built.
+pub(crate) fn refuse_begin(inbound: &Msu, otid: &[u8]) -> Option<Msu> {
+    let SccpMessage::Udt(udt) = SccpMessage::decode(&inbound.payload).ok()? else {
+        return None;
+    };
+    let reply_to = Addressing::reverse(&udt, inbound);
+    let abort = Abort::p_abort(otid.to_vec().into(), PAbortCause::RESOURCE_LIMITATION);
+    let frame = send_abort(&abort, &reply_to).pop()?;
+    metrics::abort(AbortSource::Local);
+    Some(frame)
+}
+
 /// The crate has no logging framework: the operator-facing log is stderr, and
 /// an error is marked as one.
 fn log_error(message: std::fmt::Arguments<'_>) {

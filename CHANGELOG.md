@@ -7,6 +7,20 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **An admission policy for new TCAP dialogues** (`admission` module,
+  `Router::with_admission_policy` / `set_admission_policy`,
+  `python::task_with_admission`). The embedding binary hands the router a Rust
+  function that sees each TCAP `Begin` and `Unidirectional` the node relays or
+  terminates and admits or refuses it; `Continue`, `End`, `Abort` and non-TCAP
+  traffic always pass. A refused message the node relays follows the SCCP
+  message return procedure (Q.714 4.2): a UDTS / XUDTS / LUDTS with return
+  cause "unqualified" by default when it asked to be returned on error, a
+  discard otherwise. A refused `Begin` for a local subsystem is answered with a
+  P-Abort "resource limitation". Counted in
+  `sigtran_admission_refused_total{reason,action}`. No policy set, no change.
+
 ## [3.0.0] — 2026-10-10
 
 ### Added

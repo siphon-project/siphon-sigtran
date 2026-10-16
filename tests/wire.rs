@@ -19,7 +19,10 @@
 //!   hop-counter guard on a GTT translation (decrement, then drop + XUDTS return),
 //! * a `sua` association starting, and a SUA CLDT routed via GTT to an egress AS
 //!   (the CLDT ⇄ SCCP-user bridge on both faces),
-//! * a tshark dissection gate over the forwarded frames (M3UA + M2PA, and SUA).
+//! * a tshark dissection gate over the forwarded frames (M3UA + M2PA, and SUA),
+//! * the admission policy for new dialogues: a refused Begin returned as a UDTS
+//!   (relay) or aborted (termination), a refused Begin without the return
+//!   option discarded, a Continue still relayed.
 //!
 //! Real SCTP is required; if a bind/connect fails (module not loaded, no
 //! privilege) the test prints a SKIP and passes. All data is synthetic: test
@@ -59,6 +62,7 @@ use tcap::{
     ReturnResultValue, TcapMessage,
 };
 
+use siphon_sigtran::admission::{Admission, DialogueKind, DialogueStart, RefuseCause};
 use siphon_sigtran::config::{Config, Tcap};
 use siphon_sigtran::dialogue::{
     Dialogue, DialogueEngine, IncomingOp, OutgoingBegin, PeerComponent, PeerTurn,
@@ -67,8 +71,11 @@ use siphon_sigtran::dialogue::{
 use siphon_sigtran::metrics::{self, LoopKind, ScreenReason};
 use siphon_sigtran::mtp3::route::Destination;
 use siphon_sigtran::routing::{Inbound, RouteDecision, Router};
+use siphon_sigtran::transport::Msu;
 use siphon_sigtran::transport::{next_status, Origination};
 use siphon_sigtran::TransportHandle;
+
+mod common;
 
 // ── Synthetic fixed parameters ───────────────────────────────────────────────
 
@@ -2828,4 +2835,265 @@ async fn wire_sua_cldt_dissects_clean_in_tshark() {
         proto_text.lines().any(|l| l.contains("sua")),
         "frame.protocols never reached sua: {proto_text}"
     );
+}
+
+// ── Admission of new dialogues ───────────────────────────────────────────────
+
+/// A policy that refuses every new dialogue, Begin and Unidirectional alike.
+fn refuse_new_dialogues(start: &DialogueStart<'_>) -> Admission {
+    match start.kind {
+        DialogueKind::Begin | DialogueKind::Unidirectional => {
+            Admission::Refuse(RefuseCause::new("wire-test"))
+        }
+    }
+}
+
+/// Start a node whose router carries [`refuse_new_dialogues`].
+async fn start_refusing_node(yaml: &str, what: &str) -> Option<TransportHandle> {
+    let cfg = Config::parse(yaml).expect("config parses");
+    let router = Arc::new(Router::new(&cfg).with_admission_policy(Arc::new(refuse_new_dialogues)));
+    match TransportHandle::start(&cfg, router).await {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("SKIP {what}: transport did not start ({e}); load `modprobe sctp`");
+            None
+        }
+    }
+}
+
+/// An SCCP UDT addressed by GT (prefix `1555`, which the GTT node translates to
+/// dpc 2000), with or without the "return message on error" option.
+fn udt_by_gt(tcap_bytes: &[u8], return_on_error: bool) -> Vec<u8> {
+    let gt = |digits: &str| GlobalTitle::Gt0100 {
+        translation_type: 0,
+        numbering_plan: 1,
+        encoding_scheme: 1,
+        nature_of_address: 4,
+        digits: digits.to_string(),
+    };
+    let mut udt = UnitData::new(
+        SccpAddress::with_gt(gt("15550142"), Some(SubsystemNumber::Hlr)),
+        SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Msc)),
+        tcap_bytes.to_vec(),
+    );
+    if return_on_error {
+        udt.message_handling = 0x8;
+    }
+    SccpMessage::Udt(udt).encode().expect("encode udt")
+}
+
+fn sri_sm_begin() -> Vec<u8> {
+    tcap_begin(
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        sri_sm_arg("15559999"),
+        &AC_SRI_SM,
+    )
+}
+
+/// The MSU an M3UA DATA frame carries.
+fn msu_of_m3ua(payload: &[u8]) -> Msu {
+    let msg = M3uaMessage::decode(payload).expect("decode m3ua");
+    let pd = msg.protocol_data().expect("protocol data");
+    Msu {
+        opc: pd.opc,
+        dpc: pd.dpc,
+        si: pd.si,
+        ni: pd.ni,
+        mp: pd.mp,
+        sls: pd.sls,
+        payload: pd.user_data.clone(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_admission_refuses_a_relayed_begin_and_relays_a_continue() {
+    use metrics::AdmissionAction;
+    let returned = metrics::admission_refusals("wire-test", AdmissionAction::Returned);
+    let discarded = metrics::admission_refusals("wire-test", AdmissionAction::Discarded);
+
+    let Some(handle) = start_refusing_node(GTT_NODE, "wire_admission_relay").await else {
+        return;
+    };
+    let ingress = handle.bound_addr("ingress").expect("ingress");
+    let hlr_a = handle.bound_addr("hlr-a").expect("hlr-a");
+    let (mut src, mut peer_a) = match (
+        AspPeer::connect(ingress, 0).await,
+        AspPeer::connect(hlr_a, 100).await,
+    ) {
+        (Some(s), Some(a)) => (s, a),
+        _ => {
+            eprintln!("SKIP wire_admission_relay: a peer connect failed");
+            return;
+        }
+    };
+    assert!(
+        wait_route(
+            handle.router(),
+            DPC_HLR,
+            &Destination::ApplicationServer("hlr".into())
+        )
+        .await,
+        "AS hlr never came up"
+    );
+
+    // 1. A Begin relayed on its global title, asking to be returned on error:
+    //    it comes back to the caller as a UDTS with the default cause, and the
+    //    HLR side never sees it.
+    src.send_in(&m3ua_sccp(
+        &udt_by_gt(&sri_sm_begin(), true),
+        OPC_UPSTREAM,
+        NODE_PC,
+        0,
+    ))
+    .await;
+    let ret = src.recv_out().await.expect("UDTS returned to the caller");
+    let ret = msu_of_m3ua(&ret);
+    assert_eq!((ret.opc, ret.dpc), (NODE_PC, OPC_UPSTREAM));
+    match SccpMessage::decode(&ret.payload).expect("decode return") {
+        SccpMessage::Udts(u) => {
+            assert_eq!(u.return_cause, ReturnCause::Unqualified);
+            assert_eq!(u.called_party.global_title.digits(), Some(OUR_GT));
+            assert_eq!(u.data, sri_sm_begin(), "the refused TCAP comes back whole");
+        }
+        other => panic!("expected a UDTS, got {other:?}"),
+    }
+    if let Some(wireshark) = common::dissect_unchecked(&[&ret]) {
+        wireshark
+            .clean()
+            .show("sccp.message_type", "0x0a")
+            .show("sccp.return_cause", "0x07")
+            .show("sccp.called.digits", OUR_GT);
+    }
+
+    // 2. A Begin addressed straight to the HLR's point code (MTP3 transfer)
+    //    is refused the same way.
+    src.send_in(&m3ua_sccp(
+        &udt_by_gt(&sri_sm_begin(), true),
+        OPC_UPSTREAM,
+        DPC_HLR,
+        0,
+    ))
+    .await;
+    let ret = msu_of_m3ua(&src.recv_out().await.expect("UDTS for the transfer"));
+    assert!(matches!(
+        SccpMessage::decode(&ret.payload),
+        Ok(SccpMessage::Udts(_))
+    ));
+
+    // 3. Without the return option the refused Begin is discarded.
+    src.send_in(&m3ua_sccp(
+        &udt_by_gt(&sri_sm_begin(), false),
+        OPC_UPSTREAM,
+        NODE_PC,
+        0,
+    ))
+    .await;
+    assert!(
+        src.drain(Duration::from_millis(400)).await.is_empty(),
+        "a refused Begin without the return option was answered"
+    );
+    assert!(
+        peer_a.drain(Duration::from_millis(100)).await.is_empty(),
+        "a refused Begin reached the HLR side"
+    );
+
+    // 4. A Continue belongs to a dialogue already admitted: it is relayed.
+    let cont = tcap_cont(
+        &[0x11, 0x22, 0x33, 0x44],
+        &[0x55, 0x66, 0x77, 0x88],
+        None,
+        vec![invoke_comp(
+            2,
+            gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+            None,
+        )],
+    );
+    src.send_in(&m3ua_sccp(
+        &udt_by_gt(&cont, true),
+        OPC_UPSTREAM,
+        NODE_PC,
+        0,
+    ))
+    .await;
+    let fwd = msu_of_m3ua(&peer_a.recv_out().await.expect("Continue relayed to hlr-a"));
+    assert_eq!(fwd.dpc, DPC_HLR);
+    match SccpMessage::decode(&fwd.payload).expect("decode relayed") {
+        SccpMessage::Udt(u) => assert_eq!(u.data, cont),
+        other => panic!("expected the relayed UDT, got {other:?}"),
+    }
+
+    assert_eq!(
+        metrics::admission_refusals("wire-test", AdmissionAction::Returned),
+        returned + 2
+    );
+    assert_eq!(
+        metrics::admission_refusals("wire-test", AdmissionAction::Discarded),
+        discarded + 1
+    );
+
+    src.close();
+    peer_a.close();
+    handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_admission_aborts_a_refused_begin_that_terminates_here() {
+    use metrics::AdmissionAction;
+    let aborted = metrics::admission_refusals("wire-test", AdmissionAction::Aborted);
+
+    let Some(mut handle) = start_refusing_node(TERMINATION_NODE, "wire_admission_abort").await
+    else {
+        return;
+    };
+    let mut engine = DialogueEngine::new(Tcap::default());
+    engine.register(
+        6,
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        Arc::new(WireHlr),
+    );
+    let engine = Arc::new(engine);
+    handle.serve_dialogues(engine.clone());
+
+    let ingress = handle.bound_addr("ingress").expect("ingress bound");
+    let Some(mut peer) = AspPeer::connect(ingress, 0).await else {
+        eprintln!("SKIP wire_admission_abort: ingress connect failed");
+        return;
+    };
+    sleep(Duration::from_millis(150)).await;
+
+    let sccp = sccp_udt_to_ssn(SubsystemNumber::Hlr, &sri_sm_begin());
+    peer.send_in(&m3ua_sccp(&sccp, OPC_UPSTREAM, NODE_PC, 0))
+        .await;
+
+    // The answer is a P-Abort "resource limitation" to the Begin's OTID, not
+    // the HLR's reply.
+    let reply = msu_of_m3ua(&peer.recv_out().await.expect("Abort back to the peer"));
+    let udt = match SccpMessage::decode(&reply.payload).expect("decode reply") {
+        SccpMessage::Udt(u) => u,
+        other => panic!("expected a UDT, got {other:?}"),
+    };
+    match tcap::decode(&udt.data).expect("decode tcap") {
+        TcapMessage::Abort(a) => {
+            assert_eq!(a.dtid.to_vec(), vec![0x11, 0x22, 0x33, 0x44]);
+            assert_eq!(
+                a.p_abort_cause(),
+                Some(tcap::PAbortCause::RESOURCE_LIMITATION)
+            );
+        }
+        other => panic!("expected an Abort, got {other}"),
+    }
+    if let Some(wireshark) = common::dissect_unchecked(&[&reply]) {
+        wireshark
+            .clean()
+            .show("tcap.dtid", "11:22:33:44")
+            .label("tcap.p_abortCause", "resourceLimitation");
+    }
+    assert_eq!(engine.open_dialogues(), 0, "no dialogue was opened");
+    assert_eq!(
+        metrics::admission_refusals("wire-test", AdmissionAction::Aborted),
+        aborted + 1
+    );
+
+    peer.close();
+    handle.shutdown();
 }

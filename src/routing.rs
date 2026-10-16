@@ -19,6 +19,9 @@
 //!
 //! The router is **synchronous and allocation-light**, the line-rate guarantee.
 
+use std::sync::Arc;
+
+use crate::admission::AdmissionPolicy;
 use crate::content::{Action, MapView};
 use crate::mtp3::route::Destination;
 use crate::sccp::gtt::{GttResult, GttSelector};
@@ -88,23 +91,54 @@ pub struct Inbound {
 }
 
 /// The top-level router. Holds the compiled [`Tenancy`] and resolves inbound
-/// messages against a chosen tenant.
-#[derive(Debug)]
+/// messages against a chosen tenant, plus the optional
+/// [admission policy](crate::admission) for new dialogues.
 pub struct Router {
     tenancy: Tenancy,
+    admission: Option<Arc<dyn AdmissionPolicy>>,
+}
+
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("tenancy", &self.tenancy)
+            .field("admission_policy", &self.admission.is_some())
+            .finish()
+    }
 }
 
 impl Router {
     /// Build a router from a validated [`Config`](crate::config::Config).
     pub fn new(config: &crate::config::Config) -> Self {
-        Self {
-            tenancy: Tenancy::build(config),
-        }
+        Self::from_tenancy(Tenancy::build(config))
     }
 
     /// Build directly from a compiled [`Tenancy`].
     pub fn from_tenancy(tenancy: Tenancy) -> Self {
-        Self { tenancy }
+        Self {
+            tenancy,
+            admission: None,
+        }
+    }
+
+    /// Set the [admission policy](crate::admission) the transport puts every
+    /// dialogue-starting message (TCAP `Begin` / `Unidirectional`) to, in
+    /// builder form. Without one, every dialogue is admitted.
+    pub fn with_admission_policy(mut self, policy: Arc<dyn AdmissionPolicy>) -> Self {
+        self.admission = Some(policy);
+        self
+    }
+
+    /// Set or clear the [admission policy](crate::admission). Set it before the
+    /// router is shared with the transport; a policy that must change its mind
+    /// at run time holds that state itself.
+    pub fn set_admission_policy(&mut self, policy: Option<Arc<dyn AdmissionPolicy>>) {
+        self.admission = policy;
+    }
+
+    /// The admission policy, if one is set.
+    pub fn admission_policy(&self) -> Option<&Arc<dyn AdmissionPolicy>> {
+        self.admission.as_ref()
     }
 
     /// The compiled tenancy (read-only).
