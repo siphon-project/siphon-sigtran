@@ -7,6 +7,8 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [4.0.0] — 2026-10-16
+
 ### Changed
 
 - **`sigtran.yaml` is parsed by `serde-saphyr`** (YAML 1.2, safe Rust) instead
