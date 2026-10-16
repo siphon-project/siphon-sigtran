@@ -53,7 +53,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use siphon::script::ScriptHandle;
 
-use crate::config::{Config, ContentRule, GttRule, DEFAULT_TENANT};
+use crate::config::{from_yaml, Config, ContentRule, GttRule, DEFAULT_TENANT};
 use crate::content::{ContentEngine, Operation};
 use crate::dialogue::{
     CloseReason, Dialogue as CoreDialogue, DialogueClosed, DialogueEngine,
@@ -219,52 +219,86 @@ fn config_from_source(source: &Bound<'_, PyAny>) -> PyResult<Config> {
         }
         return Config::parse(&s).map_err(err);
     }
-    // A dict (or any object): serialise to YAML via a serde_yaml::Value bridge.
-    let value = py_to_yaml(source)?;
-    let text = serde_yaml::to_string(&value).map_err(err)?;
+    // A dict (or any object): render it as YAML and parse that, so a dict and
+    // a file go through the one schema and the one parser.
+    let mut text = String::new();
+    py_to_yaml(source, &mut text)?;
     Config::parse(&text).map_err(err)
 }
 
-/// Convert a Python value (dict / list / scalar) into a `serde_yaml::Value` so
-/// the typed config deserialiser can validate it: one schema, no hand-mapping.
-fn py_to_yaml(obj: &Bound<'_, PyAny>) -> PyResult<serde_yaml::Value> {
+/// Render a Python value (dict / list / scalar) as YAML flow text (the JSON
+/// subset of YAML) so the typed config deserialiser validates it: one schema,
+/// no hand-mapping. A Python `str` is always written double-quoted, so it stays
+/// a string whatever it spells (`"001"`, `"true"`, `"1e3"`).
+fn py_to_yaml(obj: &Bound<'_, PyAny>, out: &mut String) -> PyResult<()> {
     use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
-    use serde_yaml::Value;
+    use std::fmt::Write as _;
 
     if obj.is_none() {
-        return Ok(Value::Null);
-    }
-    if let Ok(b) = obj.cast::<PyBool>() {
-        return Ok(Value::Bool(b.is_true()));
-    }
-    if let Ok(s) = obj.cast::<PyString>() {
-        return Ok(Value::String(s.extract::<String>()?));
-    }
-    if let Ok(i) = obj.cast::<PyInt>() {
-        return Ok(Value::Number(i.extract::<i64>()?.into()));
-    }
-    if let Ok(f) = obj.cast::<PyFloat>() {
-        return Ok(Value::Number(f.extract::<f64>()?.into()));
-    }
-    if let Ok(list) = obj.cast::<PyList>() {
-        let mut seq = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            seq.push(py_to_yaml(&item)?);
+        out.push_str("null");
+    } else if let Ok(b) = obj.cast::<PyBool>() {
+        out.push_str(if b.is_true() { "true" } else { "false" });
+    } else if let Ok(s) = obj.cast::<PyString>() {
+        push_yaml_str(&s.extract::<String>()?, out);
+    } else if let Ok(i) = obj.cast::<PyInt>() {
+        let _ = write!(out, "{}", i.extract::<i64>()?);
+    } else if let Ok(f) = obj.cast::<PyFloat>() {
+        let f = f.extract::<f64>()?;
+        if f.is_nan() {
+            out.push_str(".nan");
+        } else if f.is_infinite() {
+            out.push_str(if f > 0.0 { ".inf" } else { "-.inf" });
+        } else {
+            // `{:?}` keeps a fractional part (`2905.0`), so a float stays a float.
+            let _ = write!(out, "{f:?}");
         }
-        return Ok(Value::Sequence(seq));
-    }
-    if let Ok(dict) = obj.cast::<PyDict>() {
-        let mut map = serde_yaml::Mapping::new();
-        for (k, v) in dict.iter() {
-            let key = Value::String(k.str()?.extract::<String>()?);
-            map.insert(key, py_to_yaml(&v)?);
+    } else if let Ok(list) = obj.cast::<PyList>() {
+        out.push('[');
+        for (index, item) in list.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            py_to_yaml(&item, out)?;
         }
-        return Ok(Value::Mapping(map));
+        out.push(']');
+    } else if let Ok(dict) = obj.cast::<PyDict>() {
+        out.push('{');
+        for (index, (k, v)) in dict.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            push_yaml_str(&k.str()?.extract::<String>()?, out);
+            out.push_str(": ");
+            py_to_yaml(&v, out)?;
+        }
+        out.push('}');
+    } else {
+        return Err(err(format!(
+            "cannot convert {} to a config value",
+            obj.get_type().name()?
+        )));
     }
-    Err(err(format!(
-        "cannot convert {} to a config value",
-        obj.get_type().name()?
-    )))
+    Ok(())
+}
+
+/// Write `s` as a YAML double-quoted scalar: `"` and `\` escaped, and every
+/// character YAML does not allow raw (C0/C1 controls, DEL, the BOM, the line
+/// and paragraph separators, all in the BMP) as a `\uXXXX` escape.
+fn push_yaml_str(s: &str, out: &mut String) {
+    use std::fmt::Write as _;
+
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() || matches!(c, '\u{feff}' | '\u{2028}' | '\u{2029}') => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 // ── Global titles / addresses ────────────────────────────────────────────────
@@ -2118,10 +2152,12 @@ impl Gtt {
     /// `to={"dpc": 2000, "ssn": 6}` (or `{"group": "..."}` / `{"local": true}`).
     #[pyo3(signature = (*, r#match, to))]
     fn add(&self, r#match: &Bound<'_, PyAny>, to: &Bound<'_, PyAny>) -> PyResult<()> {
-        let mut m = serde_yaml::Mapping::new();
-        m.insert("match".into(), py_to_yaml(r#match)?);
-        m.insert("to".into(), py_to_yaml(to)?);
-        let rule: GttRule = serde_yaml::from_value(serde_yaml::Value::Mapping(m)).map_err(err)?;
+        let mut yaml = String::from("{match: ");
+        py_to_yaml(r#match, &mut yaml)?;
+        yaml.push_str(", to: ");
+        py_to_yaml(to, &mut yaml)?;
+        yaml.push('}');
+        let rule: GttRule = from_yaml(&yaml).map_err(err)?;
         self.push_rule(rule)
     }
 
@@ -2132,8 +2168,10 @@ impl Gtt {
 
 impl Gtt {
     fn add_prefix(&self, gt: &str, dpc: u32, ssn: u8) -> PyResult<()> {
-        let yaml = format!("match: {{ gt_prefix: \"{gt}\" }}\nto: {{ dpc: {dpc}, ssn: {ssn} }}\n");
-        let rule: GttRule = serde_yaml::from_str(&yaml).map_err(err)?;
+        let mut yaml = String::from("{match: {gt_prefix: ");
+        push_yaml_str(gt, &mut yaml);
+        yaml.push_str(&format!("}}, to: {{dpc: {dpc}, ssn: {ssn}}}}}"));
+        let rule: GttRule = from_yaml(&yaml).map_err(err)?;
         self.push_rule(rule)
     }
 
@@ -2165,12 +2203,14 @@ impl Content {
         r#match: &Bound<'_, PyAny>,
         action: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let mut m = serde_yaml::Mapping::new();
-        m.insert("name".into(), name.into());
-        m.insert("match".into(), py_to_yaml(r#match)?);
-        m.insert("action".into(), py_to_yaml(action)?);
-        let rule: ContentRule =
-            serde_yaml::from_value(serde_yaml::Value::Mapping(m)).map_err(err)?;
+        let mut yaml = String::from("{name: ");
+        push_yaml_str(name, &mut yaml);
+        yaml.push_str(", match: ");
+        py_to_yaml(r#match, &mut yaml)?;
+        yaml.push_str(", action: ");
+        py_to_yaml(action, &mut yaml)?;
+        yaml.push('}');
+        let rule: ContentRule = from_yaml(&yaml).map_err(err)?;
         with_content(|c| c.add_rule(&rule))
     }
 

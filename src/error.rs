@@ -17,7 +17,7 @@ pub enum Error {
 
     /// The YAML did not parse into the config model.
     #[error("parsing config: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_saphyr::Error),
 
     /// A point-code string in the config was malformed for its variant.
     #[error("invalid point code: {0}")]
