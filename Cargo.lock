@@ -3155,6 +3155,7 @@ dependencies = [
  "sccp",
  "serde",
  "serde-saphyr",
+ "serde_path_to_error",
  "siphon-sip",
  "sua",
  "tcap",
