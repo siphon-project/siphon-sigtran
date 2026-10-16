@@ -3017,19 +3017,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml_ng"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3127,9 +3114,9 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.12.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "279bec1d5ed7145bd088b9e30f4c0bbb7a9dcacb2dda650ec612a737ef7e8e23"
+checksum = "0bfffb7a6d46faf2b0f99ecf3f3f727180ff78d1bede52c6a801e3180a713a80"
 dependencies = [
  "serde",
  "serde_json",
@@ -3166,7 +3153,7 @@ dependencies = [
 [[package]]
 name = "siphon-sip"
 version = "1.13.1"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#e9066dd2ed324ea1feaa54ec97de1a4eb3768300"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#9e3dc4260269a1698989dd9f49ca450ed21872b2"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3204,8 +3191,9 @@ dependencies = [
  "reqwest",
  "rustls-pki-types",
  "serde",
+ "serde-saphyr",
  "serde_json",
- "serde_yaml_ng",
+ "serde_path_to_error",
  "sha2 0.11.0",
  "siphon-rtp-proto",
  "socket2",
@@ -3938,12 +3926,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
-
-[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3951,9 +3933,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "uppsala"
-version = "0.10.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a27f7d40a93824eefcf6b62fd2fa86bca9ea6a5825de56b4aa9a5ed7804b766c"
+checksum = "717b252544d044a701181a32cf7ff443b86603acf99faf8d45e14b20a8c769be"
 
 [[package]]
 name = "url"
