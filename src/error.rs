@@ -16,8 +16,15 @@ pub enum Error {
     },
 
     /// The YAML did not parse into the config model.
-    #[error("parsing config: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    #[error("parsing config: {}{source}", key_path_prefix(path))]
+    Yaml {
+        /// The key path the error happened at (`sccp.gtt[0].to.dpc`); empty
+        /// when it is the document itself, or the YAML did not parse at all.
+        path: String,
+        /// The parser's error, with the line, column and a source snippet.
+        /// Boxed: it is large, and every `Result` in the crate carries it.
+        source: Box<serde_saphyr::Error>,
+    },
 
     /// A point-code string in the config was malformed for its variant.
     #[error("invalid point code: {0}")]
@@ -27,6 +34,15 @@ pub enum Error {
     /// a dangling reference, a duplicate name, an empty required set, and so on.
     #[error("invalid config: {0}")]
     Validation(String),
+}
+
+/// `path: ` ahead of the parser's message, or nothing at the document root.
+fn key_path_prefix(path: &str) -> String {
+    if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}: ")
+    }
 }
 
 /// Convenience alias for results in this crate.

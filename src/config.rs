@@ -21,6 +21,35 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::point_code::{PointCode, RawPc, Variant};
 
+/// Deserialize YAML into a config type: the one parser entry point for the file
+/// and for the rules a script programs live.
+///
+/// YAML 1.2 core schema, with booleans held to the exact `true` / `false`: a
+/// YAML 1.1 spelling (`yes`, `on`, ...) is not a boolean, so a `screen: yes`
+/// is refused as before rather than quietly read as `true`.
+///
+/// An error names the key path it happened at as well as the line and column.
+pub(crate) fn from_yaml<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
+    let mut path = String::new();
+    serde_saphyr::with_deserializer_from_str_with_options(
+        text,
+        serde_saphyr::options! { strict_booleans: true },
+        |deserializer| {
+            serde_path_to_error::deserialize(deserializer).map_err(|e| {
+                // The root displays as "."; keep only a real key path.
+                if e.path().iter().next().is_some() {
+                    path = e.path().to_string();
+                }
+                e.into_inner()
+            })
+        },
+    )
+    .map_err(|source| Error::Yaml {
+        path,
+        source: Box::new(source),
+    })
+}
+
 /// The name that keys the implicit single-tenant instance.
 pub const DEFAULT_TENANT: &str = "default";
 
@@ -648,7 +677,7 @@ impl Config {
 
     /// Parse and validate a `sigtran.yaml` from a string (the testable core).
     pub fn parse(text: &str) -> Result<Self> {
-        let raw: RawFile = serde_yaml::from_str(text)?;
+        let raw: RawFile = from_yaml(text)?;
         let config = Self::from_raw(raw)?;
         config.validate()?;
         Ok(config)
@@ -1536,5 +1565,72 @@ tenants:
 "#;
         let err = Config::parse(yaml).unwrap_err();
         assert!(err.to_string().contains("cannot be mixed"));
+    }
+
+    /// A config with one content rule whose `screen:` is written as `value`.
+    fn with_screen(value: &str) -> String {
+        format!(
+            "node: {{ point_code: 1000, variant: itu }}\n\
+             content_routing:\n  \
+               protocol: gsm-map\n  \
+               rules:\n    \
+                 - {{ name: r, match: {{ operation: sri-sm }}, action: {{ screen: {value} }} }}\n"
+        )
+    }
+
+    #[test]
+    fn booleans_are_only_true_and_false() {
+        for value in ["true", "false"] {
+            Config::parse(&with_screen(value)).unwrap();
+        }
+        // YAML 1.1 spellings are strings in YAML 1.2, not booleans.
+        for value in ["yes", "no", "on", "off", "y", "n"] {
+            let err = Config::parse(&with_screen(value)).unwrap_err();
+            assert!(
+                matches!(err, Error::Yaml { .. }),
+                "`screen: {value}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_and_plain_digit_strings_keep_their_leading_zeros() {
+        let yaml = r#"
+node: { point_code: 1000, variant: itu }
+sccp:
+  gt_conversion:
+    plmn_map:
+      - { mcc: "001", mnc: 01, e164_prefix: "15551" }
+"#;
+        let config = Config::parse(yaml).unwrap();
+        let entry = &config.tenants[DEFAULT_TENANT].sccp.gt_conversion.plmn_map[0];
+        assert_eq!((entry.mcc.as_str(), entry.mnc.as_str()), ("001", "01"));
+    }
+
+    #[test]
+    fn rejects_duplicate_keys_and_extra_documents() {
+        let duplicate =
+            "node: { point_code: 1000, variant: itu }\nnode: { point_code: 1001, variant: itu }\n";
+        assert!(matches!(Config::parse(duplicate), Err(Error::Yaml { .. })));
+        let two_documents = "node: { point_code: 1000, variant: itu }\n---\nnode: { point_code: 1001, variant: itu }\n";
+        assert!(matches!(
+            Config::parse(two_documents),
+            Err(Error::Yaml { .. })
+        ));
+    }
+
+    #[test]
+    fn a_type_error_names_the_key_path_and_the_line() {
+        let err = Config::parse(&with_screen("yes")).unwrap_err();
+        let Error::Yaml { path, .. } = &err else {
+            panic!("expected a YAML error, got {err}");
+        };
+        assert_eq!(path, "content_routing.rules[0].action.screen");
+        let message = err.to_string();
+        assert!(
+            message.contains("content_routing.rules[0].action.screen: ")
+                && message.contains("line 5"),
+            "{message}"
+        );
     }
 }

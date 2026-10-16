@@ -90,6 +90,15 @@ try:
     raise AssertionError("expected SigtranError for a malformed GTT match")
 except siphon.SigtranError:
     pass
+# `yes` is a string, not a boolean: the rule is refused rather than read as true.
+try:
+    ss7.content.add_rule(name="yes-is-a-string", match={"operation": "sri-sm"}, action={"screen": "yes"})
+    raise AssertionError("expected SigtranError for screen='yes'")
+except siphon.SigtranError:
+    pass
+# Quotes and backslashes in a script-supplied string reach the parser intact.
+ss7.content.add_rule(name='quoted "name" \\ here', match={"imsi_prefix": "00101"}, action={"screen": True})
+ss7.routes.cache('1555"04', dpc=2006, ssn=6)
 
 # ── A MO-ForwardSM Begin driven through the engine reaches the handler ────────
 replied = {}
@@ -712,6 +721,22 @@ except siphon.SigtranError:
 try:
     gsm_map.on_operation("mo-forward-sm|bogus")
     raise AssertionError("expected SigtranError for an unknown operation in an alternation")
+except siphon.SigtranError:
+    pass
+
+# ── configure also takes a dict mirroring the file (last: it replaces the node) ─
+DICT_CONFIG = {
+    "node": {"point_code": 1000, "variant": "itu"},
+    "associations": [{"id": "hlr-a", "adaptation": "m3ua", "role": "server", "addrs": ["10.1.0.10"], "port": 2905}],
+    "application_servers": [{"name": "hlr", "traffic_mode": "override", "routing_context": 100, "asps": ["hlr-a"]}],
+    "mtp3_routes": [{"dpc": 2000, "as": "hlr", "priority": 1}],
+    "sccp": {"local_ssns": [6, 8], "gt_conversion": {"plmn_map": [{"mcc": "001", "mnc": "01", "e164_prefix": "15551"}]}},
+}
+siphon.configure(DICT_CONFIG)
+assert "default" in ss7.tenants
+try:
+    siphon.configure({**DICT_CONFIG, "node": {"point_code": 1000, "variant": "itu", "network_indicator": None}})
+    raise AssertionError("expected SigtranError for a null network indicator")
 except siphon.SigtranError:
     pass
 "#;

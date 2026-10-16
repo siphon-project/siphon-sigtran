@@ -31,11 +31,6 @@ ignore = [
     # build never pulls it. Nothing to fix in this tree, so revisit when
     # tikv-jemalloc-ctl drops it.
     "RUSTSEC-2024-0436",
-    # unsafe-libyaml is unmaintained (archived upstream), not a vulnerability.
-    # It is reached through serde_yaml here and through serde_yaml_ng in
-    # siphon-sip, so dropping it takes a YAML parser change in both crates.
-    # Revisit when the config moves to a parser written in safe Rust.
-    "RUSTSEC-2024-0449",
 ]
 
 [bans]

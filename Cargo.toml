@@ -59,7 +59,12 @@ rasn = "0.28"
 
 # ── config + errors ─────────────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+# YAML 1.2 in safe Rust (no C or c2rust parser underneath). Deserialize only:
+# the crate reads sigtran.yaml, it never writes YAML.
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
+# Records the key path (`sccp.gtt[0].to.dpc`) a deserialize error happened at;
+# serde-saphyr itself reports only the line and column.
+serde_path_to_error = "0.1.20"
 thiserror = "2"
 
 # ── async runtime (phase-2 transport; the routing brain itself is sync) ──────

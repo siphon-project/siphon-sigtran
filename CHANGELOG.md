@@ -7,6 +7,27 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`sigtran.yaml` is parsed by `serde-saphyr`** (YAML 1.2, safe Rust) instead
+  of the deprecated `serde_yaml`, which sat on the unmaintained c2rust
+  `unsafe-libyaml` (RUSTSEC-2024-0449). Breaking for Rust callers that match on
+  it: `Error::Yaml` is now `Error::Yaml { path, source }`, the key path
+  (`sccp.gtt[0].to.dpc`) and a boxed `serde_saphyr::Error`, and its message gives the
+  path, the line and column, and a snippet of the offending line. Every config that loaded before loads to the same `Config`. Booleans
+  stay `true` / `false` only (`screen: yes` is still refused), and duplicate keys
+  and a second YAML document are still refused. Some inputs that were refused
+  now load: a quoted number for a numeric field (`point_code: "1000"`), `1_000`,
+  a `~` list read as empty, `<<` merge keys, a leading byte-order mark, and an
+  unquoted `::1` in a flow list. Script-supplied values (`configure(dict)`,
+  `ss7.gtt.add`, `ss7.content.add_rule`) go through the same parser, so an
+  integer given for a string field (`gt_prefix=1555`) is now taken as its digits.
+
+### Fixed
+
+- `ss7.routes.cache` no longer fails on a global title holding a `"`: the value
+  was pasted into YAML unescaped.
+
 ## [3.1.0] — 2026-10-16
 
 ### Added

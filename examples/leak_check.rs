@@ -5,7 +5,7 @@
 //! exact, so a real leak shows up as monotonic growth. Two phases:
 //!
 //!   1. **config** parse + validate a full single-tenant `sigtran.yaml` over and
-//!      over (the serde_yaml + validation + table-compile path).
+//!      over (the YAML + validation + table-compile path).
 //!   2. **route** build a `Router` once, then churn resolutions: an MTP3 transit
 //!      transfer, an SCCP GTT lookup, and a content-rule match, each cloning the
 //!      small `Inbound`/decision structs.
