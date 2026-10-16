@@ -94,6 +94,54 @@ SCCP-layer complement on the GTT relay path. Because they run on the transit
 path, they cost nothing on the normal case and show up on a graph when a route
 table is wrong.
 
+## Admission of new dialogues { #admission }
+
+A composing binary can set an admission policy on the router: a Rust function
+that sees each **new** TCAP dialogue the node relays or terminates and admits
+or refuses it. It runs on the per-message path in Rust, never in Python. With
+no policy set, everything is admitted.
+
+```rust
+use std::sync::Arc;
+use siphon_sigtran::admission::{Admission, DialogueStart, RefuseCause};
+
+let router = Router::new(&cfg).with_admission_policy(Arc::new(
+    |start: &DialogueStart<'_>| {
+        if accepting() {
+            Admission::Admit
+        } else {
+            Admission::Refuse(RefuseCause::new("closed"))
+        }
+    },
+));
+```
+
+(`siphon_sigtran::python::task_with_admission(cfg, policy)` is the same for the
+addon's runtime task.) The policy is shown the TCAP message type, the calling
+and called party (global title, SSN, point code), the MTP3 OPC/DPC, the
+application context name when the dialogue portion carries one, the routing
+domain, and whether the dialogue terminates at this node.
+
+Only a TCAP `Begin` or `Unidirectional` is put to the policy. `Continue`,
+`End` and `Abort` belong to a dialogue that was already admitted and always
+pass, so a relaying node needs no dialogue state. Non-TCAP SCCP traffic (SCCP
+management among it) and every other Service Indicator always pass.
+
+What a refusal does:
+
+- **Relayed** (MTP3 transfer of an SCCP message, or GTT to another point
+  code): the SCCP message return procedure (ITU-T Q.714 4.2). With the "return
+  message on error" option set, the caller gets a UDTS / XUDTS / LUDTS with
+  return cause "unqualified" (Q.713 3.12, `0x07`); `RefuseCause::with_return_cause`
+  picks another. Without the option the message is discarded.
+- **Terminated here**: a `Begin` is answered with an Abort, P-Abort cause
+  "resource limitation" (Q.773, Q.772 2.3.5), as for a `Begin` over the
+  `max_dialogues` ceiling. A `Unidirectional` has no transaction to abort and
+  is discarded.
+
+Every refusal is counted in `sigtran_admission_refused_total{reason,action}`,
+`action` being `returned`, `discarded` or `aborted`, and logged on stderr.
+
 ## MAP/CAP operations { #operations }
 
 The operation names a content rule can match (`operation:`), and the
@@ -175,6 +223,7 @@ call. The families:
 | `sigtran_rx_discarded_total` | counter | `reason` |
 | `sigtran_loops_detected_total` | counter | `kind` |
 | `sigtran_isup_screened_total` | counter | `reason` |
+| `sigtran_admission_refused_total` | counter | `reason`, `action` |
 
 `sigtran_rx_discarded_total` counts what an association received and dropped
 before routing: `ppid` (not the adaptation layer's payload protocol identifier),

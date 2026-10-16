@@ -38,6 +38,8 @@
 //! - [`tenant`]: the tenancy model (implicit default).
 //! - [`routing`]: the shared [`RouteDecision`](routing::RouteDecision) type plus
 //!   the top-level [`Router`](routing::Router) that ties the layers together.
+//! - [`admission`]: an optional policy, set on the router, that admits or
+//!   refuses each new TCAP dialogue the node relays or terminates.
 //!
 //! All of that is pure Rust, synchronous, no I/O. That is the line-rate routing
 //! guarantee. It is unit- and integration-tested against genuinely assembled
@@ -104,6 +106,7 @@
 
 #![warn(missing_docs)]
 
+pub mod admission;
 pub mod config;
 pub mod content;
 pub mod dialogue;

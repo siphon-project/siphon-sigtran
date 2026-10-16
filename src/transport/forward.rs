@@ -13,9 +13,10 @@ use sccp::{
 
 use super::framing::{self, Msu};
 use super::{LocalDelivery, Registry, TaskCtx};
+use crate::admission::{self, Gate};
 use crate::config::Adaptation;
 use crate::isup::{IsupScreen, Screened};
-use crate::metrics::{self, LoopKind};
+use crate::metrics::{self, AdmissionAction, LoopKind};
 use crate::mtp3::route::Destination;
 use crate::routing::{Inbound, RouteDecision};
 use crate::sccp::gtt::GttSelector;
@@ -189,6 +190,9 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
                 loop_reflect(&via, &msu, inbound_assoc);
                 return;
             }
+            if refused_by_admission(&msu, ctx, inbound_assoc, inbound_src.as_ref(), false).await {
+                return;
+            }
             send_via(&via, &msu, &ctx.registry).await
         }
         RouteDecision::RouteTo {
@@ -199,6 +203,9 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
         } => {
             if is_reflection(inbound_src.as_ref(), &via) {
                 loop_reflect(&via, &msu, inbound_assoc);
+                return;
+            }
+            if refused_by_admission(&msu, ctx, inbound_assoc, inbound_src.as_ref(), false).await {
                 return;
             }
             // A GTT / content result to a concrete DPC is an SCCP relay point, so
@@ -230,6 +237,9 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
             return_undeliverable(&msu, ReturnCause::MtpFailure, ctx, inbound_src.as_ref()).await;
         }
         RouteDecision::Local => {
+            if refused_by_admission(&msu, ctx, inbound_assoc, inbound_src.as_ref(), true).await {
+                return;
+            }
             // Local termination: hand the MSU (and the association it arrived on,
             // for the reply path) to the dialogue SAP over the local-delivery
             // channel.
@@ -259,6 +269,67 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
             .await;
         }
     }
+}
+
+/// Put a routed message to the router's [admission policy](crate::admission),
+/// if one is set. Returns `true` when the policy refused a new dialogue: the
+/// message has then been answered or discarded, counted, and logged, and must
+/// not be forwarded or delivered.
+///
+/// A relaying node (`terminates_here == false`) follows the SCCP message return
+/// procedure (Q.714 4.2): a return carrying the refusal's return cause when the
+/// message asked to be returned on error, a discard otherwise. A terminating
+/// node answers a `Begin` with a P-Abort "resource limitation" over the
+/// association it arrived on, and discards a `Unidirectional` (no transaction
+/// to abort).
+async fn refused_by_admission(
+    msu: &Msu,
+    ctx: &TaskCtx,
+    inbound_assoc: &str,
+    inbound_src: Option<&Destination>,
+    terminates_here: bool,
+) -> bool {
+    let Some(policy) = ctx.router.admission_policy() else {
+        return false;
+    };
+    let refusal = match admission::check(policy.as_ref(), msu, &ctx.tenant, terminates_here) {
+        Gate::Pass => return false,
+        Gate::Refused(refusal) => refusal,
+    };
+
+    let action = if terminates_here {
+        let abort = refusal
+            .otid
+            .as_deref()
+            .and_then(|otid| crate::dialogue::refuse_begin(msu, otid));
+        match abort {
+            Some(abort) => {
+                super::send_reply(&ctx.registry, inbound_assoc, &abort).await;
+                AdmissionAction::Aborted
+            }
+            None => AdmissionAction::Discarded,
+        }
+    } else {
+        let our_pc = ctx.router.node_point_code(&ctx.tenant);
+        let ret = sccp_return(msu, &refusal.sccp, refusal.cause.return_cause(), our_pc);
+        match (inbound_src, ret) {
+            (Some(src), Some(ret)) => {
+                send_via(src, &ret, &ctx.registry).await;
+                AdmissionAction::Returned
+            }
+            _ => AdmissionAction::Discarded,
+        }
+    };
+    metrics::admission_refused(refusal.cause.reason(), action);
+    eprintln!(
+        "siphon-sigtran: admission refused a new dialogue ({}, reason `{}`), {}: OPC {} DPC {} in on {inbound_assoc}",
+        refusal.kind.label(),
+        refusal.cause.reason(),
+        action.label(),
+        msu.opc,
+        msu.dpc
+    );
+    true
 }
 
 /// Whether a resolved egress would send the MSU straight back out the same

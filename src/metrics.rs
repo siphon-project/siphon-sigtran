@@ -616,6 +616,8 @@ struct Labelled {
     content_rule_hits: BTreeMap<(String, String), u64>,
     /// `sigtran_invoke_timeouts_total{operation}` (operation = op code).
     invoke_timeouts: BTreeMap<i64, u64>,
+    /// `sigtran_admission_refused_total{reason,action}`.
+    admission_refused: BTreeMap<(&'static str, &'static str), u64>,
 }
 
 static LABELLED: Mutex<Option<Labelled>> = Mutex::new(None);
@@ -773,6 +775,55 @@ pub fn invoke_timeouts(operation: i64) -> u64 {
     labelled()
         .as_ref()
         .and_then(|m| m.invoke_timeouts.get(&operation).copied())
+        .unwrap_or(0)
+}
+
+// ── Admission of new dialogues ───────────────────────────────────────────────
+
+/// What the node did with a dialogue start the
+/// [admission policy](crate::admission) refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionAction {
+    /// Returned to the calling party as a UDTS / XUDTS / LUDTS (the message
+    /// asked to be returned on error).
+    Returned,
+    /// Discarded (no return option, nothing to return it over, or a
+    /// Unidirectional at a terminating node).
+    Discarded,
+    /// Answered with a TCAP Abort (a Begin at a terminating node).
+    Aborted,
+}
+
+impl AdmissionAction {
+    /// The `action` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            AdmissionAction::Returned => "returned",
+            AdmissionAction::Discarded => "discarded",
+            AdmissionAction::Aborted => "aborted",
+        }
+    }
+}
+
+/// Count one dialogue start the admission policy refused.
+pub fn admission_refused(reason: &'static str, action: AdmissionAction) {
+    if let Some(m) = labelled().as_mut() {
+        *m.admission_refused
+            .entry((reason, action.label()))
+            .or_insert(0) += 1;
+    }
+}
+
+/// The count of refused dialogue starts for a reason and action.
+pub fn admission_refusals(reason: &str, action: AdmissionAction) -> u64 {
+    labelled()
+        .as_ref()
+        .and_then(|m| {
+            m.admission_refused
+                .iter()
+                .find(|((r, a), _)| *r == reason && *a == action.label())
+                .map(|(_, v)| *v)
+        })
         .unwrap_or(0)
 }
 
@@ -1129,6 +1180,21 @@ pub fn render() -> String {
 
         help(
             &mut out,
+            "sigtran_admission_refused_total",
+            "Dialogue starts refused by the admission policy, by reason and action.",
+            "counter",
+        );
+        for ((reason, action), v) in &m.admission_refused {
+            line(
+                &mut out,
+                "sigtran_admission_refused_total",
+                &[("reason", reason), ("action", action)],
+                *v,
+            );
+        }
+
+        help(
+            &mut out,
             "sigtran_invoke_timeouts_total",
             "Invokes aged out awaiting a result, by operation.",
             "counter",
@@ -1246,12 +1312,27 @@ mod tests {
             "sigtran_mtp3mg_events_total",
             "sigtran_content_rule_hits_total",
             "sigtran_invoke_timeouts_total",
+            "sigtran_admission_refused_total",
         ] {
             assert!(
                 text.contains(&format!("# TYPE {family} ")),
                 "missing family {family}"
             );
         }
+    }
+
+    #[test]
+    fn admission_refusals_count_by_reason_and_action() {
+        let before = admission_refusals("metrics-test", AdmissionAction::Returned);
+        admission_refused("metrics-test", AdmissionAction::Returned);
+        admission_refused("metrics-test", AdmissionAction::Aborted);
+        assert_eq!(
+            admission_refusals("metrics-test", AdmissionAction::Returned),
+            before + 1
+        );
+        assert!(render().contains(
+            "sigtran_admission_refused_total{reason=\"metrics-test\",action=\"aborted\"}"
+        ));
     }
 
     #[test]

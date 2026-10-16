@@ -4023,6 +4023,24 @@ pub fn configure_from(cfg: &Config) {
 /// then drives. The task runs after the script has loaded, so by the time it
 /// snapshots the node the routing tables and termination handlers are in place.
 pub fn task(cfg: Config) -> impl FnOnce(ScriptHandle) + Send + 'static {
+    runtime_task(cfg, None)
+}
+
+/// [`task`] with an [admission policy](crate::admission) for new dialogues:
+/// the live router puts every TCAP `Begin` / `Unidirectional` it relays or
+/// terminates to `policy`, and refuses the ones it refuses. The same ordering
+/// contract as [`task`] applies.
+pub fn task_with_admission(
+    cfg: Config,
+    policy: Arc<dyn crate::admission::AdmissionPolicy>,
+) -> impl FnOnce(ScriptHandle) + Send + 'static {
+    runtime_task(cfg, Some(policy))
+}
+
+fn runtime_task(
+    cfg: Config,
+    policy: Option<Arc<dyn crate::admission::AdmissionPolicy>>,
+) -> impl FnOnce(ScriptHandle) + Send + 'static {
     move |script| {
         // Move the router + engine the script just programmed out of the node's
         // load-time mutexes into the Arcs the transport shares. After this the
@@ -4032,7 +4050,9 @@ pub fn task(cfg: Config) -> impl FnOnce(ScriptHandle) + Send + 'static {
         let node = node();
         let router = {
             let mut guard = node.router.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::new(std::mem::replace(&mut *guard, Router::new(&cfg)))
+            let mut router = std::mem::replace(&mut *guard, Router::new(&cfg));
+            router.set_admission_policy(policy);
+            Arc::new(router)
         };
         let engine = {
             let mut guard = node.engine.lock().unwrap_or_else(|e| e.into_inner());
