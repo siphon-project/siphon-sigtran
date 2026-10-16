@@ -55,7 +55,7 @@ async-sctp = "1"
 # Invoke parameter is a `rasn::types::Any`, an application context a
 # `rasn::types::Oid`), so the dialogue engine names them to build genuine
 # TCAP + MAP/CAP responses.
-rasn = "0.28"
+rasn = "0.29"
 
 # ── config + errors ─────────────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
