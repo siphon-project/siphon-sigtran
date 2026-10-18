@@ -75,7 +75,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rasn::types::{Any, Oid};
-use sccp::{SccpAddress, SccpMessage, UnitData};
+use sccp::{ExtendedUnitData, ReturnCause, SccpAddress, SccpMessage, UnitData};
 use tcap::dialogue::{
     AbortSource as TcapAbortSource, AssociateSourceDiagnostic, DialoguePdu, DialoguePortion,
     ProtocolVersion,
@@ -92,7 +92,9 @@ pub use tcap::{
 };
 
 use crate::config::Tcap;
-use crate::metrics::{self, AbortCause, AbortSource, Dir, RejectClass, RxDiscard, TcapDiscard};
+use crate::metrics::{
+    self, AbortCause, AbortSource, Dir, LoopKind, RejectClass, RxDiscard, TcapDiscard,
+};
 use crate::transport::framing::SI_SCCP;
 use crate::transport::Msu;
 
@@ -491,11 +493,29 @@ struct Addressing {
     ni: u8,
     /// Signalling link selection.
     sls: u8,
+    /// The SCCP message our outbound messages go in.
+    form: UnitdataForm,
+}
+
+/// Which SCCP connectionless message carries a TCAP message. Q.714 4.1 leaves
+/// the choice to the sending SCCP ("the user data is then transferred in XUDT
+/// or LUDT or UDT message(s)"), and 4.1.1.1.1 says of user data that needs no
+/// segmentation that "an XUDT or LUDT or UDT message is passed to SCRC". A
+/// dialogue the peer opened is answered in the form the peer chose, since that
+/// is a form the path between the two is known to carry; one this node opens
+/// goes in a UDT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitdataForm {
+    /// Unitdata (Q.713 4.10).
+    Udt,
+    /// Extended unitdata (Q.713 4.18), unsegmented: no optional part.
+    Xudt,
 }
 
 impl Addressing {
-    /// Reverse an inbound UDT + routing label into the addressing for the reply.
-    fn reverse(udt: &UnitData, inbound: &Msu) -> Self {
+    /// Reverse an inbound unitdata + routing label into the addressing for the
+    /// reply, which goes in the form the request came in.
+    fn reverse(udt: &UnitData, inbound: &Msu, form: UnitdataForm) -> Self {
         Self {
             out_called: udt.calling_party.clone(),
             out_calling: udt.called_party.clone(),
@@ -503,6 +523,7 @@ impl Addressing {
             dpc: inbound.opc,
             ni: inbound.ni,
             sls: inbound.sls,
+            form,
         }
     }
 }
@@ -1036,27 +1057,48 @@ impl DialogueEngine {
         Some(rec)
     }
 
-    /// Terminate one inbound MSU (an SCCP UDT carrying TCAP). Returns the MSUs to
-    /// send back to the peer, if any.
+    /// Terminate one inbound MSU: an SCCP UDT, or an XUDT that is not a segment
+    /// of a segmented message, carrying TCAP. Returns the MSUs to send back to
+    /// the peer, if any.
+    ///
+    /// Q.714 4.1: "When a UDT or XUDT or LUDT message is received at the
+    /// destination node, an N-UNITDATA indication primitive is invoked, after
+    /// possible reassembly of all segments". Reassembly is not implemented, so
+    /// a segment is counted and dropped, as is an LUDT.
     pub fn deliver(&self, inbound: &Msu, ingress_assoc: &str) -> Vec<Msu> {
         if inbound.si != SI_SCCP {
             not_unitdata(inbound, ingress_assoc, "not an SCCP message");
             return Vec::new();
         }
-        let udt = match SccpMessage::decode(&inbound.payload) {
-            Ok(SccpMessage::Udt(u)) => u,
-            Ok(other) => {
-                not_unitdata(inbound, ingress_assoc, sccp_type(&other));
-                return Vec::new();
-            }
+        let message = match SccpMessage::decode(&inbound.payload) {
+            Ok(message) => message,
             Err(error) => {
                 not_unitdata(inbound, ingress_assoc, error);
                 return Vec::new();
             }
         };
+        let is_segment = crate::content::is_segment(&message);
+        let (udt, form) = match message {
+            SccpMessage::Udt(udt) => (udt, UnitdataForm::Udt),
+            SccpMessage::Xudt(_) if is_segment => {
+                let what = "a segment of a segmented XUDT, which is not reassembled";
+                not_unitdata(inbound, ingress_assoc, what);
+                return Vec::new();
+            }
+            SccpMessage::Xudt(xudt) => {
+                if hop_counter_violated(&xudt) {
+                    return hop_counter_violation(inbound, ingress_assoc, xudt);
+                }
+                (xudt_as_unitdata(xudt), UnitdataForm::Xudt)
+            }
+            other => {
+                not_unitdata(inbound, ingress_assoc, sccp_type(&other));
+                return Vec::new();
+            }
+        };
         // Whatever the answer is (a reply, an Abort for a message that belongs
         // to no dialogue), it goes back where the message came from.
-        let reply_to = Addressing::reverse(&udt, inbound);
+        let reply_to = Addressing::reverse(&udt, inbound, form);
         match tcap::decode_detailed(&udt.data) {
             Decoded::Complete(msg) => self.on_message(msg, None, &reply_to, &udt, ingress_assoc),
             Decoded::Problem(problem) => self.on_problem(*problem, &reply_to, &udt, ingress_assoc),
@@ -1410,6 +1452,7 @@ impl DialogueEngine {
             dpc: req.dpc,
             ni: req.ni,
             sls: req.sls,
+            form: UnitdataForm::Udt,
         };
         let mut dlg = Dialogue::new(
             Role::Initiator,
@@ -1811,14 +1854,18 @@ fn reject_class(problem: &Problem) -> RejectClass {
     }
 }
 
-/// Wrap one TCAP message in an SCCP UDT + MTP3 routing label, ready for the
-/// transport to frame onto M3UA / M2PA.
+/// Wrap one TCAP message in an SCCP UDT or XUDT + MTP3 routing label, ready for
+/// the transport to frame onto M3UA / M2PA. An XUDT goes out whole (no
+/// segmentation parameter, Table 19/Q.713 Note 2), protocol class 0, with the
+/// hop counter a message starts with.
 fn wrap_msu(msg: &TcapMessage, a: &Addressing) -> Result<Msu, DialogueError> {
     let tcap_bytes = tcap::encode(msg).map_err(|e| DialogueError::Encode(e.to_string()))?;
-    let udt = UnitData::new(a.out_called.clone(), a.out_calling.clone(), tcap_bytes);
-    let sccp = udt
-        .encode()
-        .map_err(|e| DialogueError::Sccp(e.to_string()))?;
+    let (called, calling) = (a.out_called.clone(), a.out_calling.clone());
+    let sccp = match a.form {
+        UnitdataForm::Udt => UnitData::new(called, calling, tcap_bytes).encode(),
+        UnitdataForm::Xudt => ExtendedUnitData::new(called, calling, tcap_bytes).encode(),
+    }
+    .map_err(|e| DialogueError::Sccp(e.to_string()))?;
     Ok(Msu {
         opc: a.opc,
         dpc: a.dpc,
@@ -1853,18 +1900,35 @@ fn send_abort(abort: &Abort, a: &Addressing) -> Vec<Msu> {
 /// Answer a `Begin` the [admission policy](crate::admission) refused at this
 /// node with an Abort carrying the P-Abort cause "resource limitation" (Q.772
 /// 2.3.5), addressed back to the originator: the answer [`DialogueEngine`] gives
-/// a `Begin` over its `max_dialogues` ceiling. `None` when the inbound message is
-/// not a UDT (the only message the engine terminates) or the Abort cannot be
-/// built.
+/// a `Begin` over its `max_dialogues` ceiling, in the form the `Begin` came in.
+/// `None` when the inbound message is not one the engine terminates (a UDT, or
+/// a whole XUDT whose hop counter allows delivery) or the Abort cannot be built.
 pub(crate) fn refuse_begin(inbound: &Msu, otid: &[u8]) -> Option<Msu> {
-    let SccpMessage::Udt(udt) = SccpMessage::decode(&inbound.payload).ok()? else {
+    let message = SccpMessage::decode(&inbound.payload).ok()?;
+    if crate::content::is_segment(&message) {
         return None;
+    }
+    let (udt, form) = match message {
+        SccpMessage::Udt(udt) => (udt, UnitdataForm::Udt),
+        SccpMessage::Xudt(xudt) if !hop_counter_violated(&xudt) => {
+            (xudt_as_unitdata(xudt), UnitdataForm::Xudt)
+        }
+        _ => return None,
     };
-    let reply_to = Addressing::reverse(&udt, inbound);
+    let reply_to = Addressing::reverse(&udt, inbound, form);
     let abort = Abort::p_abort(otid.to_vec().into(), PAbortCause::RESOURCE_LIMITATION);
     let frame = send_abort(&abort, &reply_to).pop()?;
     metrics::abort(AbortSource::Local);
     Some(frame)
+}
+
+/// A whole XUDT as the unitdata the dialogue engine reads (Q.714 4.1): the
+/// parties, the data, the protocol class and the message handling.
+fn xudt_as_unitdata(xudt: ExtendedUnitData) -> UnitData {
+    let mut udt = UnitData::new(xudt.called_party, xudt.calling_party, xudt.data);
+    udt.protocol_class = xudt.protocol_class;
+    udt.message_handling = xudt.message_handling;
+    udt
 }
 
 /// The crate has no logging framework: the operator-facing log is stderr, and
@@ -1873,9 +1937,35 @@ fn log_error(message: std::fmt::Arguments<'_>) {
     eprintln!("siphon-sigtran: ERROR: {message}");
 }
 
+/// Whether delivering this XUDT here uses up its hop counter. Q.714 2.3.1: a
+/// called party address that routes on its subsystem number is handed to the
+/// subsystem as it is; one that routes on a global title is translated first,
+/// and "the SCCP Hop Counter (if present) is decremented and if a Hop Counter
+/// violation is encountered (i.e. the value zero is reached), then ... the
+/// message return procedure is initiated", before the translation is found to
+/// lead to this node.
+fn hop_counter_violated(xudt: &ExtendedUnitData) -> bool {
+    !xudt.called_party.route_on_ssn && xudt.hop_counter <= 1
+}
+
+/// Drop an XUDT whose hop counter ran out at the translation to this node:
+/// count it with the loops, log it, and return it in an XUDTS with the cause
+/// "hop counter violation" (Q.714 2.8.6) when it asked to be returned.
+fn hop_counter_violation(inbound: &Msu, ingress_assoc: &str, xudt: ExtendedUnitData) -> Vec<Msu> {
+    metrics::record_loop(LoopKind::HopCounter);
+    eprintln!(
+        "siphon-sigtran: loop dropped (hop-counter): OPC {} DPC {} received on `{ingress_assoc}`, exhausted at the translation to a local subsystem",
+        inbound.opc, inbound.dpc
+    );
+    let cause = ReturnCause::HopCounterViolation;
+    crate::transport::sccp_return(inbound, &SccpMessage::Xudt(xudt), cause, None)
+        .into_iter()
+        .collect()
+}
+
 /// Count and log an MSU that was routed to a subsystem of this node and is not
-/// a unitdata message the engine reads. Only a UDT is read: an XUDT or an LUDT
-/// for a local subsystem ends here.
+/// a unitdata message the engine reads: a segment of a segmented XUDT (there is
+/// no reassembly), an LUDT, a service message.
 fn not_unitdata(inbound: &Msu, ingress_assoc: &str, what: impl std::fmt::Display) {
     metrics::rx_discard(RxDiscard::NotUnitdata);
     eprintln!(
@@ -1935,9 +2025,92 @@ mod tests {
                 dpc: 2000,
                 ni: 0,
                 sls: 0,
+                form: UnitdataForm::Udt,
             },
             &Tcap::default(),
         )
+    }
+
+    /// An inbound MSU from point code 4000 to 1000 carrying `sccp`.
+    fn inbound(sccp: Vec<u8>) -> Msu {
+        Msu {
+            opc: 4000,
+            dpc: 1000,
+            si: SI_SCCP,
+            ni: 0,
+            mp: 0,
+            sls: 3,
+            payload: sccp,
+        }
+    }
+
+    fn hlr() -> SccpAddress {
+        SccpAddress::with_ssn(SubsystemNumber::Hlr, Some(1000))
+    }
+
+    fn msc() -> SccpAddress {
+        SccpAddress::with_ssn(SubsystemNumber::Msc, Some(4000))
+    }
+
+    /// The P-Abort an admission refusal sends, decoded: its SCCP form, the dtid
+    /// and the cause.
+    fn refusal(frame: &Msu) -> (&'static str, Vec<u8>, Option<PAbortCause>) {
+        assert_eq!((frame.opc, frame.dpc, frame.sls), (1000, 4000, 3));
+        let (form, data) = match SccpMessage::decode(&frame.payload).unwrap() {
+            SccpMessage::Udt(m) => ("udt", m.data),
+            SccpMessage::Xudt(m) => {
+                assert!(m.optional_part.is_empty(), "an answer is never segmented");
+                ("xudt", m.data)
+            }
+            other => panic!("not unitdata: {other:?}"),
+        };
+        let TcapMessage::Abort(abort) = tcap::decode(&data).unwrap() else {
+            panic!("not an Abort");
+        };
+        (form, abort.dtid.to_vec(), abort.p_abort_cause())
+    }
+
+    const OTID: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+
+    #[test]
+    fn a_refused_udt_begin_is_aborted_in_a_udt() {
+        let msu = inbound(
+            UnitData::new(hlr(), msc(), vec![0x62, 0x00])
+                .encode()
+                .unwrap(),
+        );
+        let frame = refuse_begin(&msu, &OTID).expect("an Abort");
+        assert_eq!(
+            refusal(&frame),
+            ("udt", OTID.to_vec(), Some(PAbortCause::RESOURCE_LIMITATION))
+        );
+    }
+
+    #[test]
+    fn a_refused_whole_xudt_begin_is_aborted_in_an_xudt() {
+        let msu = inbound(
+            ExtendedUnitData::new(hlr(), msc(), vec![0x62, 0x00])
+                .encode()
+                .unwrap(),
+        );
+        let frame = refuse_begin(&msu, &OTID).expect("an Abort, as for a UDT");
+        assert_eq!(
+            refusal(&frame),
+            (
+                "xudt",
+                OTID.to_vec(),
+                Some(PAbortCause::RESOURCE_LIMITATION)
+            )
+        );
+    }
+
+    #[test]
+    fn a_refused_segment_of_an_xudt_is_not_answered() {
+        let mut xudt = ExtendedUnitData::new(hlr(), msc(), vec![0x62, 0x00]);
+        // Segmentation (Q.713 3.17): first segment, one remaining.
+        xudt.optional_part = vec![0x10, 0x04, 0x81, 0x00, 0x00, 0x01, 0x00];
+        let msu = inbound(xudt.encode().unwrap());
+        assert!(refuse_begin(&msu, &OTID).is_none());
     }
 
     /// Make every staged invoke an operation in progress, as a flush does.

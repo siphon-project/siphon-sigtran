@@ -1582,3 +1582,285 @@ fn an_originated_dialogue_gets_its_result() {
     );
     assert_eq!(probe.reasons(), vec![CloseReason::PeerEnded]);
 }
+
+// ── SCCP: the unitdata form a message arrives in (Q.713 4.18, Q.714 4.1) ─────
+
+/// Our HLR subsystem and the peer's MSC subsystem, each as an address that
+/// routes on the subsystem number: address indicator `42` (routing indicator
+/// 1, subsystem number present, no point code, no global title), then the
+/// subsystem number.
+const TO_HLR: [u8; 2] = [0x42, 0x06];
+const FROM_MSC: [u8; 2] = [0x42, 0x08];
+
+/// The same two as addresses that route on a global title: address indicator
+/// `12` (routing indicator 0, global title indicator 4, subsystem number
+/// present), the subsystem number, translation type 0, numbering plan E.164
+/// with an even number of BCD digits (`12`), nature of address international
+/// (`04`), the digits 15550100 and 15550170.
+const TO_HLR_BY_TITLE: [u8; 9] = [0x12, 0x06, 0x00, 0x12, 0x04, 0x51, 0x55, 0x10, 0x00];
+const FROM_MSC_BY_TITLE: [u8; 9] = [0x12, 0x08, 0x00, 0x12, 0x04, 0x51, 0x55, 0x10, 0x07];
+
+/// Message handling `1000`: return the message on error (Q.713 3.6).
+const RETURN_ON_ERROR: u8 = 0x8;
+
+fn a_begin(otid: &[u8]) -> Vec<u8> {
+    begin(otid, Some(&aarq(&AC)), &[invoke(1, OP, Some(&ARG))])
+}
+
+/// The fixed part of an XUDT the engine emitted: message type, protocol class
+/// and message handling, hop counter, and whether it has an optional part.
+fn assert_a_whole_xudt(m: &siphon_sigtran::transport::Msu) {
+    assert_eq!(m.payload[0], 0x11, "an XUDT");
+    assert_eq!(m.payload[1], 0x00, "class 0, no special options");
+    assert_eq!(m.payload[2], 15, "a fresh hop counter");
+    assert_eq!(m.payload[6], 0, "no optional part: the message is whole");
+}
+
+/// Q.714 4.1: "When a UDT or XUDT or LUDT message is received at the
+/// destination node, an N-UNITDATA indication primitive is invoked". A Begin
+/// that arrives in an XUDT with no optional part is a Begin: the handler runs,
+/// and the answer goes back in an XUDT, to the calling party, with a hop
+/// counter of its own.
+#[test]
+fn a_begin_in_an_extended_unitdata_is_answered_in_one() {
+    let probe = Probe::new().on_begin(reply_and_end).arc();
+    let engine = engine(probe.clone());
+    let request = inbound_sccp(xudt(
+        0,
+        15,
+        &TO_HLR,
+        &FROM_MSC,
+        &a_begin(&[0x51, 0x52]),
+        &[],
+    ));
+    let out = engine.deliver(&request, "ingress");
+
+    assert_eq!(probe.begins().len(), 1, "the handler ran");
+    assert_eq!(probe.begins()[0].operation_code, OP);
+    assert_eq!(probe.begins()[0].called_ssn, HLR);
+    assert_eq!(out.len(), 1, "and its answer is sent");
+    assert_a_whole_xudt(&out[0]);
+    assert_eq!((out[0].opc, out[0].dpc), (OUR_PC, PEER_PC));
+    let TcapMessage::End(e) = decode(&out[0]) else {
+        panic!("expected an End");
+    };
+    assert_eq!(e.dtid.as_ref(), &[0x51, 0x52]);
+    // The addresses are the request's, swapped.
+    let reply = sccp_of(&out[0]);
+    assert_eq!(reply.called_party().encode().unwrap(), FROM_MSC);
+    assert_eq!(reply.calling_party().encode().unwrap(), TO_HLR);
+    assert_eq!(engine.open_dialogues(), 0);
+
+    if let Some(d) = dissect_all(&[&request, &out[0]]) {
+        d.show_all("sccp.message_type", &["0x11", "0x11"])
+            .hex("sccp.hops", "0f")
+            .present("tcap.begin_element")
+            .present("tcap.end_element")
+            .hex("tcap.dtid", "5152")
+            .show("tcap.aarq_application_context_name", "0.4.0.0.1.0.15.2")
+            .show("tcap.aare_application_context_name", "0.4.0.0.1.0.15.2")
+            .present("gsm_old.returnResultLast_element");
+    }
+}
+
+/// Table 19/Q.713 says of the Segmentation parameter that it "should not be
+/// present in case of a single XUDT message", and Q.714 4.1.1.2.1 starts a
+/// reassembly only for "the F-bit set to one and the 'remaining segment' field
+/// different from zero". A first segment with no segment remaining is therefore
+/// the whole message, and is read as one.
+#[test]
+fn an_extended_unitdata_that_is_its_only_segment_is_answered() {
+    let probe = Probe::new().on_begin(reply_and_end).arc();
+    let engine = engine(probe.clone());
+    // Segmentation (name `10`, four octets): first segment, class 0, no
+    // segment remaining; a local reference; then the end of the optional part.
+    let only_segment = [0x10, 0x04, 0x80, 0x00, 0x00, 0x2A, 0x00];
+    let request = inbound_sccp(xudt(
+        0,
+        15,
+        &TO_HLR,
+        &FROM_MSC,
+        &a_begin(&[0x53]),
+        &only_segment,
+    ));
+    let out = engine.deliver(&request, "ingress");
+    assert_eq!(probe.begins().len(), 1);
+    assert_eq!(out.len(), 1);
+    assert_a_whole_xudt(&out[0]);
+    assert!(matches!(decode(&out[0]), TcapMessage::End(_)));
+
+    if let Some(d) = dissect_all(&[&request, &out[0]]) {
+        d.show_all("sccp.message_type", &["0x11", "0x11"])
+            .present("tcap.begin_element")
+            .present("tcap.end_element");
+    }
+}
+
+/// A dialogue that was opened in an XUDT stays in that form: the Continue the
+/// handler answers the Begin with, and its End to the peer's next message,
+/// which is read from an XUDT as well.
+#[test]
+fn a_dialogue_begun_in_an_extended_unitdata_goes_on_in_that_form() {
+    let probe = Probe::new()
+        .on_begin(reply_and_hold)
+        .on_turn(|dlg, _| dlg.end().expect("end"))
+        .arc();
+    let engine = engine(probe.clone());
+    let peer = [0x54, 0x55];
+    let out = engine.deliver(
+        &inbound_sccp(xudt(0, 15, &TO_HLR, &FROM_MSC, &a_begin(&peer), &[])),
+        "ingress",
+    );
+    assert_eq!(out.len(), 1);
+    assert_a_whole_xudt(&out[0]);
+    let TcapMessage::Continue(c) = decode(&out[0]) else {
+        panic!("expected a Continue");
+    };
+
+    let next = cont(&peer, &c.otid, &[invoke(2, OP, Some(&ARG))]);
+    let out = engine.deliver(
+        &inbound_sccp(xudt(0, 15, &TO_HLR, &FROM_MSC, &next, &[])),
+        "ingress",
+    );
+    assert_eq!(probe.turns().len(), 1, "the Continue reached the handler");
+    assert_eq!(out.len(), 1);
+    assert_a_whole_xudt(&out[0]);
+    assert!(matches!(decode(&out[0]), TcapMessage::End(_)));
+    assert_eq!(engine.open_dialogues(), 0);
+}
+
+/// What the engine answers without a dialogue goes back in the form of the
+/// message it answers too: the Abort for a Continue nobody knows.
+#[test]
+fn an_abort_for_an_extended_unitdata_is_sent_in_one() {
+    let engine = engine(Probe::new().arc());
+    let stray = cont(&[0x56], &[0x7F, 0x7F], &[]);
+    let request = inbound_sccp(xudt(0, 15, &TO_HLR, &FROM_MSC, &stray, &[]));
+    let out = engine.deliver(&request, "ingress");
+    assert_eq!(out.len(), 1);
+    assert_a_whole_xudt(&out[0]);
+    let abort = abort_of(&out[0]);
+    assert_eq!(abort.dtid.as_ref(), &[0x56]);
+
+    // And a message in a UDT is answered in a UDT, as before.
+    let out = engine.deliver(&inbound(&stray), "ingress");
+    assert_eq!(out[0].payload[0], 0x09, "a UDT");
+}
+
+/// Reassembly (Q.714 4.1.1.2) is not implemented: a segment of a segmented
+/// message is not a TCAP message. It is counted and logged as before, no
+/// handler runs and nothing is sent, whichever segment it is.
+#[test]
+fn a_segment_of_a_segmented_message_is_counted_and_not_answered() {
+    use siphon_sigtran::metrics::{rx_discards, RxDiscard};
+    let probe = Probe::new().on_begin(reply_and_end).arc();
+    let engine = engine(probe.clone());
+    let whole = a_begin(&[0x57]);
+    let (head, tail) = whole.split_at(whole.len() / 2);
+    // First segment, one remaining; then the last one (F-bit 0, none
+    // remaining), under the same local reference.
+    let first = [0x10, 0x04, 0x81, 0x00, 0x00, 0x2B, 0x00];
+    let last = [0x10, 0x04, 0x00, 0x00, 0x00, 0x2B, 0x00];
+    let before = rx_discards(RxDiscard::NotUnitdata);
+    for (data, segmentation) in [(head, first), (tail, last)] {
+        let segment = inbound_sccp(xudt(
+            RETURN_ON_ERROR,
+            15,
+            &TO_HLR,
+            &FROM_MSC,
+            data,
+            &segmentation,
+        ));
+        assert!(engine.deliver(&segment, "ingress").is_empty());
+    }
+    assert!(probe.begins().is_empty(), "no handler ran");
+    assert!(rx_discards(RxDiscard::NotUnitdata) >= before + 2);
+    assert_eq!(engine.open_dialogues(), 0);
+
+    // An LUDT is not read either.
+    let ludt = sccp::LongUnitData::new(
+        sccp::SccpAddress::decode(&TO_HLR).unwrap(),
+        sccp::SccpAddress::decode(&FROM_MSC).unwrap(),
+        whole,
+    )
+    .encode()
+    .unwrap();
+    assert!(engine.deliver(&inbound_sccp(ludt), "ingress").is_empty());
+    assert!(probe.begins().is_empty());
+    assert!(rx_discards(RxDiscard::NotUnitdata) >= before + 3);
+}
+
+/// Q.714 2.3.1: a called party address that routes on its subsystem number is
+/// handed to the subsystem, and the hop counter plays no part: "if the
+/// subsystem is available, the message is passed, based on the message type,
+/// to either SCOC or SCLC". Only a global title is translated, and it is at a
+/// translation that "the SCCP Hop Counter (if present) is decremented".
+#[test]
+fn the_hop_counter_is_not_looked_at_without_a_translation() {
+    let probe = Probe::new().on_begin(reply_and_end).arc();
+    let engine = engine(probe.clone());
+    let last_hop = xudt(0, 1, &TO_HLR, &FROM_MSC, &a_begin(&[0x58]), &[]);
+    assert_eq!(engine.deliver(&inbound_sccp(last_hop), "ingress").len(), 1);
+    assert_eq!(probe.begins().len(), 1);
+}
+
+/// Q.714 2.3.1 3): for a called party address that routes on a global title,
+/// "the SCCP Hop Counter (if present) is decremented and if a Hop Counter
+/// violation is encountered (i.e. the value zero is reached), then: if the
+/// message is a connectionless message, then the message return procedure is
+/// initiated", and that is before the translation is found to lead here. A
+/// counter of 2 or more passes; a counter of 1 is a violation: the message is
+/// not delivered, it is counted as a loop, and it is returned in an XUDTS with
+/// the cause "hop counter violation" when it asked to be returned.
+#[test]
+fn a_hop_counter_that_runs_out_at_our_own_title_is_a_violation() {
+    use siphon_sigtran::metrics::{loops_detected, LoopKind};
+    let probe = Probe::new().on_begin(reply_and_end).arc();
+    let engine = engine(probe.clone());
+    let by_title = |handling, hop_counter, otid: u8| {
+        inbound_sccp(xudt(
+            handling,
+            hop_counter,
+            &TO_HLR_BY_TITLE,
+            &FROM_MSC_BY_TITLE,
+            &a_begin(&[otid]),
+            &[],
+        ))
+    };
+
+    // Two hops left: one is used here, the message is delivered and answered.
+    let out = engine.deliver(&by_title(0, 2, 0x59), "ingress");
+    assert_eq!(probe.begins().len(), 1);
+    assert_eq!(out.len(), 1);
+    assert_a_whole_xudt(&out[0]);
+
+    // One hop left, and no return asked for: dropped, counted.
+    let before = loops_detected(LoopKind::HopCounter);
+    assert!(engine.deliver(&by_title(0, 1, 0x5A), "ingress").is_empty());
+    assert_eq!(probe.begins().len(), 1, "not delivered");
+    assert!(loops_detected(LoopKind::HopCounter) > before);
+
+    // One hop left, return on error: an XUDTS back to the calling party.
+    let request = by_title(RETURN_ON_ERROR, 1, 0x5B);
+    let out = engine.deliver(&request, "ingress");
+    assert_eq!(probe.begins().len(), 1, "not delivered");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].payload[0], 0x12, "an XUDTS");
+    assert_eq!(
+        out[0].payload[1], 0x0C,
+        "return cause: hop counter violation"
+    );
+    assert_eq!((out[0].opc, out[0].dpc), (OUR_PC, PEER_PC));
+    let returned = sccp_of(&out[0]);
+    assert_eq!(returned.called_party().encode().unwrap(), FROM_MSC_BY_TITLE);
+    assert_eq!(
+        returned.data(),
+        &a_begin(&[0x5B])[..],
+        "the data comes back"
+    );
+    if let Some(d) = dissect_unchecked(&[&request, &out[0]]) {
+        d.clean()
+            .show_all("sccp.message_type", &["0x11", "0x12"])
+            .hex("sccp.return_cause", "0c");
+    }
+}

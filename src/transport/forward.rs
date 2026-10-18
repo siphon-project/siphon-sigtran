@@ -479,7 +479,7 @@ fn set_hop_counter(msg: &mut SccpMessage, hop: u8) {
 /// (the return's OPC). Returns `None` when the message did not ask to be returned
 /// on error, or is itself a service message (a return is never returned). This is
 /// the Q.714 "always answer an undeliverable SCCP message" seam.
-fn sccp_return(
+pub(crate) fn sccp_return(
     inbound: &Msu,
     sccp: &SccpMessage,
     cause: ReturnCause,

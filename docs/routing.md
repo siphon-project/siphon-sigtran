@@ -87,6 +87,10 @@ drops the offending MSU and counts it in
 - **hop-counter**: an SCCP XUDT/LUDT carries a Q.713 hop counter, decremented at
   each GTT relay; at zero the message is a translation loop, dropped and returned
   as an XUDTS/LUDTS "hop counter violation" when it asked to be returned on error.
+  The translation that leads to a subsystem of this node counts as one (Q.714
+  2.3.1): an XUDT addressed by global title that arrives with one hop left is
+  dropped the same way and not terminated. One addressed by subsystem number is
+  not translated, and its hop counter is not looked at.
 
 The first two catch route-config loops that no upper-layer mechanism sees
 (call-control SIs have no application-level hop counter); the hop counter is the
@@ -229,8 +233,16 @@ call. The families:
 before routing: `ppid` (not the adaptation layer's payload protocol identifier),
 `undecodable`, `out-of-state` (traffic from an ASP that is not active, or on a
 link that is not in service), `no-payload` (a data message without its user
-part) and `not-unitdata` (addressed to a local subsystem and not a UDT). Each is
-also a line on stderr naming the association. Alert on any of them moving.
+part) and `not-unitdata` (addressed to a local subsystem and not a message the
+dialogue engine reads: a segment of a segmented XUDT, an LUDT, a service
+message). Each is also a line on stderr naming the association. Alert on any of
+them moving.
+
+The dialogue engine reads a UDT and an XUDT that holds a whole message (no
+segmentation parameter, or one that says first segment, none remaining), and
+answers in the form the dialogue was opened in: XUDT for XUDT, with a hop
+counter of 15. It does not reassemble: the segments of a segmented XUDT are
+counted under `not-unitdata` and the message is not answered.
 
 Good first panels: linkset / ASP state and route availability (is the node
 wired up?), MSU rate by SI, GTT translations vs errors, active dialogues, and

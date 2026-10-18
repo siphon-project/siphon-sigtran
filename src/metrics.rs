@@ -541,7 +541,8 @@ pub enum RxDiscard {
     /// without Protocol Data, RFC 4666 3.3.1).
     NoPayload,
     /// Addressed to a subsystem of this node, and not a unitdata message the
-    /// dialogue engine reads.
+    /// dialogue engine reads: a segment of a segmented XUDT, an LUDT, a
+    /// service message.
     NotUnitdata,
 }
 
