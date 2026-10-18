@@ -7,6 +7,8 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [4.1.0] — 2026-10-18
+
 ### Added
 
 - **A script reads what the gsmSSF sends in a CAMEL call**, typed, where 3.0.0
