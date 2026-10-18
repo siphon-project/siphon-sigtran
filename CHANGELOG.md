@@ -26,6 +26,9 @@ All notable changes are documented here. The format follows
   returned in an XUDTS, hop counter violation, when it asked to be returned. An
   XUDT addressed by subsystem number is not translated and is delivered
   whatever its hop counter says.
+- **A `Begin` refused by the admission policy in a whole XUDT is aborted** with
+  the P-Abort "resource limitation" in an XUDT, as one in a UDT is. It was
+  discarded.
 
 Reassembly is still not implemented: a segment of a segmented XUDT, and an
 LUDT, are counted in `sigtran_rx_discarded_total{reason="not-unitdata"}` and

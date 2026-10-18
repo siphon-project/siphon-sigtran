@@ -1089,10 +1089,7 @@ impl DialogueEngine {
                 if hop_counter_violated(&xudt) {
                     return hop_counter_violation(inbound, ingress_assoc, xudt);
                 }
-                let mut udt = UnitData::new(xudt.called_party, xudt.calling_party, xudt.data);
-                udt.protocol_class = xudt.protocol_class;
-                udt.message_handling = xudt.message_handling;
-                (udt, UnitdataForm::Xudt)
+                (xudt_as_unitdata(xudt), UnitdataForm::Xudt)
             }
             other => {
                 not_unitdata(inbound, ingress_assoc, sccp_type(&other));
@@ -1903,18 +1900,35 @@ fn send_abort(abort: &Abort, a: &Addressing) -> Vec<Msu> {
 /// Answer a `Begin` the [admission policy](crate::admission) refused at this
 /// node with an Abort carrying the P-Abort cause "resource limitation" (Q.772
 /// 2.3.5), addressed back to the originator: the answer [`DialogueEngine`] gives
-/// a `Begin` over its `max_dialogues` ceiling. `None` when the inbound message is
-/// not a UDT (the only message the engine terminates) or the Abort cannot be
-/// built.
+/// a `Begin` over its `max_dialogues` ceiling, in the form the `Begin` came in.
+/// `None` when the inbound message is not one the engine terminates (a UDT, or
+/// a whole XUDT whose hop counter allows delivery) or the Abort cannot be built.
 pub(crate) fn refuse_begin(inbound: &Msu, otid: &[u8]) -> Option<Msu> {
-    let SccpMessage::Udt(udt) = SccpMessage::decode(&inbound.payload).ok()? else {
+    let message = SccpMessage::decode(&inbound.payload).ok()?;
+    if crate::content::is_segment(&message) {
         return None;
+    }
+    let (udt, form) = match message {
+        SccpMessage::Udt(udt) => (udt, UnitdataForm::Udt),
+        SccpMessage::Xudt(xudt) if !hop_counter_violated(&xudt) => {
+            (xudt_as_unitdata(xudt), UnitdataForm::Xudt)
+        }
+        _ => return None,
     };
-    let reply_to = Addressing::reverse(&udt, inbound);
+    let reply_to = Addressing::reverse(&udt, inbound, form);
     let abort = Abort::p_abort(otid.to_vec().into(), PAbortCause::RESOURCE_LIMITATION);
     let frame = send_abort(&abort, &reply_to).pop()?;
     metrics::abort(AbortSource::Local);
     Some(frame)
+}
+
+/// A whole XUDT as the unitdata the dialogue engine reads (Q.714 4.1): the
+/// parties, the data, the protocol class and the message handling.
+fn xudt_as_unitdata(xudt: ExtendedUnitData) -> UnitData {
+    let mut udt = UnitData::new(xudt.called_party, xudt.calling_party, xudt.data);
+    udt.protocol_class = xudt.protocol_class;
+    udt.message_handling = xudt.message_handling;
+    udt
 }
 
 /// The crate has no logging framework: the operator-facing log is stderr, and
@@ -2015,6 +2029,88 @@ mod tests {
             },
             &Tcap::default(),
         )
+    }
+
+    /// An inbound MSU from point code 4000 to 1000 carrying `sccp`.
+    fn inbound(sccp: Vec<u8>) -> Msu {
+        Msu {
+            opc: 4000,
+            dpc: 1000,
+            si: SI_SCCP,
+            ni: 0,
+            mp: 0,
+            sls: 3,
+            payload: sccp,
+        }
+    }
+
+    fn hlr() -> SccpAddress {
+        SccpAddress::with_ssn(SubsystemNumber::Hlr, Some(1000))
+    }
+
+    fn msc() -> SccpAddress {
+        SccpAddress::with_ssn(SubsystemNumber::Msc, Some(4000))
+    }
+
+    /// The P-Abort an admission refusal sends, decoded: its SCCP form, the dtid
+    /// and the cause.
+    fn refusal(frame: &Msu) -> (&'static str, Vec<u8>, Option<PAbortCause>) {
+        assert_eq!((frame.opc, frame.dpc, frame.sls), (1000, 4000, 3));
+        let (form, data) = match SccpMessage::decode(&frame.payload).unwrap() {
+            SccpMessage::Udt(m) => ("udt", m.data),
+            SccpMessage::Xudt(m) => {
+                assert!(m.optional_part.is_empty(), "an answer is never segmented");
+                ("xudt", m.data)
+            }
+            other => panic!("not unitdata: {other:?}"),
+        };
+        let TcapMessage::Abort(abort) = tcap::decode(&data).unwrap() else {
+            panic!("not an Abort");
+        };
+        (form, abort.dtid.to_vec(), abort.p_abort_cause())
+    }
+
+    const OTID: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+
+    #[test]
+    fn a_refused_udt_begin_is_aborted_in_a_udt() {
+        let msu = inbound(
+            UnitData::new(hlr(), msc(), vec![0x62, 0x00])
+                .encode()
+                .unwrap(),
+        );
+        let frame = refuse_begin(&msu, &OTID).expect("an Abort");
+        assert_eq!(
+            refusal(&frame),
+            ("udt", OTID.to_vec(), Some(PAbortCause::RESOURCE_LIMITATION))
+        );
+    }
+
+    #[test]
+    fn a_refused_whole_xudt_begin_is_aborted_in_an_xudt() {
+        let msu = inbound(
+            ExtendedUnitData::new(hlr(), msc(), vec![0x62, 0x00])
+                .encode()
+                .unwrap(),
+        );
+        let frame = refuse_begin(&msu, &OTID).expect("an Abort, as for a UDT");
+        assert_eq!(
+            refusal(&frame),
+            (
+                "xudt",
+                OTID.to_vec(),
+                Some(PAbortCause::RESOURCE_LIMITATION)
+            )
+        );
+    }
+
+    #[test]
+    fn a_refused_segment_of_an_xudt_is_not_answered() {
+        let mut xudt = ExtendedUnitData::new(hlr(), msc(), vec![0x62, 0x00]);
+        // Segmentation (Q.713 3.17): first segment, one remaining.
+        xudt.optional_part = vec![0x10, 0x04, 0x81, 0x00, 0x00, 0x01, 0x00];
+        let msu = inbound(xudt.encode().unwrap());
+        assert!(refuse_begin(&msu, &OTID).is_none());
     }
 
     /// Make every staged invoke an operation in progress, as a flush does.
