@@ -2985,6 +2985,171 @@ impl GsmCap {
         StagedInvoke::new(gsm_cap::op_codes::CONTINUE, None, OperationClass::Four)
     }
 
+    /// Stage a CAP ConnectToResource invoke (TS 29.078 11.10): connect the call
+    /// to a gsmSRF at `ip_routing_address` (an E.164 digit string, encoded as an
+    /// international CalledPartyNumber, or the octets of one), or, with none
+    /// given, to the gsmSRF co-located with the gsmSSF. The gsmSSF then relays
+    /// the PlayAnnouncement / PromptAndCollectUserInformation that follow.
+    #[pyo3(signature = (*, ip_routing_address=None))]
+    fn connect_to_resource(
+        &self,
+        ip_routing_address: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<StagedInvoke> {
+        use gsm_cap::operations::ConnectToResourceArg;
+        use gsm_cap::types::ResourceAddress;
+        let address = match ip_routing_address {
+            Some(number) => ResourceAddress::IpRoutingAddress(called_party(&number)?.into()),
+            None => ResourceAddress::None(()),
+        };
+        staged_cap_invoke(
+            gsm_cap::op_codes::CONNECT_TO_RESOURCE,
+            &ConnectToResourceArg::new(address),
+            OperationClass::Two,
+        )
+    }
+
+    /// Stage a CAP PlayAnnouncement invoke (TS 29.078 11.23). What to send is a
+    /// typed choice: an elementary announcement id (`message_id=`), a tone
+    /// (`tone_id=`, `tone_duration=` seconds), or the BER of a CAP
+    /// `InformationToSend` value (decoded and refused if it is not one).
+    /// `request_announcement_complete=True` has the gsmSRF answer with a
+    /// SpecializedResourceReport (operation 49) when it is done.
+    #[pyo3(signature = (*, message_id=None, tone_id=None, tone_duration=None, information_to_send=None, disconnect_from_ip_forbidden=None, request_announcement_complete=None))]
+    fn play_announcement(
+        &self,
+        message_id: Option<u32>,
+        tone_id: Option<u32>,
+        tone_duration: Option<u32>,
+        information_to_send: Option<Vec<u8>>,
+        disconnect_from_ip_forbidden: Option<bool>,
+        request_announcement_complete: Option<bool>,
+    ) -> PyResult<StagedInvoke> {
+        use gsm_cap::operations::PlayAnnouncementArg;
+        let info = cap_information_to_send(message_id, tone_id, tone_duration, information_to_send)?
+            .ok_or_else(|| {
+                err("play_announcement: give message_id, tone_id or information_to_send")
+            })?;
+        let mut arg = PlayAnnouncementArg::new(info);
+        arg.disconnect_from_ip_forbidden = disconnect_from_ip_forbidden;
+        arg.request_announcement_complete_notification = request_announcement_complete;
+        staged_cap_invoke(
+            gsm_cap::op_codes::PLAY_ANNOUNCEMENT,
+            &arg,
+            OperationClass::Two,
+        )
+    }
+
+    /// Stage a CAP PromptAndCollectUserInformation invoke (TS 29.078 11.25):
+    /// collect digits from the user, optionally after a prompt given as for
+    /// `play_announcement`. Say what to collect with `maximum_digits=` (and
+    /// `minimum_digits=`), or with `collected_info=`, the BER of a CAP
+    /// `CollectedInfo` value. The digits come back in the result.
+    #[pyo3(signature = (*, maximum_digits=None, minimum_digits=None, collected_info=None, disconnect_from_ip_forbidden=None, message_id=None, tone_id=None, tone_duration=None, information_to_send=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn prompt_and_collect_user_information(
+        &self,
+        maximum_digits: Option<u8>,
+        minimum_digits: Option<u8>,
+        collected_info: Option<Vec<u8>>,
+        disconnect_from_ip_forbidden: Option<bool>,
+        message_id: Option<u32>,
+        tone_id: Option<u32>,
+        tone_duration: Option<u32>,
+        information_to_send: Option<Vec<u8>>,
+    ) -> PyResult<StagedInvoke> {
+        use gsm_cap::operations::PromptAndCollectUserInformationArg;
+        use gsm_cap::types::{CollectedDigits, CollectedInfo};
+        let what = match (maximum_digits, collected_info) {
+            (Some(max), None) => {
+                let mut digits = CollectedDigits::new(max);
+                digits.minimum_nb_of_digits = minimum_digits;
+                CollectedInfo::CollectedDigits(digits)
+            }
+            (None, Some(bytes)) => gsm_cap::decode::<CollectedInfo>(&bytes)
+                .map_err(|e| err(format!("collected_info is not a CollectedInfo: {e}")))?,
+            _ => {
+                return Err(err(
+                    "prompt_and_collect_user_information: give maximum_digits or collected_info",
+                ))
+            }
+        };
+        let mut arg = PromptAndCollectUserInformationArg::new(what);
+        arg.disconnect_from_ip_forbidden = disconnect_from_ip_forbidden;
+        arg.information_to_send =
+            cap_information_to_send(message_id, tone_id, tone_duration, information_to_send)?;
+        staged_cap_invoke(
+            gsm_cap::op_codes::PROMPT_AND_COLLECT_USER_INFORMATION,
+            &arg,
+            OperationClass::One,
+        )
+    }
+
+    /// Stage a CAP DisconnectForwardConnection invoke (TS 29.078 11.13): take
+    /// the call off the gsmSRF after an announcement, before the instruction
+    /// that goes on with it (Continue, Connect, ReleaseCall). It carries no
+    /// argument.
+    fn disconnect_forward_connection(&self) -> StagedInvoke {
+        StagedInvoke::new(DISCONNECT_FORWARD_CONNECTION, None, OperationClass::Two)
+    }
+
+    /// Stage a CAP FurnishChargingInformation invoke (TS 29.078 11.19): free
+    /// format data (1 to 160 octets) for the call record the MSC writes, for
+    /// leg `party_to_charge` (default leg 1), replacing what an earlier one
+    /// gave, or after it with `append=True`.
+    #[pyo3(signature = (*, free_format_data, party_to_charge=None, append=None))]
+    fn furnish_charging_information(
+        &self,
+        free_format_data: Vec<u8>,
+        party_to_charge: Option<u8>,
+        append: Option<bool>,
+    ) -> PyResult<StagedInvoke> {
+        use gsm_cap::operations::FurnishChargingInformationArg;
+        use gsm_cap::types::{
+            AppendFreeFormatData, CamelFciBillingChargingCharacteristics, FciBccCamelSequence1,
+            SendingSideId,
+        };
+        if free_format_data.is_empty() || free_format_data.len() > 160 {
+            return Err(err(format!(
+                "furnish_charging_information: free_format_data is 1 to 160 octets, not {}",
+                free_format_data.len()
+            )));
+        }
+        let characteristics =
+            CamelFciBillingChargingCharacteristics::FciBccCamelSequence1(FciBccCamelSequence1 {
+                free_format_data: free_format_data.into(),
+                party_to_charge: party_to_charge.map(SendingSideId::leg),
+                append_free_format_data: append.map(|append| {
+                    if append {
+                        AppendFreeFormatData::Append
+                    } else {
+                        AppendFreeFormatData::Overwrite
+                    }
+                }),
+            });
+        let arg =
+            FurnishChargingInformationArg::from_characteristics(&characteristics).map_err(err)?;
+        staged_cap_invoke(
+            gsm_cap::op_codes::FURNISH_CHARGING_INFORMATION,
+            &arg,
+            OperationClass::Two,
+        )
+    }
+
+    /// Stage a CAP Cancel invoke (TS 29.078 11.8): cancel the announcement of
+    /// the PlayAnnouncement / PromptAndCollectUserInformation invoke
+    /// `invoke_id`, or, with `all_requests=True`, every outstanding request of
+    /// the dialogue.
+    #[pyo3(signature = (*, invoke_id=None, all_requests=false))]
+    fn cancel(&self, invoke_id: Option<i64>, all_requests: bool) -> PyResult<StagedInvoke> {
+        use gsm_cap::operations::CancelArg;
+        let arg = match (invoke_id, all_requests) {
+            (Some(id), false) => CancelArg::InvokeId(i64::from(invoke_id_arg(id)?).into()),
+            (None, true) => CancelArg::AllRequests(()),
+            _ => return Err(err("cancel: give invoke_id or all_requests=True")),
+        };
+        staged_cap_invoke(gsm_cap::op_codes::CANCEL, &arg, OperationClass::Two)
+    }
+
     fn __repr__(&self) -> String {
         "gsm_cap".to_string()
     }
@@ -3345,6 +3510,51 @@ fn staged_inap_invoke<T: rasn::Encode>(
 ) -> PyResult<StagedInvoke> {
     let bytes = inap::encode(arg).map_err(err)?;
     Ok(StagedInvoke::new(op, Some(bytes), class))
+}
+
+/// `disconnectForwardConnection` (TS 29.078 clause 5.3). gsm_cap 3 has no
+/// constant for it: the operation has no argument and so no type there.
+const DISCONNECT_FORWARD_CONNECTION: i64 = 18;
+
+/// Encode a CAP argument to BER and stage it as an `Invoke` of `op`.
+fn staged_cap_invoke<T: rasn::Encode>(
+    op: i64,
+    arg: &T,
+    class: OperationClass,
+) -> PyResult<StagedInvoke> {
+    let bytes = gsm_cap::encode(arg).map_err(err)?;
+    Ok(StagedInvoke::new(op, Some(bytes), class))
+}
+
+/// The CAP `InformationToSend` of a PlayAnnouncement or a prompt: an
+/// elementary message id, a tone, or the BER of a value, exactly one of them;
+/// `None` when none is given.
+fn cap_information_to_send(
+    message_id: Option<u32>,
+    tone_id: Option<u32>,
+    tone_duration: Option<u32>,
+    encoded: Option<Vec<u8>>,
+) -> PyResult<Option<gsm_cap::types::InformationToSend>> {
+    use gsm_cap::types::{InbandInfo, InformationToSend, MessageId, Tone};
+    Ok(match (message_id, tone_id, encoded) {
+        (None, None, None) => None,
+        (Some(id), None, None) => Some(InformationToSend::InbandInfo(InbandInfo::new(
+            MessageId::ElementaryMessageId(id),
+        ))),
+        (None, Some(tone_id), None) => Some(InformationToSend::Tone(Tone {
+            tone_id,
+            duration: tone_duration,
+        })),
+        (None, None, Some(bytes)) => Some(
+            gsm_cap::decode::<InformationToSend>(&bytes)
+                .map_err(|e| err(format!("information_to_send is not an InformationToSend: {e}")))?,
+        ),
+        _ => {
+            return Err(err(
+                "give one of message_id, tone_id and information_to_send, not several",
+            ))
+        }
+    })
 }
 
 /// One `events` entry of a RequestReportBCSMEvent builder: `(event_type,
