@@ -175,6 +175,43 @@ pub struct Association {
     /// means every default of [`M2paLink`].
     #[serde(default)]
     pub m2pa: Option<M2paLink>,
+    /// For m3ua associations only: the heartbeat and the acknowledgement timer
+    /// of this association. Absent means every default of [`M3uaPeer`].
+    #[serde(default)]
+    pub m3ua: Option<M3uaPeer>,
+}
+
+/// The `m3ua:` block of an association: what RFC 4666 leaves to provisioning
+/// for one M3UA peer. Every timer is in milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct M3uaPeer {
+    /// T(beat), the interval at which this node sends Heartbeat on the
+    /// association (RFC 4666 4.3.4.6). `0`, the default, sends none: SCTP has
+    /// its own heartbeat. With an interval set, a peer from which nothing at
+    /// all arrives for twice that long is taken to be unavailable and the
+    /// association is aborted. A Heartbeat from the peer is acknowledged
+    /// whatever is set here.
+    pub beat_ms: u64,
+    /// T(ack), after which an ASP Up or ASP Active this node sent as an ASP
+    /// is sent again while it is not acknowledged (RFC 4666 4.3.4.1 and
+    /// 4.3.4.3, "provisionable, with a default of 2 seconds"). Only a `client`
+    /// association sends them.
+    pub ack_ms: u64,
+    /// The ASP Identifier this node puts in its ASP Up as an ASP (RFC 4666
+    /// 3.5.1, "a unique value that is locally significant among the ASPs that
+    /// support an AS"). Absent, the parameter is left out, which it may be.
+    pub asp_id: Option<u32>,
+}
+
+impl Default for M3uaPeer {
+    fn default() -> Self {
+        Self {
+            beat_ms: 0,
+            ack_ms: 2_000,
+            asp_id: None,
+        }
+    }
 }
 
 /// Which proving period a link asks for at alignment (ITU-T Q.703 7.1).
@@ -313,6 +350,34 @@ pub struct ApplicationServer {
     pub routing_context: u32,
     /// The member ASPs: association ids, each an m3ua association.
     pub asps: Vec<String>,
+    /// T(r), the recovery timer in milliseconds (RFC 4666 4.3.2 and 4.3.4.4):
+    /// how long the server is pending, and traffic for it queued, after its
+    /// last active ASP left. "T(r) is configurable by the network operator";
+    /// the RFC names no value, 2000 is the default here. `0` switches the
+    /// pending state off: the server is inactive or down at once.
+    #[serde(default = "default_recovery_ms")]
+    pub recovery_ms: u64,
+    /// Messages queued for the server while it is pending, before further
+    /// ones are discarded.
+    #[serde(default = "default_pending_queue")]
+    pub pending_queue: usize,
+    /// "n" of RFC 4666 4.3.2: the number of ASPs that have to be active
+    /// before the server is, and below which its inactive ASPs are told
+    /// ("Insufficient ASP Resources Active in AS"). 1 for an override server.
+    #[serde(default = "default_required_asps")]
+    pub required_asps: usize,
+}
+
+fn default_recovery_ms() -> u64 {
+    2_000
+}
+
+fn default_pending_queue() -> usize {
+    4_096
+}
+
+fn default_required_asps() -> usize {
+    1
 }
 
 /// A link within a linkset: the association it rides (which also identifies it).
@@ -1012,6 +1077,20 @@ impl Config {
                 // known. Here just a sanity bound against the widest (ANSI).
                 pc.resolve(Variant::Ansi)?;
             }
+            if let Some(m3ua) = &a.m3ua {
+                if a.adaptation != Adaptation::M3ua {
+                    return Err(Error::validation(format!(
+                        "association `{}` has an `m3ua:` block but is not an m3ua association",
+                        a.id
+                    )));
+                }
+                if m3ua.ack_ms == 0 {
+                    return Err(Error::validation(format!(
+                        "association `{}`: m3ua `ack_ms` must not be 0",
+                        a.id
+                    )));
+                }
+            }
             if let Some(m2pa) = &a.m2pa {
                 if a.adaptation != Adaptation::M2pa {
                     return Err(Error::validation(format!(
@@ -1085,6 +1164,24 @@ impl Config {
             if a.asps.is_empty() {
                 return Err(where_(format!(
                     "application_server `{}` has no asps",
+                    a.name
+                )));
+            }
+            if a.pending_queue == 0 {
+                return Err(where_(format!(
+                    "application_server `{}`: `pending_queue` must not be 0",
+                    a.name
+                )));
+            }
+            // RFC 4666 4.3.2: "n = 1 for Override Traffic Mode".
+            let most = if a.traffic_mode == TrafficMode::Override {
+                1
+            } else {
+                a.asps.len()
+            };
+            if a.required_asps == 0 || a.required_asps > most {
+                return Err(where_(format!(
+                    "application_server `{}`: `required_asps` must be between 1 and {most}",
                     a.name
                 )));
             }
@@ -2096,5 +2193,97 @@ sccp:
             let err = Config::parse(&yaml).unwrap_err().to_string();
             assert!(err.contains(key) && err.contains("must not be 0"), "{err}");
         }
+    }
+    const M3UA_NODE: &str = "node: { point_code: 1000, variant: ITU }\nassociations:\n  - { id: a1, adaptation: m3ua, role: server, addrs: [192.0.2.1], port: 2905 }\n  - { id: a2, adaptation: m3ua, role: client, addrs: [192.0.2.2], port: 2905 }\n";
+
+    #[test]
+    fn m3ua_management_defaults_to_the_values_of_rfc_4666() {
+        // No `m3ua:` block and none of the server keys: a 3.0 file loads
+        // unchanged.
+        let cfg = Config::parse(&format!(
+            "{M3UA_NODE}application_servers:\n  - {{ name: as1, traffic_mode: loadshare, routing_context: 1, asps: [a1, a2] }}\n"
+        ))
+        .unwrap();
+        assert!(cfg.associations[0].m3ua.is_none());
+        let peer = M3uaPeer::default();
+        // 4.3.4.6: the heartbeat is optional. 4.3.4.1: T(ack) "is
+        // provisionable, with a default of 2 seconds".
+        assert_eq!((peer.beat_ms, peer.ack_ms, peer.asp_id), (0, 2_000, None));
+        let server = &cfg.default_tenant().unwrap().application_servers[0];
+        assert_eq!(
+            (
+                server.recovery_ms,
+                server.pending_queue,
+                server.required_asps
+            ),
+            (2_000, 4_096, 1)
+        );
+    }
+
+    #[test]
+    fn the_m3ua_keys_are_read() {
+        let cfg = Config::parse(
+            "node: { point_code: 1000, variant: ITU }\nassociations:\n  - { id: a1, adaptation: m3ua, role: client, addrs: [192.0.2.1], port: 2905, m3ua: { beat_ms: 30000, ack_ms: 500, asp_id: 7 } }\n  - { id: a2, adaptation: m3ua, role: server, addrs: [192.0.2.2], port: 2905, m3ua: { beat_ms: 1000 } }\napplication_servers:\n  - { name: as1, traffic_mode: broadcast, routing_context: 1, asps: [a1, a2], recovery_ms: 0, pending_queue: 16, required_asps: 2 }\n",
+        )
+        .unwrap();
+        let peer = cfg.associations[0].m3ua.clone().unwrap();
+        assert_eq!(
+            (peer.beat_ms, peer.ack_ms, peer.asp_id),
+            (30_000, 500, Some(7))
+        );
+        // The keys left out keep their defaults.
+        assert_eq!(cfg.associations[1].m3ua.clone().unwrap().ack_ms, 2_000);
+        let server = &cfg.default_tenant().unwrap().application_servers[0];
+        assert_eq!(
+            (
+                server.recovery_ms,
+                server.pending_queue,
+                server.required_asps
+            ),
+            (0, 16, 2)
+        );
+    }
+
+    #[test]
+    fn rejects_m3ua_settings_that_cannot_work() {
+        let bad = |yaml: &str, expect: &str| {
+            let err = Config::parse(yaml).unwrap_err();
+            assert!(
+                err.to_string().contains(expect),
+                "{err} does not say `{expect}`"
+            );
+        };
+        let server = |keys: &str| {
+            format!(
+                "{M3UA_NODE}application_servers:\n  - {{ name: as1, traffic_mode: loadshare, routing_context: 1, asps: [a1, a2], {keys} }}\n"
+            )
+        };
+        // More ASPs required than the server has, or none.
+        bad(
+            &server("required_asps: 3"),
+            "`required_asps` must be between 1 and 2",
+        );
+        bad(
+            &server("required_asps: 0"),
+            "`required_asps` must be between 1 and 2",
+        );
+        bad(&server("pending_queue: 0"), "`pending_queue` must not be 0");
+        // RFC 4666 4.3.2: "n = 1 for Override Traffic Mode".
+        bad(
+            &format!(
+                "{M3UA_NODE}application_servers:\n  - {{ name: as1, traffic_mode: override, routing_context: 1, asps: [a1, a2], required_asps: 2 }}\n"
+            ),
+            "`required_asps` must be between 1 and 1",
+        );
+        // A timer of 0 would fire at once, forever.
+        bad(
+            "node: { point_code: 1000, variant: ITU }\nassociations:\n  - { id: a1, adaptation: m3ua, role: client, addrs: [192.0.2.1], port: 2905, m3ua: { ack_ms: 0 } }\n",
+            "m3ua `ack_ms` must not be 0",
+        );
+        // The block belongs to an m3ua association.
+        bad(
+            "node: { point_code: 1000, variant: ITU }\nassociations:\n  - { id: x1, adaptation: m2pa, role: client, addrs: [192.0.2.1], port: 3565, m3ua: { beat_ms: 500 } }\n",
+            "is not an m3ua association",
+        );
     }
 }

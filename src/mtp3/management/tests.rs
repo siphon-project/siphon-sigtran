@@ -1309,3 +1309,52 @@ fn a_short_isolation_does_not_restart_and_a_long_one_does() {
     let restarted = m.handle(Input::LinkUp { link: 0 });
     assert!(restarted.contains(&Action::Restarting(true)));
 }
+
+// ── 13.4: a destination reached by restricted routes only ────────────────────
+
+#[test]
+fn a_destination_is_restricted_while_every_route_in_use_is() {
+    let restricted = |actions: &[Action], dpc: u32| {
+        actions.iter().find_map(|a| match a {
+            Action::Restricted {
+                dpc: about,
+                restricted,
+            } if *about == dpc => Some(*restricted),
+            _ => None,
+        })
+    };
+    let mut m = running();
+    // 2300 has the one route through C: restricted there, it is restricted.
+    let tfr = |dpc| M::Tfr {
+        destination: pc(dpc),
+    };
+    let tfa = |dpc| M::Tfa {
+        destination: pc(dpc),
+    };
+    let actions = from(&mut m, 3, C, 0, tfr(2300));
+    assert_eq!(restricted(&actions, 2300), Some(true));
+    assert!(m.is_accessible(2300), "it can still be reached");
+    // Said once.
+    assert_eq!(restricted(&from(&mut m, 3, C, 0, tfr(2300)), 2300), None);
+    let actions = from(&mut m, 3, C, 0, tfa(2300));
+    assert_eq!(restricted(&actions, 2300), Some(false));
+
+    // 2200 is shared by B and C: restricted through one of them, the other
+    // carries it alone and it is not restricted.
+    let actions = from(&mut m, 2, B, 0, tfr(2200));
+    assert_eq!(restricted(&actions, 2200), None);
+    let actions = from(&mut m, 3, C, 0, tfr(2200));
+    assert_eq!(restricted(&actions, 2200), Some(true));
+    // The link to C fails: B's restricted route is all there is, and still
+    // is. The link to B fails too: inaccessible, which says it all.
+    let actions = m.handle(Input::LinkDown { link: 3, bsnt: 0 });
+    assert_eq!(restricted(&actions, 2200), None);
+    let actions = m.handle(Input::LinkDown { link: 2, bsnt: 0 });
+    assert_eq!(restricted(&actions, 2200), None);
+    assert!(actions.contains(&Action::Accessibility {
+        dpc: 2200,
+        accessible: false
+    }));
+    // A destination behind an application server is never restricted.
+    assert_eq!(restricted(&from(&mut m, 0, A, 0, tfr(2400)), 2400), None);
+}

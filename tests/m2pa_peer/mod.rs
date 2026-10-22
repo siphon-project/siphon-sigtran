@@ -755,6 +755,16 @@ impl Read {
 /// Have `tshark` read frames the node sent and report `fields` for each.
 /// `None` when `tshark` is not installed (see [`tshark_available`]).
 pub fn wireshark(frames: &[Frame], fields: &[&str]) -> Option<Read> {
+    dissect(frames, fields, "f")
+}
+
+/// [`wireshark`] with every occurrence of a field in a frame, separated by
+/// commas: for a parameter that is a list.
+pub fn wireshark_every(frames: &[Frame], fields: &[&str]) -> Option<Read> {
+    dissect(frames, fields, "a")
+}
+
+fn dissect(frames: &[Frame], fields: &[&str], occurrence: &str) -> Option<Read> {
     if !tshark_available() {
         return None;
     }
@@ -791,7 +801,17 @@ pub fn wireshark(frames: &[Frame], fields: &[&str]) -> Option<Read> {
     };
 
     let names: Vec<Vec<&str>> = fields.iter().map(|f| field_names(f)).collect();
-    let mut args = vec!["-T", "fields", "-E", "separator=|", "-E", "occurrence=f"];
+    let occurrence = format!("occurrence={occurrence}");
+    let mut args = vec![
+        "-T",
+        "fields",
+        "-E",
+        "separator=|",
+        "-E",
+        "aggregator=,",
+        "-E",
+        &occurrence,
+    ];
     for name in names.iter().flatten() {
         args.push("-e");
         args.push(name);

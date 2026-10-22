@@ -1737,9 +1737,9 @@ dependencies = [
 
 [[package]]
 name = "m3ua"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "034364374aa58b7153aceab0969c55725a4b2d51a7d3eeb525b0a5ad9e3f3d08"
+checksum = "33841bc19d1edf8fb7698abf2da7e9a386b6cb83ecb86d8d92527fbac04c1327"
 dependencies = [
  "thiserror 2.0.21",
 ]
