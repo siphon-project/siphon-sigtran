@@ -134,6 +134,41 @@ assert node.open_dialogues() == 0   # the End closed it
 mo_end = node.decode(frames[0])
 assert mo_end.kind == "end" and mo_end.result is None and mo_end.result_invoke_id == 1
 
+# ── An async handler's event loop is reused when it leaves nothing pending ────
+loops = []
+leave_pending = {"on": False}
+
+@gsm_map.on_operation("mt-forward-sm")
+async def on_mt(dlg, arg):
+    loop = asyncio.get_running_loop()
+    loops.append(loop)
+    if leave_pending["on"]:
+        # A task still pending when the handler returns: the loop must not be
+        # handed to the next handler.
+        loop.create_task(asyncio.sleep(3600))
+    dlg.reply(gsm_map.mt_forward_sm_res())
+    dlg.end()
+
+def mt_begin():
+    return node.assemble_begin(
+        op="mt-forward-sm",
+        called_gt="15550100",
+        called_ssn=8,
+        calling_gt="15550142",
+        ac=gsm_map.AC.short_msg_mt_relay,
+    )
+
+node.deliver(mt_begin(), opc=2000, dpc=1000)
+node.deliver(mt_begin(), opc=2000, dpc=1000)
+assert loops[0] is loops[1], "an idle loop is reused by the next handler"
+assert not loops[0].is_closed()
+leave_pending["on"] = True
+node.deliver(mt_begin(), opc=2000, dpc=1000)
+leave_pending["on"] = False
+node.deliver(mt_begin(), opc=2000, dpc=1000)
+assert loops[2].is_closed(), "a loop left with a pending task is closed"
+assert loops[3] is not loops[2], "and the next handler gets another loop"
+
 # ── Full HLR: updateLocation held open for an insertSubscriberData leg ─────────
 # The engine terminates updateLocation; the HLR pushes subscriber data to the
 # VLR (a Continue that holds the dialogue open), then closes with the

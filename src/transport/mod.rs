@@ -131,6 +131,12 @@ pub enum TransportError {
 /// Transport result alias.
 pub type Result<T> = std::result::Result<T, TransportError>;
 
+/// Lanes [`TransportHandle::serve_dialogues`] terminates dialogues on: how many
+/// handlers can run at once.
+const DIALOGUE_LANES: usize = 32;
+/// Deliveries a lane holds before the transport waits for it.
+const LANE_DEPTH: usize = 256;
+
 /// A message the router decided terminates locally, handed to the dialogue SAP
 /// over the transport's local-delivery channel. Carries the decoded MSU plus the
 /// association it arrived on, so the dialogue engine's reply goes back to the
@@ -323,6 +329,38 @@ impl TransportHandle {
         let router = self.router.clone();
         let tenant = self.tenant.clone();
         let mut shutdown = self.shutdown_tx.subscribe();
+        // Dialogues are terminated side by side on lanes. A lane takes one
+        // dialogue's messages in order (keyed on its transaction ID, see
+        // `dialogue_lane`), and runs each on a blocking thread, since a handler
+        // (a script among them) may take as long as it likes. One task for all
+        // of them made every dialogue wait for the slowest handler before it.
+        let mut lanes = Vec::with_capacity(DIALOGUE_LANES);
+        for _ in 0..DIALOGUE_LANES {
+            let (lane_tx, mut lane_rx) = mpsc::channel::<LocalDelivery>(LANE_DEPTH);
+            let engine = Arc::clone(&engine);
+            let registry = registry.clone();
+            self.tasks.push(tokio::spawn(async move {
+                while let Some(delivery) = lane_rx.recv().await {
+                    let engine = Arc::clone(&engine);
+                    let ingress = delivery.ingress_assoc.clone();
+                    let delivered = tokio::task::spawn_blocking(move || {
+                        engine.deliver(&delivery.msu, &delivery.ingress_assoc)
+                    })
+                    .await;
+                    match delivered {
+                        Ok(outs) => {
+                            for out in outs {
+                                send_reply(&registry, &ingress, &out).await;
+                            }
+                        }
+                        Err(error) => eprintln!(
+                            "siphon-sigtran: ERROR: a dialogue handler on `{ingress}` panicked: {error}"
+                        ),
+                    }
+                }
+            }));
+            lanes.push(lane_tx);
+        }
         let task = tokio::spawn(async move {
             // Age dialogues once a second; the timers themselves are seconds.
             let mut sweep = tokio::time::interval(Duration::from_secs(1));
@@ -331,8 +369,10 @@ impl TransportHandle {
                     _ = shutdown.changed() => break,
                     maybe = rx.recv() => {
                         let Some(delivery) = maybe else { break };
-                        for out in engine.deliver(&delivery.msu, &delivery.ingress_assoc) {
-                            send_reply(&registry, &delivery.ingress_assoc, &out).await;
+                        let lane = (crate::dialogue::dialogue_lane(&delivery.msu)
+                            % DIALOGUE_LANES as u64) as usize;
+                        if lanes[lane].send(delivery).await.is_err() {
+                            break;
                         }
                     }
                     _ = sweep.tick() => {

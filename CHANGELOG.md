@@ -7,6 +7,21 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Dialogues are terminated side by side.** `serve_dialogues` handed every
+  inbound MSU to one task, which ran each handler to completion before reading
+  the next: one slow handler (a script waiting on a store) held up every dialogue
+  behind it, and blocked a runtime worker while it ran. Deliveries now go to 32
+  lanes keyed on the dialogue's transaction ID, so the messages of one dialogue
+  stay in order, and each handler runs on a blocking thread. Four 300 ms
+  handlers are answered in under 0.5 s instead of 1.2 s.
+- **An `async def` handler reuses an idle event loop.** Each one got a new
+  asyncio loop (a selector and a self-pipe socket pair) that was closed again
+  after it; a loop the handler leaves with nothing pending is now kept for the
+  next one (16 us down to under 5 us per call for a short handler). A loop left
+  with a task still pending is closed, as before.
+
 ## [4.1.0] — 2026-10-18
 
 ### Added

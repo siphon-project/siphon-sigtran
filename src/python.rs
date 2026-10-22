@@ -2199,9 +2199,18 @@ fn origination_begin<'py>(
     })
 }
 
+/// Event loops a finished `async def` handler left with nothing pending, kept
+/// for the next one. Creating a loop (a selector, a self-pipe socket pair) and
+/// closing it again cost more than running a short handler on it.
+static IDLE_LOOPS: Mutex<Vec<Py<PyAny>>> = Mutex::new(Vec::new());
+/// Loops kept idle at most; one per handler running at the same time is enough.
+const IDLE_LOOPS_KEPT: usize = 64;
+
 /// Drive a possibly-async result to completion. A plain return value is done; a
-/// coroutine is run on a fresh asyncio event loop (mirroring how an `async def`
-/// handler runs on siphon's runtime).
+/// coroutine is run on an asyncio event loop of its own for the duration,
+/// mirroring how an `async def` handler runs on siphon's runtime. A loop the
+/// handler leaves with no task pending is reused by a later handler; one with
+/// tasks still pending is closed, as every loop was before.
 fn drive(py: Python<'_>, result: &Bound<'_, PyAny>) -> PyResult<()> {
     let asyncio = py.import("asyncio")?;
     if !asyncio
@@ -2210,9 +2219,32 @@ fn drive(py: Python<'_>, result: &Bound<'_, PyAny>) -> PyResult<()> {
     {
         return Ok(());
     }
-    let event_loop = asyncio.call_method0("new_event_loop")?;
+    let idle = IDLE_LOOPS.lock().ok().and_then(|mut idle| idle.pop());
+    let event_loop = match idle {
+        Some(event_loop) => event_loop.into_bound(py),
+        None => asyncio.call_method0("new_event_loop")?,
+    };
     let outcome = event_loop.call_method1("run_until_complete", (result,));
-    let _ = event_loop.call_method0("close");
+    let reusable = asyncio
+        .call_method1("all_tasks", (&event_loop,))
+        .and_then(|pending| pending.len())
+        .map(|pending| pending == 0)
+        .unwrap_or(false);
+    let kept = reusable
+        && IDLE_LOOPS
+            .lock()
+            .map(|mut idle| {
+                if idle.len() < IDLE_LOOPS_KEPT {
+                    idle.push(event_loop.clone().unbind());
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+    if !kept {
+        let _ = event_loop.call_method0("close");
+    }
     outcome.map(|_| ())
 }
 
