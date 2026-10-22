@@ -225,24 +225,46 @@ call. The families:
 | `sigtran_tcap_discarded_total` | counter | `reason` |
 | `sigtran_tcap_send_errors_total` | counter | |
 | `sigtran_rx_discarded_total` | counter | `reason` |
+| `sigtran_m2pa_discarded_total` | counter | `reason` |
+| `sigtran_m2pa_link_failures_total` | counter | `reason` |
+| `sigtran_link_tests_total` | counter | `result` |
 | `sigtran_loops_detected_total` | counter | `kind` |
 | `sigtran_isup_screened_total` | counter | `reason` |
 | `sigtran_admission_refused_total` | counter | `reason`, `action` |
 
 `sigtran_rx_discarded_total` counts what an association received and dropped
 before routing: `ppid` (not the adaptation layer's payload protocol identifier),
-`undecodable`, `out-of-state` (traffic from an ASP that is not active, or on a
-link that is not in service), `no-payload` (a data message without its user
-part) and `not-unitdata` (addressed to a local subsystem and not a message the
-dialogue engine reads: a segment of a segmented XUDT, an LUDT, a service
-message). Each is also a line on stderr naming the association. Alert on any of
-them moving.
+`undecodable`, `out-of-state` (traffic from an ASP that is not active),
+`no-payload` (a data message without its user part), `not-unitdata` (addressed
+to a local subsystem and not a message the dialogue engine reads: a segment of
+a segmented XUDT, an LUDT, a service message) and `link-test` (a signalling
+link test message for another point code, for a link code the linkset does not
+have, or an acknowledgement of a test that is not running). Each is also a line
+on stderr naming the association. Alert on any of them moving.
 
 The dialogue engine reads a UDT and an XUDT that holds a whole message (no
 segmentation parameter, or one that says first segment, none remaining), and
 answers in the form the dialogue was opened in: XUDT for XUDT, with a hop
 counter of 15. It does not reassemble: the segments of a segmented XUDT are
 counted under `not-unitdata` and the message is not answered.
+
+An M2PA link has three families of its own. `sigtran_m2pa_link_state` is `0`
+while the link is out of service or aligning, `1` once level 2 is in service
+(aligned, the link test still to pass, or the peer in processor outage) and `2`
+when the link is available for traffic. `sigtran_m2pa_link_failures_total`
+counts every time a link leaves service or fails to align, by `reason`: `t1`,
+`t2`, `t3` (alignment timers), `t6` (the peer stayed busy), `t7` (a message was
+not acknowledged), `peer-status` (the peer sent Alignment, Proving or Out of
+Service), `abnormal-bsn`, `link-test`, `association` (SCTP lost) and `stopped`.
+`sigtran_m2pa_discarded_total` counts messages a link did not carry:
+`rx-out-of-sequence`, `rx-not-in-service`, `rx-abnormal-bsn`,
+`tx-not-in-service`, `tx-congestion` (the transmit queue was full),
+`tx-lost-on-failure` (sent or queued, not acknowledged, and the link failed),
+`tx-flushed-by-peer` (discarded by a peer recovering from processor outage) and
+`encode`. `sigtran_link_tests_total` counts signalling link test messages
+`sent`, `passed` and `failed`. A link that keeps failing its test, or a
+`tx-lost-on-failure` that moves, is traffic lost: there is no changeover to
+another link yet.
 
 Good first panels: linkset / ASP state and route availability (is the node
 wired up?), MSU rate by SI, GTT translations vs errors, active dialogues, and

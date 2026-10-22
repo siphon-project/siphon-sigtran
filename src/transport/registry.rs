@@ -11,13 +11,100 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use async_sctp::SctpAssociation;
 use mtp3::Variant;
+use tokio::sync::{mpsc, watch};
 
-use crate::config::{Adaptation, Config, TenantId, TrafficMode};
+use super::m2pa::link::{Discard, LinkTimers, Proving};
+use crate::config::{Adaptation, Config, M2paLink, ProvingMode, TenantId, TrafficMode};
+use crate::metrics;
 use crate::mtp3::route::Destination;
 use crate::routing::Router;
+
+/// What the signalling link test of a link needs (ITU-T Q.707 2.2).
+#[derive(Debug, Clone)]
+pub struct LinkTestSettings {
+    /// T1, supervision of the acknowledgement.
+    pub t1: Duration,
+    /// T2, interval between tests.
+    pub t2: Duration,
+    /// The pattern sent, and expected back.
+    pub pattern: Vec<u8>,
+}
+
+/// Everything the task of one M2PA link is configured with.
+#[derive(Debug, Clone)]
+pub struct LinkSettings {
+    /// The level-2 timers.
+    pub timers: LinkTimers,
+    /// The proving period this end asks for.
+    pub proving: Proving,
+    /// MSUs held for transmission before the link discards.
+    pub tx_queue: usize,
+    /// Delay before alignment is tried again (Q.704 T17).
+    pub restart: Duration,
+    /// The test this node runs on the link; `None` when it is switched off or
+    /// the link has no adjacent point code to address it to.
+    pub test: Option<LinkTestSettings>,
+    /// This node's point code.
+    pub own_pc: u32,
+    /// The point at the other end of the link.
+    pub adjacent_pc: Option<u32>,
+    /// The network indicator of this node.
+    pub ni: u8,
+    /// The signalling link code of the link in its linkset.
+    pub slc: u8,
+}
+
+/// The transmit side of one M2PA link: MSUs are numbered and sent by the link's
+/// own task, so every sender hands them over here.
+pub struct LinkPort {
+    /// The link's configuration.
+    pub settings: LinkSettings,
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Held by the task that currently runs the link.
+    pub(super) rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// Bumped when a new association takes the link over.
+    pub(super) generation: watch::Sender<u64>,
+    /// Level 2 is in service (aligned), whether or not the link is available.
+    aligned: AtomicBool,
+}
+
+impl LinkPort {
+    fn new(settings: LinkSettings) -> Self {
+        let (tx, rx) = mpsc::channel(settings.tx_queue.max(1));
+        Self {
+            settings,
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
+            generation: watch::channel(0).0,
+            aligned: AtomicBool::new(false),
+        }
+    }
+
+    /// Hand an MSU (SIO and SIF) to the link for transmission. `false`, counted,
+    /// when the link's transmit queue is full (transmit congestion, Q.704 3.8).
+    pub fn offer(&self, msu: Vec<u8>) -> bool {
+        match self.tx.try_send(msu) {
+            Ok(()) => true,
+            Err(_) => {
+                metrics::m2pa_discard(Discard::TxCongestion, 1);
+                false
+            }
+        }
+    }
+
+    /// Record whether level 2 is in service, for the link state gauge.
+    pub(super) fn set_aligned(&self, on: bool) {
+        self.aligned.store(on, Ordering::Relaxed);
+    }
+
+    fn is_aligned(&self) -> bool {
+        self.aligned.load(Ordering::Relaxed)
+    }
+}
 
 /// One SCTP association's live slot. The sender is set once the association is
 /// established (client connect / server accept); the `active` flag tracks the
@@ -31,16 +118,24 @@ pub struct AssocSlot {
     sender: RwLock<Option<Arc<SctpAssociation>>>,
     /// Whether the adaptation layer is carrying traffic (ASP-Active / in-service).
     active: AtomicBool,
+    /// For an m2pa association: the link it is.
+    link: Option<LinkPort>,
 }
 
 impl AssocSlot {
-    fn new(id: String, adaptation: Adaptation) -> Self {
+    fn new(id: String, adaptation: Adaptation, link: Option<LinkPort>) -> Self {
         Self {
             id,
             adaptation,
             sender: RwLock::new(None),
             active: AtomicBool::new(false),
+            link,
         }
+    }
+
+    /// The M2PA link this association is, if it is one.
+    pub fn link(&self) -> Option<&LinkPort> {
+        self.link.as_ref()
     }
 
     /// Install the live association handle (on connect / accept).
@@ -95,6 +190,9 @@ struct LinksetEntry {
 pub struct Selected {
     /// The egress association handle.
     pub assoc: Arc<SctpAssociation>,
+    /// The slot of that association. An M2PA egress sends through its
+    /// [`AssocSlot::link`], not on the association directly.
+    pub slot: Arc<AssocSlot>,
     /// The AS routing context (M3UA / SUA), if this egress is an AS.
     pub routing_context: Option<u32>,
     /// The egress association's adaptation, so the forwarder frames the MSU for
@@ -116,13 +214,51 @@ impl Registry {
     /// is unknown.
     pub fn build(config: &Config, tenant_id: &str) -> Option<Self> {
         let tenant = config.tenant(tenant_id)?;
+        let own_pc = tenant
+            .resolved_point_code()
+            .map(|pc| pc.value())
+            .unwrap_or(tenant.point_code.0);
         let assocs = config
             .associations
             .iter()
             .map(|a| {
+                let link = (a.adaptation == Adaptation::M2pa).then(|| {
+                    // The linkset the link is in gives it its link code and
+                    // its test; a link in no linkset is code 0, untested.
+                    let place = tenant.linksets.iter().find_map(|ls| {
+                        ls.links
+                            .iter()
+                            .position(|l| l.assoc == a.id)
+                            .map(|index| (ls, index))
+                    });
+                    let adjacent_pc = a.adjacent_pc.map(|pc| pc.0);
+                    let test = place.and_then(|(ls, _)| {
+                        let pattern = ls.link_test.pattern_octets()?;
+                        (ls.link_test.enabled && adjacent_pc.is_some()).then(|| LinkTestSettings {
+                            t1: Duration::from_millis(ls.link_test.t1_ms),
+                            t2: Duration::from_millis(ls.link_test.t2_ms),
+                            pattern,
+                        })
+                    });
+                    let m2pa = a.m2pa.clone().unwrap_or_default();
+                    LinkPort::new(LinkSettings {
+                        timers: link_timers(&m2pa),
+                        proving: match m2pa.proving {
+                            ProvingMode::Normal => Proving::Normal,
+                            ProvingMode::Emergency => Proving::Emergency,
+                        },
+                        tx_queue: m2pa.tx_queue,
+                        restart: Duration::from_millis(m2pa.restart_ms),
+                        test,
+                        own_pc,
+                        adjacent_pc,
+                        ni: tenant.network_indicator.bits(),
+                        slc: place.map_or(0, |(ls, index)| ls.slc_of(index)),
+                    })
+                });
                 (
                     a.id.clone(),
-                    Arc::new(AssocSlot::new(a.id.clone(), a.adaptation)),
+                    Arc::new(AssocSlot::new(a.id.clone(), a.adaptation, link)),
                 )
             })
             .collect();
@@ -197,11 +333,23 @@ impl Registry {
             .map(|l| Destination::Linkset(l.name.clone()))
     }
 
+    /// The link with signalling link code `slc` in the linkset that the link
+    /// `assoc_id` belongs to (which may be `assoc_id` itself).
+    pub fn link_by_slc(&self, assoc_id: &str, slc: u8) -> Option<&Arc<AssocSlot>> {
+        let linkset = self
+            .linksets
+            .iter()
+            .find(|l| l.links.iter().any(|x| x == assoc_id))?;
+        linkset
+            .links
+            .iter()
+            .filter_map(|id| self.assocs.get(id))
+            .find(|slot| slot.link().is_some_and(|l| l.settings.slc == slc))
+    }
+
     /// Recompute AS + linkset availability from the current slot states, push it
     /// into the router's route state, and refresh the Prometheus state gauges.
     pub fn recompute(&self, router: &Router) {
-        use crate::metrics;
-
         // Per-association transport state, plus the M2PA link-liveness gauge.
         for slot in self.assocs.values() {
             let assoc_state = if slot.is_carrying() {
@@ -216,10 +364,10 @@ impl Registry {
                 adaptation_label(slot.adaptation),
                 assoc_state,
             );
-            if slot.adaptation == Adaptation::M2pa {
+            if let Some(link) = slot.link() {
                 let ls = if slot.is_carrying() {
                     metrics::M2paLinkState::InService
-                } else if slot.sender().is_some() {
+                } else if link.is_aligned() && slot.sender().is_some() {
                     metrics::M2paLinkState::Aligned
                 } else {
                     metrics::M2paLinkState::Failed
@@ -281,6 +429,7 @@ impl Registry {
                     .filter_map(|i| {
                         slots[i].sender().map(|assoc| Selected {
                             assoc,
+                            slot: slots[i].clone(),
                             routing_context: Some(a.routing_context),
                             adaptation: slots[i].adaptation,
                         })
@@ -304,6 +453,7 @@ impl Registry {
                     .filter_map(|i| {
                         slots[i].sender().map(|assoc| Selected {
                             assoc,
+                            slot: slots[i].clone(),
                             routing_context: None,
                             adaptation: slots[i].adaptation,
                         })
@@ -311,6 +461,20 @@ impl Registry {
                     .collect()
             }
         }
+    }
+}
+
+/// The level-2 timers of a link from its `m2pa:` block.
+fn link_timers(m2pa: &M2paLink) -> LinkTimers {
+    LinkTimers {
+        t1: Duration::from_millis(m2pa.t1_ms),
+        t2: Duration::from_millis(m2pa.t2_ms),
+        t3: Duration::from_millis(m2pa.t3_ms),
+        t4_normal: Duration::from_millis(m2pa.t4n_ms),
+        t4_emergency: Duration::from_millis(m2pa.t4e_ms),
+        t6: Duration::from_millis(m2pa.t6_ms),
+        t7: Duration::from_millis(m2pa.t7_ms),
+        proving_interval: Duration::from_millis(m2pa.proving_interval_ms),
     }
 }
 

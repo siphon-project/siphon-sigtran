@@ -39,7 +39,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
-use async_sctp::{SctpAssociation, SctpConfig, SctpListener};
+use async_sctp::{SctpAssociation, SctpConfig};
+
+mod m2pa_peer;
 
 use gsm_cap::operations::{EventReportBcsmArg, InitialDpArg, RequestReportBcsmEventArg};
 use gsm_cap::types::{BcsmEvent, EventTypeBcsm, LegId, MiscCallInfo, MonitorMode, ReceivingSideId};
@@ -49,7 +51,7 @@ use gsm_map::operations::mt_forward_sm::MtForwardSmArg;
 use gsm_map::operations::sri_sm::{RoutingInfoForSmArg, RoutingInfoForSmRes};
 use gsm_map::types::{LocationInfoWithLmsi, SmRpDa, SmRpOa};
 
-use m2pa::{LinkState, LinkStatusMessage, M2paMessage, M2paStateMachine};
+use m2pa::M2paMessage;
 use m3ua::{M3uaMessage, MessageType, ProtocolData};
 use mtp3::NetworkIndicator;
 use sccp::{
@@ -72,7 +74,7 @@ use siphon_sigtran::metrics::{self, LoopKind, ScreenReason};
 use siphon_sigtran::mtp3::route::Destination;
 use siphon_sigtran::routing::{Inbound, RouteDecision, Router};
 use siphon_sigtran::transport::Msu;
-use siphon_sigtran::transport::{next_status, Origination};
+use siphon_sigtran::transport::Origination;
 use siphon_sigtran::TransportHandle;
 
 mod common;
@@ -481,74 +483,15 @@ async fn wait_m3ua(assoc: &SctpAssociation, want: MessageType) -> Option<()> {
 
 // ── Synthetic M2PA peer (the node connects to it as an m2pa client) ──────────
 
-/// An M2PA peer: it listens, and on the node's connect it runs link alignment
-/// to In-Service (mirroring the node's own reactive alignment) and collects the
-/// User Data the node forwards out over the linkset.
-struct M2paPeer {
-    port: u16,
-    rx: mpsc::Receiver<Vec<u8>>,
-    task: JoinHandle<()>,
-}
+/// The far end of the `transit` linkset: a conformant M2PA peer that aligns,
+/// answers the signalling link test, acknowledges User Data and collects what
+/// the node forwards over the link. Hand-written from the specifications, see
+/// `tests/m2pa_peer`.
+struct M2paPeer;
 
 impl M2paPeer {
-    async fn spawn() -> Option<Self> {
-        let cfg = SctpConfig::new().nodelay(true);
-        let listener = SctpListener::bind_config("127.0.0.1:0".parse().ok()?, &cfg).ok()?;
-        let port = listener.local_addr().ok()?.port();
-        let (tx, rx) = mpsc::channel(64);
-        let task = tokio::spawn(async move {
-            let assoc = match listener.accept().await {
-                Ok((a, _)) => Arc::new(a),
-                Err(_) => return,
-            };
-            let mut sm = M2paStateMachine::new();
-            sm.start();
-            send_link_status(&assoc, LinkState::Alignment).await;
-            while let Ok((data, info)) = assoc.recv().await {
-                if info.ppid != PPID_M2PA {
-                    continue;
-                }
-                match M2paMessage::decode(&data) {
-                    Ok(M2paMessage::LinkStatus { message, .. }) => {
-                        let new = sm.on_link_status(message.state);
-                        if let Some(next) = next_status(new) {
-                            send_link_status(&assoc, next).await;
-                        }
-                    }
-                    Ok(M2paMessage::UserData { .. }) => {
-                        if tx.send(data).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-        });
-        Some(Self { port, rx, task })
-    }
-
-    async fn recv_out(&mut self) -> Option<Vec<u8>> {
-        timeout(Duration::from_secs(5), self.rx.recv())
-            .await
-            .ok()
-            .flatten()
-    }
-}
-
-impl Drop for M2paPeer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn send_link_status(assoc: &SctpAssociation, state: LinkState) {
-    let msg = M2paMessage::LinkStatus {
-        bsn: 0xFF_FFFF,
-        fsn: 0xFF_FFFF,
-        message: LinkStatusMessage::new(state),
-    };
-    if let Ok(bytes) = msg.encode() {
-        let _ = assoc.send(&bytes, 0, PPID_M2PA).await;
+    async fn spawn() -> Option<m2pa_peer::AutoPeer> {
+        m2pa_peer::AutoPeer::spawn(3000, NODE_PC, 0).await
     }
 }
 
@@ -731,17 +674,19 @@ node: {{ point_code: 1000, variant: ITU, network_indicator: international }}
 associations:
   - {{ id: ingress, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }}
   - {{ id: hlr-a,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }}
-  - {{ id: xit-1,   adaptation: m2pa, role: client, addrs: [127.0.0.1], port: {m2pa_port}, adjacent_pc: 3000 }}
+  - {{ id: xit-1,   adaptation: m2pa, role: client, addrs: [127.0.0.1], port: {m2pa_port}, adjacent_pc: 3000, m2pa: {fast} }}
 application_servers:
   - {{ name: hlr, traffic_mode: override, routing_context: 100, asps: [hlr-a] }}
 linksets:
-  - {{ name: transit, links: [{{assoc: xit-1}}] }}
+  - {{ name: transit, links: [{{assoc: xit-1}}], link_test: {test} }}
 mtp3_routes:
   - {{ dpc: 2000, as: hlr,          priority: 1 }}
   - {{ dpc: 2000, linkset: transit, priority: 2 }}
 sccp:
   local_ssns: [8]
-"#
+"#,
+        fast = m2pa_peer::FAST_M2PA,
+        test = m2pa_peer::FAST_LINK_TEST,
     )
 }
 
