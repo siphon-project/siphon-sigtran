@@ -185,14 +185,14 @@ mod map {
     }
 
     /// The defect the strict decoder closes, pinned on the octets: the generic
-    /// BER decoder returns this answer as complete, with one serving node. A
-    /// service centre acting on that never tries the second node.
+    /// BER decoder of rasn 0.28 returned this answer as complete, with one
+    /// serving node. A service centre acting on that never tries the second
+    /// node.
     #[test]
-    fn the_lenient_decoder_returns_the_malformed_answer_without_its_second_node() {
+    fn a_malformed_answer_is_not_returned_without_its_second_node() {
         let wire = sri_sm_res(&NO_SUCH_ALTERNATIVE);
-        let lenient: RoutingInfoForSmRes =
-            rasn::ber::decode(&wire).expect("the lenient decoder accepts it");
-        assert_eq!(lenient.location_info_with_lmsi.additional_number, None);
+        // rasn 0.28 returned it without the unreadable part; 0.29 refuses it.
+        assert!(rasn::ber::decode::<RoutingInfoForSmRes>(&wire).is_err());
         assert!(gsm_map::decode::<RoutingInfoForSmRes>(&wire).is_err());
     }
 
@@ -273,11 +273,10 @@ mod map {
     }
 
     #[test]
-    fn the_lenient_decoder_returns_the_vector_list_one_short() {
+    fn a_vector_list_is_not_returned_one_short() {
         let wire = sai_res(&triplet_without_kc());
-        let lenient: SendAuthenticationInfoRes =
-            rasn::ber::decode(&wire).expect("the lenient decoder accepts it");
-        assert_eq!(lenient.triplet_list.map(|t| t.len()), Some(1));
+        // rasn 0.28 returned it without the unreadable part; 0.29 refuses it.
+        assert!(rasn::ber::decode::<SendAuthenticationInfoRes>(&wire).is_err());
         assert!(gsm_map::decode::<SendAuthenticationInfoRes>(&wire).is_err());
     }
 
@@ -609,19 +608,18 @@ mod inap_cs1 {
         }
     }
 
-    /// The lenient decoder took an InitialDP with an unreadable member behind
-    /// an explicit tag for one without that member.
+    /// The lenient decoder (rasn 0.28) took an InitialDP with an unreadable
+    /// member behind an explicit tag for one without that member.
     #[test]
-    fn the_lenient_decoder_returns_the_initial_dp_without_the_unreadable_member() {
+    fn an_initial_dp_is_not_returned_without_the_unreadable_member() {
         // bearerCapability [27] is an explicit tag around a CHOICE { bearerCap
         // [0], tmr [1] }; [5] is no alternative of it.
         let wire = tlv(
             0x30,
             &[&[0x80, 0x01, 0x64][..], &tlv(0xBB, &[0x85, 0x01, 0x00])[..]].concat(),
         );
-        let lenient: InitialDpArg =
-            rasn::ber::decode(&wire).expect("the lenient decoder accepts it");
-        assert_eq!(lenient.bearer_capability, None);
+        // rasn 0.28 returned it without the unreadable part; 0.29 refuses it.
+        assert!(rasn::ber::decode::<InitialDpArg>(&wire).is_err());
         assert!(inap::decode::<InitialDpArg>(&wire).is_err());
     }
 }
@@ -1096,10 +1094,10 @@ mod cap {
         assert!(matches!(decode(&out[0]), TcapMessage::End(_)));
     }
 
-    /// The lenient decoder took an InitialDP with an unreadable member behind
-    /// an explicit tag for one without that member.
+    /// The lenient decoder (rasn 0.28) took an InitialDP with an unreadable
+    /// member behind an explicit tag for one without that member.
     #[test]
-    fn the_lenient_decoder_returns_the_initial_dp_without_the_unreadable_member() {
+    fn an_initial_dp_is_not_returned_without_the_unreadable_member() {
         let wire = tlv(
             0x30,
             &[
@@ -1108,9 +1106,8 @@ mod cap {
             ]
             .concat(),
         );
-        let lenient: InitialDpArg =
-            rasn::ber::decode(&wire).expect("the lenient decoder accepts it");
-        assert_eq!(lenient.subscriber_state, None);
+        // rasn 0.28 returned it without the unreadable part; 0.29 refuses it.
+        assert!(rasn::ber::decode::<InitialDpArg>(&wire).is_err());
         assert!(gsm_cap::decode::<InitialDpArg>(&wire).is_err());
     }
 }
