@@ -143,6 +143,15 @@ jobs:
           SIGTRAN_REQUIRE_TSHARK: "1"
         run: cargo test --test wire_m3ua
 
+      # Who a listening association accepts, against peers bound to loopback
+      # addresses of their own: the configured peer, a stranger, a second
+      # association. What the node sends to the peer it accepted is read back
+      # by Wireshark.
+      - name: Association identity (tshark field assertions)
+        env:
+          SIGTRAN_REQUIRE_TSHARK: "1"
+        run: cargo test --test wire_identity
+
       # Every message the dialogue engine emits in answer to a damaged or
       # unexpected one, dissected by Wireshark with assertions on the fields.
       - name: Abnormal procedures (tshark field assertions)

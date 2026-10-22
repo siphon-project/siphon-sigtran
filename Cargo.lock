@@ -132,9 +132,9 @@ dependencies = [
 
 [[package]]
 name = "async-sctp"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea7feb5d8961d6fcdf580e578b48809f359b92746ef574528a14d902a0a3f40"
+checksum = "5e2ebbfc77fa1d31f7800f672f34f3f8ac58039decf20eb6c9bf6cee7fe4212c"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
