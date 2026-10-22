@@ -9,6 +9,14 @@
 //!
 //! The level-2 and link test timers are set to tens and hundreds of
 //! milliseconds in the node's configuration, so nothing waits on a default.
+//!
+//! So are the level-3 timers. A node whose first link comes into service runs
+//! the MTP restart procedure (ITU-T Q.704 9.2.1), during which "all messages to
+//! another destination received at a signalling point whose MTP is restarting
+//! are discarded" (9.6.6); a peer that restarts is waited for under T21 before
+//! traffic is sent to it (9.3.2, 9.6.7). The peers of these tests are about
+//! level 2 and send no traffic restart allowed, so the node is given a T18 and
+//! a T21 that run out at once.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +52,7 @@ fn node(north_port: u16, south_port: u16, link_test: &str) -> String {
     format!(
         r#"
 node: {{ point_code: {NODE_PC}, variant: ITU, network_indicator: national }}
+mtp3: {FAST_MTP3}
 associations:
   - {{ id: north-0, adaptation: m2pa, role: client, addrs: [127.0.0.1], port: {north_port}, adjacent_pc: {NORTH_PC}, m2pa: {FAST_M2PA} }}
   - {{ id: south-0, adaptation: m2pa, role: client, addrs: [127.0.0.1], port: {south_port}, adjacent_pc: {SOUTH_PC}, m2pa: {FAST_M2PA} }}
@@ -84,6 +93,16 @@ async fn node_with_links_up(what: &str) -> Option<(TransportHandle, Peer, Peer)>
     let (handle, mut north, mut south) = node_with_peers(what, FAST_LINK_TEST).await?;
     north.bring_up().await;
     south.bring_up().await;
+    // A transfer point tells an adjacent point whose linkset became available
+    // what it must not send here, and that traffic may restart (ITU-T Q.704
+    // 9.3.2: "X sends any necessary TFP and TFR messages to Y; then X sends a
+    // traffic restart allowed message to signalling point Y"). Those come
+    // first on each link and are acknowledged here, for longer than the T21
+    // the node waits for these peers; the tests below are about what follows.
+    tokio::join!(
+        north.quiet(Duration::from_millis(450)),
+        south.quiet(Duration::from_millis(450))
+    );
     assert!(reachable(&handle, FAR_SOUTH, true).await, "south is up");
     assert!(reachable(&handle, FAR_NORTH, true).await, "north is up");
     Some((handle, north, south))
@@ -261,6 +280,7 @@ async fn a_listening_link_aligns_and_answers_the_peers_link_test() {
     let yaml = format!(
         r#"
 node: {{ point_code: {NODE_PC}, variant: ITU, network_indicator: national }}
+mtp3: {FAST_MTP3}
 associations:
   - {{ id: north-0, adaptation: m2pa, role: server, addrs: [127.0.0.1], port: 0, adjacent_pc: {NORTH_PC}, m2pa: {FAST_M2PA} }}
 linksets:
@@ -336,8 +356,11 @@ linksets:
     );
     assert_eq!(read.column("mtp3.opc"), ["1000"; 3]);
     assert_eq!(read.column("mtp3.dpc"), ["3000"; 3]);
-    // The node's own SLTM was FSN 0; its answers follow on.
-    assert_eq!(read.column("m2pa.fsn"), ["1", "2", "3"]);
+    // The node's own SLTM was FSN 0, and FSN 1 the traffic restart allowed
+    // that ends its restart (ITU-T Q.704 9.2.4: it "sends traffic restart
+    // allowed messages to all adjacent signalling points"); its answers
+    // follow on.
+    assert_eq!(read.column("m2pa.fsn"), ["2", "3", "4"]);
     // Each acknowledges the SLTM it answers (the peer's SLTA was FSN 0).
     assert_eq!(read.column("m2pa.bsn"), ["1", "2", "3"]);
 }
@@ -351,6 +374,10 @@ async fn user_data_is_numbered_and_acknowledged() {
         return;
     };
     let north_seen = north.log.len();
+    // The last FSN the node used on each link before the traffic: its link
+    // test, and the management messages a transfer point sends an adjacent
+    // point at the start (ITU-T Q.704 9.2.4, 9.3.2, 13.2.2).
+    let (north_last, south_last) = (north.fsn_in, south.fsn_in);
 
     for tag in 0..4 {
         north.send_msu(&transit(tag)).await;
@@ -397,8 +424,9 @@ async fn user_data_is_numbered_and_acknowledged() {
         return;
     };
     println!("{what} forwarded:\n{}", read.lines());
-    // FSN 0 was the node's link test; the transit messages follow, one by one.
-    assert_eq!(read.column("m2pa.fsn"), ["1", "2", "3", "4", "5"]);
+    // The transit messages follow what the node sent before, one by one.
+    let following: Vec<String> = (1..=5).map(|n| (south_last + n).to_string()).collect();
+    assert_eq!(read.column("m2pa.fsn"), following);
     // The BSN is the last FSN the south peer sent: its SLTA, FSN 0.
     assert_eq!(read.column("m2pa.bsn"), ["0"; 5]);
     assert_eq!(read.column("sctp.data_sid"), ["0x0001"; 5]);
@@ -412,9 +440,12 @@ async fn user_data_is_numbered_and_acknowledged() {
     assert_eq!(acks.column("m2pa.length"), ["16"; 4], "with no Data field");
     // The north peer's SLTA was FSN 0, so its four MSUs are FSN 1 to 4.
     assert_eq!(acks.column("m2pa.bsn"), ["1", "2", "3", "4"]);
-    // RFC 4165 4.2.1: the FSN of an empty message is not incremented; the
-    // node's last message with data on this link was its SLTM, FSN 0.
-    assert_eq!(acks.column("m2pa.fsn"), ["0"; 4]);
+    // RFC 4165 4.2.1: the FSN of an empty message is not incremented: it is
+    // that of the node's last message with data on this link.
+    assert_eq!(
+        acks.column("m2pa.fsn"),
+        [north_last.to_string().as_str(); 4]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -464,7 +495,9 @@ async fn a_message_that_is_not_acknowledged_fails_the_link_and_it_realigns() {
         .until(false, |f| f.msu().is_some())
         .await
         .expect("forwarded");
-    assert_eq!(unacked.fsn(), 1);
+    // The next FSN after what the node sent this adjacent point at the start
+    // (its link test, and the management messages of ITU-T Q.704 9.3.2).
+    assert_eq!(unacked.fsn(), south.fsn_in + 1);
 
     // T7 (400 ms here) runs out: Out of Service, the destination is gone.
     let out = south
@@ -887,6 +920,7 @@ async fn emergency_proving_and_a_link_without_a_test_follow_the_configuration() 
     let yaml = format!(
         r#"
 node: {{ point_code: {NODE_PC}, variant: ITU, network_indicator: national }}
+mtp3: {FAST_MTP3}
 associations:
   - {{ id: north-0, adaptation: m2pa, role: client, addrs: [127.0.0.1], port: {port}, adjacent_pc: {NORTH_PC}, m2pa: {fast} }}
 linksets:

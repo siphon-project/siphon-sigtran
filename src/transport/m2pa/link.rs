@@ -309,7 +309,7 @@ struct Unacked {
 /// What a failed link still holds, for the changeover procedure (RFC 4165
 /// 4.2.3): the last FSN accepted from the peer, and what the peer may not have.
 #[derive(Debug, Clone, Default)]
-struct Retrievable {
+pub struct Retrievable {
     /// The FSN of the last message accepted from the peer (the BSNT).
     bsnt: u32,
     /// The last of our FSNs the peer acknowledged before the failure.
@@ -318,6 +318,69 @@ struct Retrievable {
     unacked: VecDeque<(u32, Vec<u8>)>,
     /// Never sent.
     unsent: VecDeque<Vec<u8>>,
+}
+
+/// The outcome of a retrieval: what goes out on the alternative links, and
+/// what became of the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Retrieval {
+    /// To be sent on the alternative links, in order: SIO and SIF each.
+    pub resend: Vec<Vec<u8>>,
+    /// Sent before the failure and accepted by the far end, by its FSNC.
+    pub confirmed: usize,
+    /// Sent before the failure, never acknowledged, and not to be sent again
+    /// because no FSNC says whether the far end has them: sending them again
+    /// could duplicate, so they may be lost.
+    pub unconfirmed: Vec<Vec<u8>>,
+}
+
+impl Retrievable {
+    /// The FSN of the last User Data message accepted before the failure.
+    pub fn bsnt(&self) -> u32 {
+        self.bsnt
+    }
+
+    /// How many messages are held, sent or not.
+    pub fn len(&self) -> usize {
+        self.unacked.len() + self.unsent.len()
+    }
+
+    /// Whether nothing is held.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Retrieval (RFC 4165 4.2.3). With `fsnc`, the FSN the far end last
+    /// accepted: "any transmitted User Data messages beginning with the first
+    /// unacknowledged message with FSN greater than FSNC", then "any
+    /// untransmitted User Data messages". Without one, or with one that is not
+    /// an FSN that was sent and is still held ("no FSNC value, or with an
+    /// invalid FSNC"): the untransmitted ones only.
+    pub fn retrieve(mut self, fsnc: Option<u32>) -> Retrieval {
+        let mut out = Retrieval {
+            resend: Vec::with_capacity(self.len()),
+            ..Retrieval::default()
+        };
+        let last_sent = self.unacked.back().map_or(self.acked, |(fsn, _)| *fsn);
+        let valid = fsnc.filter(|f| {
+            seq_distance(self.acked, f & SEQ_MASK) <= seq_distance(self.acked, last_sent)
+        });
+        match valid {
+            Some(fsnc) => {
+                let accepted = seq_distance(self.acked, fsnc & SEQ_MASK);
+                for (fsn, msu) in self.unacked.drain(..) {
+                    if seq_distance(self.acked, fsn) > accepted {
+                        out.resend.push(msu);
+                    } else {
+                        out.confirmed += 1;
+                    }
+                }
+            }
+            None => out.unconfirmed = self.unacked.drain(..).map(|(_, msu)| msu).collect(),
+        }
+        out.resend.extend(self.unsent.drain(..));
+        out
+    }
 }
 
 /// Level 2 of one M2PA link.
@@ -466,24 +529,18 @@ impl Link {
     /// the untransmitted ones only. Each MSU is SIO and SIF, in order. The
     /// buffers are emptied: a second call returns nothing.
     pub fn retrieve(&mut self, fsnc: Option<u32>) -> Vec<Vec<u8>> {
-        let Some(mut held) = self.retrievable.take() else {
-            return Vec::new();
-        };
-        let mut out = Vec::with_capacity(held.unacked.len() + held.unsent.len());
-        let last_sent = held.unacked.back().map_or(held.acked, |(fsn, _)| *fsn);
-        let valid = fsnc.filter(|f| {
-            seq_distance(held.acked, f & SEQ_MASK) <= seq_distance(held.acked, last_sent)
-        });
-        if let Some(fsnc) = valid {
-            let accepted = seq_distance(held.acked, fsnc & SEQ_MASK);
-            for (fsn, msu) in held.unacked.drain(..) {
-                if seq_distance(held.acked, fsn) > accepted {
-                    out.push(msu);
-                }
-            }
+        match self.retrievable.take() {
+            Some(held) => held.retrieve(fsnc).resend,
+            None => Vec::new(),
         }
-        out.extend(held.unsent.drain(..));
-        out
+    }
+
+    /// Hand over what a failure left for retrieval, so that it outlives this
+    /// link's next alignment (which starts the sequence numbers again) and its
+    /// association. `None` when the link has not failed, or was already
+    /// emptied.
+    pub fn detach(&mut self) -> Option<Retrievable> {
+        self.retrievable.take()
     }
 
     /// Give up what a failure left for retrieval. Returns how many messages

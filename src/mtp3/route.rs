@@ -20,9 +20,20 @@
 //! link) **and** (b) the DPC is not prohibited (MTP3-MG TFP / M3UA DUNA).
 //! Availability is an in-memory [`RouteState`] mutated by
 //! [`RouteState::apply_event`] (Pause → prohibited, Resume → allowed, Status →
-//! congestion) and the AS / linkset up/down setters. [`RouteResolver::resolve`]
-//! walks the candidate routes lowest-priority-first and returns the first
-//! eligible destination.
+//! congestion), the AS / linkset up/down setters, and
+//! [`RouteState::set_route_status`] (a transfer-prohibited, -restricted or
+//! -allowed received from the adjacent point of one linkset, ITU-T Q.704
+//! clause 13, which marks that one route and no other).
+//!
+//! # Load sharing
+//!
+//! [`RouteResolver::resolve_for`] takes the signalling link selection of the
+//! message. Routes of the same priority are a combined linkset (Q.704 2.3.2 b,
+//! 4.2.1) and share the traffic by it: each selection code has one of them as
+//! its normal route, and moves to another only while that one is unavailable,
+//! so the codes on the routes that stayed up do not move. A route marked
+//! restricted is used only when no route of the same priority is unrestricted
+//! (Q.704 4.7). [`RouteResolver::resolve`] is the same with selection code 0.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -82,6 +93,96 @@ struct Candidate {
     priority: u8,
 }
 
+/// What an adjacent signalling transfer point has said about one route
+/// through it (ITU-T Q.704 3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteStatus {
+    /// Transfer-allowed, or nothing said: "at the beginning of the MTP restart
+    /// procedure all signalling routes [are considered] to be allowed" (9.6.1).
+    #[default]
+    Allowed,
+    /// Transfer-restricted (national option, 13.4).
+    Restricted,
+    /// Transfer-prohibited (13.2).
+    Prohibited,
+}
+
+/// Whether a candidate route can carry traffic, for [`choose_route`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Usable {
+    /// Not available, or prohibited.
+    No,
+    /// Available, and restricted by the adjacent point.
+    Restricted,
+    /// Available.
+    Yes,
+}
+
+/// The routes that carry traffic among candidates sorted by priority: the
+/// first priority that has a usable route, and of its routes the unrestricted
+/// ones if there are any, the restricted ones otherwise. Returns the range of
+/// that priority and the class in use.
+fn tier_in_use<T>(
+    sorted: &[T],
+    priority: impl Fn(&T) -> u8,
+    usable: impl Fn(&T) -> Usable,
+) -> Option<(std::ops::Range<usize>, Usable)> {
+    let mut start = 0;
+    while start < sorted.len() {
+        let level = priority(&sorted[start]);
+        let mut end = start;
+        let mut class = Usable::No;
+        while end < sorted.len() && priority(&sorted[end]) == level {
+            match usable(&sorted[end]) {
+                Usable::Yes => class = Usable::Yes,
+                Usable::Restricted if class == Usable::No => class = Usable::Restricted,
+                _ => {}
+            }
+            end += 1;
+        }
+        if class != Usable::No {
+            return Some((start..end, class));
+        }
+        start = end;
+    }
+    None
+}
+
+/// The index of the route that carries selection code `sls`, among candidates
+/// sorted by priority. One function for the per-message resolver and for
+/// signalling route management, so both always name the same route.
+pub(crate) fn choose_route<T>(
+    sorted: &[T],
+    priority: impl Fn(&T) -> u8,
+    usable: impl Fn(&T) -> Usable,
+    sls: u8,
+) -> Option<usize> {
+    let (tier, class) = tier_in_use(sorted, priority, &usable)?;
+    // The normal route of this selection code, while it is in use.
+    let normal = tier.start + usize::from(sls) % tier.len();
+    if usable(&sorted[normal]) == class {
+        return Some(normal);
+    }
+    let count = tier
+        .clone()
+        .filter(|i| usable(&sorted[*i]) == class)
+        .count();
+    tier.filter(|i| usable(&sorted[*i]) == class)
+        .nth(usize::from(sls) % count.max(1))
+}
+
+/// Every route that carries some selection code (see [`choose_route`]).
+pub(crate) fn routes_in_use<T>(
+    sorted: &[T],
+    priority: impl Fn(&T) -> u8,
+    usable: impl Fn(&T) -> Usable,
+) -> Vec<usize> {
+    match tier_in_use(sorted, priority, &usable) {
+        Some((tier, class)) => tier.filter(|i| usable(&sorted[*i]) == class).collect(),
+        None => Vec::new(),
+    }
+}
+
 /// Mutable, in-memory availability state fed by network-management events and
 /// AS / linkset up/down. Cheap to clone; the resolver borrows it read-only.
 #[derive(Debug, Clone, Default)]
@@ -94,6 +195,9 @@ pub struct RouteState {
     prohibited: BTreeSet<u32>,
     /// Congestion level per DPC value (0 = none).
     congestion: BTreeMap<u32, u8>,
+    /// Routes an adjacent point has prohibited or restricted, per DPC value.
+    /// Empty unless a transfer-prohibited or -restricted is outstanding.
+    route_status: BTreeMap<u32, Vec<(Destination, RouteStatus)>>,
 }
 
 impl RouteState {
@@ -160,6 +264,27 @@ impl RouteState {
         self.prohibited.contains(&dpc.value())
     }
 
+    /// Record what the adjacent point of `via` said about its route to `dpc`
+    /// (transfer-prohibited, -restricted, -allowed; ITU-T Q.704 13.2 to 13.4).
+    pub fn set_route_status(&mut self, dpc: u32, via: &Destination, status: RouteStatus) {
+        let marks = self.route_status.entry(dpc).or_default();
+        marks.retain(|(dest, _)| dest != via);
+        if status != RouteStatus::Allowed {
+            marks.push((via.clone(), status));
+        }
+        if marks.is_empty() {
+            self.route_status.remove(&dpc);
+        }
+    }
+
+    /// The status of the route to `dpc` through `via`.
+    pub fn route_status(&self, dpc: u32, via: &Destination) -> RouteStatus {
+        self.route_status
+            .get(&dpc)
+            .and_then(|marks| marks.iter().find(|(dest, _)| dest == via))
+            .map_or(RouteStatus::Allowed, |(_, status)| *status)
+    }
+
     /// The congestion level for a DPC (0 = uncongested).
     pub fn congestion(&self, dpc: PointCode) -> u8 {
         self.congestion.get(&dpc.value()).copied().unwrap_or(0)
@@ -196,7 +321,8 @@ impl RouteState {
 #[derive(Debug, Clone)]
 pub struct RouteResolver {
     variant: Variant,
-    /// DPC value → candidates (unsorted; resolve sorts by priority).
+    /// DPC value → candidates, sorted by priority (stable: config order
+    /// within one priority).
     routes: BTreeMap<u32, Vec<Candidate>>,
 }
 
@@ -220,10 +346,16 @@ impl RouteResolver {
         for ls in &tenant.linksets {
             for link in &ls.links {
                 if let Some(&pc) = adj.get(link.assoc.as_str()) {
-                    routes.entry(pc).or_default().push(Candidate {
+                    // Every link of a linkset names the same adjacent point:
+                    // one route, not one per link.
+                    let candidate = Candidate {
                         dest: Destination::Linkset(ls.name.clone()),
                         priority: ADJACENT_PRIORITY,
-                    });
+                    };
+                    let candidates = routes.entry(pc).or_default();
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
                 }
             }
         }
@@ -242,7 +374,20 @@ impl RouteResolver {
             });
         }
 
+        // Lowest priority number first (0 adjacent, then 1 primary, then 2…),
+        // once, so resolving a message neither sorts nor allocates.
+        for candidates in routes.values_mut() {
+            candidates.sort_by_key(|c| c.priority);
+        }
         Self { variant, routes }
+    }
+
+    /// Every route of the table: `(dpc, destination, priority)`, the routes of
+    /// one DPC in priority order.
+    pub fn routes(&self) -> impl Iterator<Item = (u32, &Destination, u8)> + '_ {
+        self.routes
+            .iter()
+            .flat_map(|(dpc, candidates)| candidates.iter().map(|c| (*dpc, &c.dest, c.priority)))
     }
 
     /// The variant these routes are keyed under.
@@ -258,17 +403,64 @@ impl RouteResolver {
 
     /// Resolve a DPC to the best currently-available destination, or `None` if
     /// the DPC is prohibited or every candidate route is down / has no route.
+    /// The route of selection code 0: see [`resolve_for`](Self::resolve_for).
     pub fn resolve(&self, dpc: PointCode, state: &RouteState) -> Option<Destination> {
+        self.resolve_for(dpc, 0, state)
+    }
+
+    /// Resolve a DPC for a message with signalling link selection `sls`: the
+    /// available routes of the best priority share the selection codes (see
+    /// the module documentation).
+    pub fn resolve_for(&self, dpc: PointCode, sls: u8, state: &RouteState) -> Option<Destination> {
+        self.resolve_avoiding(dpc, sls, state, None)
+    }
+
+    /// [`resolve_for`](Self::resolve_for) without the routes through `avoid`,
+    /// for a message that must not go that way (Q.704 2.3.4.2 b).
+    pub(crate) fn resolve_avoiding(
+        &self,
+        dpc: PointCode,
+        sls: u8,
+        state: &RouteState,
+        avoid: Option<&Destination>,
+    ) -> Option<Destination> {
         if state.is_prohibited(dpc) {
             return None;
         }
-        let mut candidates: Vec<&Candidate> = self.routes.get(&dpc.value())?.iter().collect();
-        // Lowest priority number first (0 adjacent, then 1 primary, then 2…).
-        candidates.sort_by_key(|c| c.priority);
-        candidates
-            .into_iter()
-            .find(|c| state.is_available(&c.dest))
-            .map(|c| c.dest.clone())
+        let candidates = self.routes.get(&dpc.value())?;
+        let marks = state.route_status.get(&dpc.value());
+        let usable = |c: &Candidate| {
+            if !state.is_available(&c.dest) || avoid == Some(&c.dest) {
+                return Usable::No;
+            }
+            let status = marks
+                .and_then(|marks| marks.iter().find(|(dest, _)| *dest == c.dest))
+                .map_or(RouteStatus::Allowed, |(_, status)| *status);
+            match status {
+                RouteStatus::Allowed => Usable::Yes,
+                RouteStatus::Restricted => Usable::Restricted,
+                RouteStatus::Prohibited => Usable::No,
+            }
+        };
+        choose_route(candidates, |c| c.priority, usable, sls).map(|i| candidates[i].dest.clone())
+    }
+
+    /// The most routes of one priority that any destination reached through
+    /// `via` has: how many ways the selection codes are split before a link of
+    /// `via` is chosen (1 when `via` is in no combined linkset).
+    pub fn share_width(&self, via: &Destination) -> usize {
+        let mut width = 1;
+        for candidates in self.routes.values() {
+            let Some(own) = candidates.iter().find(|c| c.dest == *via) else {
+                continue;
+            };
+            let tier = candidates
+                .iter()
+                .filter(|c| c.priority == own.priority)
+                .count();
+            width = width.max(tier);
+        }
+        width
     }
 
     /// Whether we have *any* route (available or not) to a DPC.
@@ -285,6 +477,7 @@ impl RouteResolver {
         let candidate = Candidate { dest, priority };
         if !candidates.contains(&candidate) {
             candidates.push(candidate);
+            candidates.sort_by_key(|c| c.priority);
         }
     }
 }
@@ -407,5 +600,137 @@ mod tests {
         assert!(r.resolve(pc(2000, var), &state).is_none());
         assert!(!state.is_as_up("hlr"));
         assert!(!state.is_linkset_up("transit"));
+    }
+
+    /// Two linksets of one priority toward 2200, a third as the alternative.
+    fn combined() -> (RouteResolver, RouteState, Variant) {
+        let cfg = Config::parse(
+            r#"
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: b-0, adaptation: m2pa, role: client, addrs: [192.0.2.1], port: 3565, adjacent_pc: 4000 }
+  - { id: c-0, adaptation: m2pa, role: client, addrs: [192.0.2.2], port: 3565, adjacent_pc: 5000 }
+  - { id: d-0, adaptation: m2pa, role: client, addrs: [192.0.2.3], port: 3565, adjacent_pc: 6000 }
+linksets:
+  - { name: b, links: [{assoc: b-0}] }
+  - { name: c, links: [{assoc: c-0}] }
+  - { name: d, links: [{assoc: d-0}] }
+mtp3_routes:
+  - { dpc: 2200, linkset: d, priority: 2 }
+  - { dpc: 2200, linkset: b, priority: 1 }
+  - { dpc: 2200, linkset: c, priority: 1 }
+"#,
+        )
+        .unwrap();
+        let tenant = cfg.default_tenant().unwrap();
+        let resolver = RouteResolver::build(tenant, &cfg.associations);
+        let state = RouteState::with_linksets_up(["b", "c", "d"]);
+        (resolver, state, tenant.variant)
+    }
+
+    fn linkset(name: &str) -> Destination {
+        Destination::Linkset(name.into())
+    }
+
+    #[test]
+    fn routes_of_one_priority_share_by_selection_code() {
+        // Q.704 2.3.2 b): "traffic relating to a given destination is shared
+        // (on the basis of the signalling link selection field) between
+        // different signalling links not belonging to the same link set".
+        let (r, state, var) = combined();
+        let dpc = pc(2200, var);
+        let via: Vec<Destination> = (0..16)
+            .map(|sls| r.resolve_for(dpc, sls, &state).unwrap())
+            .collect();
+        for (sls, dest) in via.iter().enumerate() {
+            let expected = if sls % 2 == 0 { "b" } else { "c" };
+            assert_eq!(*dest, linkset(expected), "selection code {sls}");
+        }
+        // The alternative of lower priority carries nothing while they are up.
+        assert!(!via.contains(&linkset("d")));
+        // `resolve` is selection code 0.
+        assert_eq!(r.resolve(dpc, &state), Some(linkset("b")));
+    }
+
+    #[test]
+    fn a_failed_route_moves_only_its_own_selection_codes() {
+        let (r, mut state, var) = combined();
+        let dpc = pc(2200, var);
+        state.set_linkset_down("c");
+        for sls in 0..16 {
+            assert_eq!(r.resolve_for(dpc, sls, &state), Some(linkset("b")));
+        }
+        // Both of the priority down: the alternative takes everything.
+        state.set_linkset_down("b");
+        for sls in 0..16 {
+            assert_eq!(r.resolve_for(dpc, sls, &state), Some(linkset("d")));
+        }
+        state.set_linkset_down("d");
+        assert_eq!(r.resolve_for(dpc, 3, &state), None);
+    }
+
+    #[test]
+    fn a_prohibited_route_is_one_route_not_the_destination() {
+        // Q.704 13.2.3: a transfer-prohibited from the adjacent point of one
+        // linkset makes that route unavailable (3.4.1), not the others.
+        let (r, mut state, var) = combined();
+        let dpc = pc(2200, var);
+        state.set_route_status(2200, &linkset("b"), RouteStatus::Prohibited);
+        assert_eq!(
+            state.route_status(2200, &linkset("b")),
+            RouteStatus::Prohibited
+        );
+        assert_eq!(
+            state.route_status(2200, &linkset("c")),
+            RouteStatus::Allowed
+        );
+        for sls in 0..16 {
+            assert_eq!(r.resolve_for(dpc, sls, &state), Some(linkset("c")));
+        }
+        // Another destination through the same linkset is not touched.
+        assert_eq!(r.resolve(pc(4000, var), &state), Some(linkset("b")));
+        // Transfer-allowed puts it back.
+        state.set_route_status(2200, &linkset("b"), RouteStatus::Allowed);
+        assert_eq!(r.resolve_for(dpc, 0, &state), Some(linkset("b")));
+    }
+
+    #[test]
+    fn a_restricted_route_yields_to_an_equal_one_and_to_no_other() {
+        // Q.704 4.7: traffic is transferred "if an equal priority alternative
+        // is available and not restricted".
+        let (r, mut state, var) = combined();
+        let dpc = pc(2200, var);
+        state.set_route_status(2200, &linkset("b"), RouteStatus::Restricted);
+        for sls in 0..16 {
+            assert_eq!(r.resolve_for(dpc, sls, &state), Some(linkset("c")));
+        }
+        // With its equal gone, the restricted route is used before the
+        // alternative of lower priority.
+        state.set_linkset_down("c");
+        assert_eq!(r.resolve_for(dpc, 1, &state), Some(linkset("b")));
+    }
+
+    #[test]
+    fn a_route_can_be_avoided_and_the_width_of_a_combined_linkset_is_known() {
+        let (r, state, var) = combined();
+        let dpc = pc(2200, var);
+        assert_eq!(
+            r.resolve_avoiding(dpc, 0, &state, Some(&linkset("b"))),
+            Some(linkset("c"))
+        );
+        assert_eq!(r.share_width(&linkset("b")), 2);
+        assert_eq!(r.share_width(&linkset("c")), 2);
+        assert_eq!(r.share_width(&linkset("d")), 1);
+    }
+
+    #[test]
+    fn a_route_added_at_run_time_keeps_the_priority_order() {
+        let (mut r, mut state, var) = combined();
+        state.set_as_up("gateway");
+        r.add(2200, Destination::ApplicationServer("gateway".into()), 0);
+        assert_eq!(
+            r.resolve(pc(2200, var), &state),
+            Some(Destination::ApplicationServer("gateway".into()))
+        );
     }
 }

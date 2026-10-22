@@ -22,6 +22,16 @@
 //! * **Failure.** A link that fails, or cannot be aligned, starts alignment
 //!   again after `restart_ms` (Q.704 12.2.2, T17), for as long as the
 //!   association lasts.
+//! * **Level 3.** The task reports the link available or unavailable to
+//!   signalling network management ([`crate::mtp3::management`]) and hands it
+//!   every management message for this node (service indicator 0). What it
+//!   does with the traffic it is handed is level 3's decision
+//!   ([`traffic::LinkTraffic`]): send it, buffer it while a changeover or a
+//!   changeback runs, or pass it on to the alternative links. When the link
+//!   fails, what level 2 still holds is kept until the changeover says what
+//!   the far end has (RFC 4165 4.2.3), and goes out on the alternatives.
+//!   Between associations a task without one ([`idle_link`]) serves the queue
+//!   the same way, so nothing handed to a link waits for it to come back.
 //!
 //! SCTP hands messages over in the order they arrived on the association, so
 //! the "SHOULD give higher priority to reading the Link Status stream" of
@@ -32,20 +42,23 @@ use std::time::Instant;
 
 use ::m2pa::M2paMessage;
 use async_sctp::SctpAssociation;
-use mtp3::mgmt::TestMessage;
+use mtp3::mgmt::{ManagementMessage, TestMessage};
 use mtp3::{Mtp3Msu, NetworkIndicator, PointCode, ServiceIndicator, Variant};
 use tokio::sync::watch;
 
 use self::link::{Action, Discard, Failure, Link, State, Timer};
 use self::slt::{LinkTest, TestAction, TestTimer};
-use super::forward::dispatch;
+use self::traffic::{LinkTraffic, Offer};
+use super::forward::{dispatch, reroute};
 use super::framing::Msu;
-use super::registry::{AssocSlot, LinkPort, LinkSettings};
+use super::registry::{AssocSlot, LinkCommand, LinkPort, LinkQueues, LinkSettings};
 use super::{discard, TaskCtx};
-use crate::metrics::{self, LinkTestResult, RxDiscard};
+use crate::metrics::{self, LinkTestResult, Mtp3Discard, Retrieved, RxDiscard};
+use crate::mtp3::management::Input;
 
 pub mod link;
 pub mod slt;
+pub mod traffic;
 
 const PPID_M2PA: u32 = 5;
 
@@ -96,8 +109,10 @@ struct Runner<'a> {
     deadlines: Deadlines,
     /// The association refused a send: it is gone.
     lost: bool,
-    /// Whether the slot is currently an egress for routing.
+    /// Whether the link is available to level 3: in service and tested.
     available: bool,
+    /// What level 3 has the link do with traffic.
+    traffic: &'a mut LinkTraffic,
 }
 
 impl Runner<'_> {
@@ -268,6 +283,28 @@ impl Runner<'_> {
             self.link_test_message(&msu, more);
             return;
         }
+        // Q.704 2.4.2: a message for this point is delivered by its service
+        // indicator, "to the corresponding User Part (or to the Message
+        // Transfer Part level 3)". Signalling network management is level 3's.
+        if msu.si == ServiceIndicator::SNM && msu.dpc.value() == self.port.settings.own_pc {
+            metrics::msu(metrics::Dir::Rx, msu.si.0);
+            self.management_message(&msu);
+            return;
+        }
+        // 9.6.6: "All messages to another destination received at a
+        // signalling point whose MTP is restarting are discarded", and so are
+        // those for a local user.
+        if self.ctx.registry.is_restarting() {
+            metrics::msu(metrics::Dir::Rx, msu.si.0);
+            metrics::mtp3_discard(Mtp3Discard::Restarting, 1);
+            eprintln!(
+                "siphon-sigtran: dropped a message received on `{}` for dpc {} (SI {}): this node's MTP is restarting",
+                self.slot.id,
+                msu.dpc.value(),
+                msu.si.0
+            );
+            return;
+        }
         let msu = Msu {
             opc: msu.opc.value(),
             dpc: msu.dpc.value(),
@@ -278,6 +315,80 @@ impl Runner<'_> {
             payload: msu.data,
         };
         dispatch(msu, self.ctx, &self.slot.id).await;
+    }
+
+    /// A signalling network management message for this node (service
+    /// indicator 0): decoded here, acted on by signalling network management.
+    fn management_message(&mut self, msu: &Mtp3Msu) {
+        let message = match ManagementMessage::decode(&msu.data, Variant::Itu) {
+            Ok(message) => message,
+            Err(error) => {
+                discard(RxDiscard::Undecodable, &self.slot.id, error);
+                return;
+            }
+        };
+        metrics::mtp3_management(metrics::Dir::Rx, message.name());
+        match self.port.settings.index {
+            Some(link) => self.ctx.registry.manage(Input::Received {
+                link,
+                opc: msu.opc.value(),
+                slc: msu.sls,
+                message,
+            }),
+            None => {
+                metrics::mtp3_discard(Mtp3Discard::Management, 1);
+                eprintln!(
+                    "siphon-sigtran: {} received on `{}`, a link in no linkset: not acted on",
+                    message.name(),
+                    self.slot.id
+                );
+            }
+        }
+    }
+
+    /// An MSU handed to the link for transmission: sent, buffered or passed
+    /// on, as level 3 has it.
+    async fn carry(&mut self, msu: Vec<u8>) {
+        let can_send = self.link.is_aligned() && !self.lost;
+        match self.traffic.offer(msu, can_send) {
+            Offer::Send(msu) => {
+                let mut actions = Vec::new();
+                self.link.send(msu, Instant::now(), &mut actions);
+                self.apply(actions).await;
+            }
+            Offer::Held => {}
+            Offer::Divert(msu) => reroute(msu, self.ctx, self.slot).await,
+            Offer::Full => buffer_full(&self.slot.id),
+        }
+    }
+
+    /// What level 3 wants of the link.
+    async fn command(&mut self, command: LinkCommand) {
+        let mut actions = Vec::new();
+        match command {
+            LinkCommand::Hold { done } => hold(self.traffic, self.port, self.ctx, done),
+            LinkCommand::Divert { fsnc } => {
+                divert_all(self.traffic, fsnc, self.ctx, self.slot, self.port).await;
+            }
+            LinkCommand::Open => {
+                let (buffered, lost) = self.traffic.open();
+                route_to(self.port, self.ctx, true);
+                lost_with_the_link(&self.slot.id, lost);
+                let can_send = self.link.is_aligned() && !self.lost;
+                for msu in buffered {
+                    match self.traffic.offer(msu, can_send) {
+                        Offer::Send(msu) => self.link.send(msu, Instant::now(), &mut actions),
+                        Offer::Full => buffer_full(&self.slot.id),
+                        Offer::Held | Offer::Divert(_) => {}
+                    }
+                }
+            }
+            // Q.704 3.2.2: the far end ordered a changeover from a link that
+            // was available here.
+            LinkCommand::Fail => self.link.fail(Failure::Stopped, &mut actions),
+            LinkCommand::Direct(msu) => self.link.send(msu, Instant::now(), &mut actions),
+        }
+        self.apply(actions).await;
     }
 
     /// A signalling network testing message (service indicator 1).
@@ -321,9 +432,8 @@ impl Runner<'_> {
                     .link_by_slc(&self.slot.id, msu.sls)
                     .and_then(|slot| slot.link());
                 match other {
-                    Some(port) => {
-                        port.offer(reply);
-                    }
+                    // On that link and no other, whatever it carries.
+                    Some(port) => port.command(LinkCommand::Direct(reply)),
                     None => discard(
                         RxDiscard::LinkTest,
                         &self.slot.id,
@@ -410,18 +520,107 @@ impl Runner<'_> {
         self.apply(actions).await;
     }
 
-    /// Make the slot an egress exactly while the link is in service and tested.
+    /// Tell level 3 when the link becomes available (in service and tested)
+    /// or stops being it. Whether it then carries traffic is level 3's call.
     fn refresh_availability(&mut self) {
         let aligned = self.link.is_aligned();
         let tested = !self.test.as_ref().is_some_and(|t| !t.is_available());
         let available = self.link.state() == State::InService && tested && !self.lost;
-        self.port.set_aligned(aligned);
-        if available != self.available {
-            self.available = available;
-            self.slot.set_active(available);
+        let realigned = self.port.set_aligned(aligned);
+        if available == self.available {
+            if realigned {
+                self.ctx.registry.recompute(&self.ctx.router);
+            }
+            return;
+        }
+        self.available = available;
+        self.slot.set_active(available);
+        if available {
+            if let Some(link) = self.port.settings.index {
+                self.ctx.registry.manage(Input::LinkUp { link });
+            }
+        } else {
+            // Q.704 5.3.1: the sequence number of the last message accepted
+            // goes into the changeover order, and what the link still holds
+            // is kept for the retrieval that follows.
+            let bsnt = self.link.bsnt();
+            let lost = self.traffic.failed(self.link.detach());
+            lost_with_the_link(&self.slot.id, lost);
+            if let Some(link) = self.port.settings.index {
+                self.ctx.registry.manage(Input::LinkDown { link, bsnt });
+            }
         }
         self.ctx.registry.recompute(&self.ctx.router);
     }
+}
+
+/// Count what a failure took with it and nothing will send again.
+fn lost_with_the_link(link: &str, count: usize) {
+    if count > 0 {
+        metrics::m2pa_discard(Discard::TxLostOnFailure, count as u64);
+        eprintln!(
+            "siphon-sigtran: m2pa link `{link}`: {count} unacknowledged message(s) lost with the link"
+        );
+    }
+}
+
+fn buffer_full(link: &str) {
+    metrics::mtp3_discard(Mtp3Discard::BufferFull, 1);
+    eprintln!("siphon-sigtran: m2pa link `{link}`: changeover buffer full, message dropped");
+}
+
+/// Say whether routing leads to the link, and have the route state follow.
+/// The task that serves the link is the one that says so: it knows what it
+/// does with the traffic before any arrives, and has passed on what it held
+/// before none does.
+fn route_to(port: &LinkPort, ctx: &TaskCtx, on: bool) {
+    port.set_routable(on);
+    ctx.registry.recompute(&ctx.router);
+}
+
+/// Buffer the traffic of the link, and route to it (Q.704 5.3.1 a, 6.3.1 i).
+fn hold(
+    traffic: &mut LinkTraffic,
+    port: &LinkPort,
+    ctx: &TaskCtx,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    traffic.hold();
+    route_to(port, ctx, true);
+    if let Some(done) = done {
+        let _ = done.send(());
+    }
+}
+
+/// The changeover of a link is complete (Q.704 5.5): send what it holds by the
+/// alternatives, in order, say what became of the rest, and only then have
+/// routing pass the link by. What is handed to the link meanwhile waits in its
+/// queue and follows.
+async fn divert_all(
+    traffic: &mut LinkTraffic,
+    fsnc: Option<u32>,
+    ctx: &TaskCtx,
+    slot: &AssocSlot,
+    port: &LinkPort,
+) {
+    let diverted = traffic.divert(fsnc);
+    metrics::mtp3_retrieved(Retrieved::Resent, diverted.resent as u64);
+    metrics::mtp3_retrieved(Retrieved::Confirmed, diverted.confirmed as u64);
+    metrics::mtp3_retrieved(Retrieved::LinkTest, diverted.link_tests as u64);
+    eprintln!(
+        "siphon-sigtran: m2pa link `{}`: changeover, {} message(s) to the alternative ({} of them sent before), {} accepted by the far end",
+        slot.id,
+        diverted.messages.len(),
+        diverted.resent,
+        diverted.confirmed
+    );
+    // Sent, not acknowledged, and not to be sent again without the far end's
+    // word on them: possibly lost, and counted as that.
+    lost_with_the_link(&slot.id, diverted.unconfirmed);
+    for msu in diverted.messages {
+        reroute(msu, ctx, slot).await;
+    }
+    route_to(port, ctx, false);
 }
 
 /// Build the MSU of a signalling link test message from this node to `dpc`,
@@ -457,21 +656,19 @@ pub async fn run_link(
         return;
     };
     // A link is one association (RFC 4165 4.1.2). A new one for the same link
-    // takes it over: tell the task that runs it, then wait for its queue.
-    port.generation.send_modify(|generation| *generation += 1);
+    // takes it over: tell the task that serves it, then wait for its queues.
+    let mut mine = 0;
+    port.generation.send_modify(|generation| {
+        *generation += 1;
+        mine = *generation;
+    });
     let mut superseded = port.generation.subscribe();
-    let mut queue = port.rx.lock().await;
-    let mut stale = 0;
-    while queue.try_recv().is_ok() {
-        stale += 1;
-    }
-    if stale > 0 {
-        metrics::m2pa_discard(Discard::TxNotInService, stale);
-        eprintln!(
-            "siphon-sigtran: m2pa link `{}`: {stale} message(s) queued for the previous association dropped",
-            slot.id
-        );
-    }
+    let mut queues = port.rx.lock().await;
+    let LinkQueues {
+        msus,
+        commands,
+        traffic,
+    } = &mut *queues;
 
     let settings = &port.settings;
     if settings.test.is_none() {
@@ -491,6 +688,7 @@ pub async fn run_link(
         deadlines: Deadlines::default(),
         lost: false,
         available: false,
+        traffic,
     };
 
     let mut actions = Vec::new();
@@ -499,6 +697,7 @@ pub async fn run_link(
     runner.apply(actions).await;
 
     let mut taken_over = false;
+    let mut stopping = false;
     while !runner.lost {
         let wake = runner.deadlines.earliest();
         let sleep = async {
@@ -508,7 +707,10 @@ pub async fn run_link(
             }
         };
         tokio::select! {
-            _ = shutdown.changed() => break,
+            _ = shutdown.changed() => {
+                stopping = true;
+                break;
+            }
             _ = superseded.changed() => {
                 taken_over = true;
                 eprintln!(
@@ -523,10 +725,14 @@ pub async fn run_link(
                     runner.lost = true;
                 }
             },
-            Some(msu) = queue.recv() => {
-                let mut actions = Vec::new();
-                runner.link.send(msu, Instant::now(), &mut actions);
-                runner.apply(actions).await;
+            Some(command) = commands.recv() => runner.command(command).await,
+            Some(msu) = msus.recv() => {
+                // What level 3 said before it routed this message here comes
+                // first.
+                while let Ok(command) = commands.try_recv() {
+                    runner.command(command).await;
+                }
+                runner.carry(msu).await;
             }
             _ = sleep => runner.fire().await,
         }
@@ -540,10 +746,12 @@ pub async fn run_link(
     };
     let mut actions = Vec::new();
     runner.link.fail(reason, &mut actions);
+    // Level 3 hears of it here, and what the link held is kept for the
+    // changeover.
     runner.apply(actions).await;
     runner.deadlines = Deadlines::default();
-    // What the failed link still holds goes with the association: nothing
-    // retrieves it yet (changeover is level 3's, RFC 4165 4.2.3).
+    // A link that was not available carried nothing of level 3's: what it
+    // still holds (its own link test) goes with it.
     let lost = runner.link.abandon();
     if lost > 0 {
         metrics::m2pa_discard(Discard::TxLostOnFailure, lost as u64);
@@ -560,5 +768,81 @@ pub async fn run_link(
         slot.clear_sender();
     }
     ctx.registry.recompute(&ctx.router);
-    drop(queue);
+    drop(queues);
+    // Until another association takes the link, its queue is still served:
+    // traffic routed to it during a changeover is buffered and diverted.
+    if !taken_over && !stopping {
+        tokio::spawn(idle_link(slot.clone(), ctx.clone(), shutdown, mine));
+    }
+}
+
+/// Serve the queues of a link that has no association: buffer or pass on what
+/// it is handed, as level 3 has it, until an association takes the link.
+/// `seen` is the generation of the link when this task was asked for: if a
+/// newer association exists already, there is nothing to do.
+pub async fn idle_link(
+    slot: Arc<AssocSlot>,
+    ctx: TaskCtx,
+    mut shutdown: watch::Receiver<bool>,
+    seen: u64,
+) {
+    let Some(port) = slot.link() else {
+        return;
+    };
+    let mut superseded = port.generation.subscribe();
+    if *superseded.borrow_and_update() != seen {
+        return;
+    }
+    let mut queues = tokio::select! {
+        queues = port.rx.lock() => queues,
+        _ = superseded.changed() => return,
+        _ = shutdown.changed() => return,
+    };
+    let LinkQueues {
+        msus,
+        commands,
+        traffic,
+    } = &mut *queues;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = superseded.changed() => break,
+            Some(command) = commands.recv() => idle_command(command, traffic, &ctx, &slot).await,
+            Some(msu) = msus.recv() => {
+                while let Ok(command) = commands.try_recv() {
+                    idle_command(command, traffic, &ctx, &slot).await;
+                }
+                match traffic.offer(msu, false) {
+                    Offer::Divert(msu) => reroute(msu, &ctx, &slot).await,
+                    Offer::Full => buffer_full(&slot.id),
+                    Offer::Held | Offer::Send(_) => {}
+                }
+            }
+        }
+    }
+}
+
+/// What level 3 wants of a link that has no association.
+async fn idle_command(
+    command: LinkCommand,
+    traffic: &mut LinkTraffic,
+    ctx: &TaskCtx,
+    slot: &AssocSlot,
+) {
+    let Some(port) = slot.link() else { return };
+    match command {
+        LinkCommand::Hold { done } => hold(traffic, port, ctx, done),
+        LinkCommand::Divert { fsnc } => divert_all(traffic, fsnc, ctx, slot, port).await,
+        // The link is not up: level 3 has not heard yet. It buffers until the
+        // changeover that follows.
+        LinkCommand::Open => hold(traffic, port, ctx, None),
+        LinkCommand::Fail => {}
+        LinkCommand::Direct(_) => {
+            metrics::m2pa_discard(Discard::TxNotInService, 1);
+            eprintln!(
+                "siphon-sigtran: m2pa link `{}` has no association: a message bound to it was not sent",
+                slot.id
+            );
+        }
+    }
 }
