@@ -1727,9 +1727,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "m2pa"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ee94d9aff2f4388222d266cf4d38abfa5c5d38d2531b032b2fe399e3ffe7df"
+checksum = "04096ef975904051fc5a88a062c61df0ef150a26fbc3858b08d78a67db7de3f4"
 dependencies = [
  "modular-bitfield-msb",
  "thiserror 2.0.21",
@@ -1737,9 +1737,9 @@ dependencies = [
 
 [[package]]
 name = "m3ua"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "034364374aa58b7153aceab0969c55725a4b2d51a7d3eeb525b0a5ad9e3f3d08"
+checksum = "33841bc19d1edf8fb7698abf2da7e9a386b6cb83ecb86d8d92527fbac04c1327"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -1855,9 +1855,9 @@ dependencies = [
 
 [[package]]
 name = "mtp3"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaa5e221ff33f662a04e099c665b413b2063d994a46e0b9ded9f24ab4ac3ae57"
+checksum = "a262ba3eb02826fe7b7cd2476f67fdb879c8eddd5e79b1649686832297863020"
 dependencies = [
  "async-trait",
  "serde",
