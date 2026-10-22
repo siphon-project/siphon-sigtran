@@ -1931,6 +1931,39 @@ fn xudt_as_unitdata(xudt: ExtendedUnitData) -> UnitData {
     udt
 }
 
+/// The lane of [`crate::transport::TransportHandle::serve_dialogues`] an inbound
+/// MSU belongs on: a hash of the transaction ID of its dialogue at this node.
+///
+/// A Begin opens a dialogue under the peer's OTID; everything after it (a
+/// Continue, End or Abort for a dialogue this node answered or opened) names
+/// this node's TID as its DTID. So the messages of one dialogue that can be in
+/// flight together share a key and stay in order on one lane, while different
+/// dialogues spread. The peer cannot send the second message of a dialogue
+/// it opened before this node has answered the Begin, so the Begin and what
+/// follows never race on two lanes. Anything that is not a readable unitdata
+/// with TCAP goes to lane 0, where `deliver` reports it as before.
+pub fn dialogue_lane(inbound: &Msu) -> u64 {
+    if inbound.si != SI_SCCP {
+        return 0;
+    }
+    let data = match SccpMessage::decode(&inbound.payload) {
+        Ok(SccpMessage::Udt(udt)) => udt.data,
+        Ok(SccpMessage::Xudt(xudt)) => xudt.data,
+        _ => return 0,
+    };
+    let tid: Vec<u8> = match tcap::decode(&data) {
+        Ok(TcapMessage::Begin(begin)) => begin.otid.to_vec(),
+        Ok(TcapMessage::Continue(cont)) => cont.dtid.to_vec(),
+        Ok(TcapMessage::End(end)) => end.dtid.to_vec(),
+        Ok(TcapMessage::Abort(abort)) => abort.dtid.to_vec(),
+        _ => return 0,
+    };
+    // FNV-1a: stable, and good enough to spread transaction IDs.
+    tid.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// The crate has no logging framework: the operator-facing log is stderr, and
 /// an error is marked as one.
 fn log_error(message: std::fmt::Arguments<'_>) {
@@ -2071,6 +2104,63 @@ mod tests {
     }
 
     const OTID: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+
+    fn carried(message: TcapMessage) -> Msu {
+        inbound(
+            UnitData::new(hlr(), msc(), tcap::encode(&message).unwrap())
+                .encode()
+                .unwrap(),
+        )
+    }
+
+    /// The messages of one dialogue that can be in flight together land on one
+    /// lane: a Begin by the peer's OTID, and everything that follows by this
+    /// node's TID, which the peer sends as the DTID.
+    #[test]
+    fn the_messages_of_a_dialogue_share_a_lane() {
+        let ours = vec![0x0a, 0x0b, 0x0c, 0x0d];
+        let begin = carried(TcapMessage::Begin(Begin {
+            otid: OTID.to_vec().into(),
+            dialogue_portion: None,
+            components: None,
+        }));
+        let carry_on = carried(TcapMessage::Continue(TcapContinue {
+            otid: OTID.to_vec().into(),
+            dtid: ours.clone().into(),
+            dialogue_portion: None,
+            components: None,
+        }));
+        let end = carried(TcapMessage::End(End {
+            dtid: ours.clone().into(),
+            dialogue_portion: None,
+            components: None,
+        }));
+        let abort = carried(TcapMessage::Abort(Abort::p_abort(
+            ours.clone().into(),
+            PAbortCause::UNRECOGNIZED_TRANSACTION_ID,
+        )));
+        assert_eq!(dialogue_lane(&carry_on), dialogue_lane(&end));
+        assert_eq!(dialogue_lane(&end), dialogue_lane(&abort));
+        // Another dialogue's Begin keys on its own OTID.
+        let other = carried(TcapMessage::Begin(Begin {
+            otid: vec![0x55, 0x66, 0x77, 0x88].into(),
+            dialogue_portion: None,
+            components: None,
+        }));
+        assert_ne!(dialogue_lane(&begin), dialogue_lane(&other));
+        // Not SCCP, or not readable TCAP: lane 0, where `deliver` reports it.
+        let mut not_sccp = begin.clone();
+        not_sccp.si = 5;
+        assert_eq!(dialogue_lane(&not_sccp), 0);
+        assert_eq!(
+            dialogue_lane(&inbound(
+                UnitData::new(hlr(), msc(), vec![0x62, 0x00])
+                    .encode()
+                    .unwrap()
+            )),
+            0
+        );
+    }
 
     #[test]
     fn a_refused_udt_begin_is_aborted_in_a_udt() {

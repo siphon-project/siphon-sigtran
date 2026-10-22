@@ -1524,6 +1524,74 @@ async fn wire_terminates_sri_sm_in_the_dialogue_engine() {
     handle.shutdown();
 }
 
+/// An HLR whose handler takes 300 ms, as a script that waits on a store does.
+struct SlowHlr;
+impl TerminationHandler for SlowHlr {
+    fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
+        std::thread::sleep(Duration::from_millis(300));
+        WireHlr.on_begin(dlg, op);
+    }
+}
+
+/// Dialogues are terminated side by side: four Begins to a handler that takes
+/// 300 ms each are all answered in well under the 1.2 s they took one after the
+/// other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_terminates_dialogues_side_by_side() {
+    let Some(mut handle) = start_node(TERMINATION_NODE, "wire_side_by_side").await else {
+        return;
+    };
+    let mut engine = DialogueEngine::new(Tcap::default());
+    engine.register(
+        6,
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        Arc::new(SlowHlr),
+    );
+    let engine = Arc::new(engine);
+    handle.serve_dialogues(engine.clone());
+    let ingress = handle.bound_addr("ingress").expect("ingress bound");
+    let Some(mut peer) = AspPeer::connect(ingress, 0).await else {
+        eprintln!("SKIP wire_side_by_side: ingress connect failed");
+        return;
+    };
+    sleep(Duration::from_millis(150)).await;
+
+    let started = std::time::Instant::now();
+    for index in 0..4u8 {
+        let invoke = Component::Invoke(Invoke {
+            invoke_id: 1,
+            linked_id: None,
+            operation_code: OperationCode::Local(
+                gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+            ),
+            parameter: Some(Any::new(sri_sm_arg("15559999"))),
+        });
+        let begin = tcap_begin_tid(
+            &[0x51, 0x52, 0x53, index],
+            Some(aarq(&AC_SRI_SM)),
+            vec![invoke],
+        );
+        let sccp = sccp_udt_to_ssn(SubsystemNumber::Hlr, &begin);
+        peer.send_in(&m3ua_sccp(&sccp, OPC_UPSTREAM, NODE_PC, index))
+            .await;
+    }
+    for _ in 0..4 {
+        let reply = peer.recv_out().await.expect("an answer to every Begin");
+        assert!(
+            decode_sri_sm_reply(&reply).is_some(),
+            "each answer is an SRI-SM result"
+        );
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "four 300 ms handlers took {elapsed:?}: they ran one after another"
+    );
+    assert_eq!(engine.open_dialogues(), 0);
+    peer.close();
+    handle.shutdown();
+}
+
 // ── Scenario 8a: the same in an XUDT ──────────────────────────────────────────
 
 /// The Begin arrives in an unsegmented XUDT (Q.713 4.18) for a subsystem of
