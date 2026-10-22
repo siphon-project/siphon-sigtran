@@ -7,6 +7,8 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [5.0.0] — 2026-10-22
+
 ### Added
 
 - **Level 2 of an M2PA link** as RFC 4165 and ITU-T Q.703 have it. The Link
@@ -169,6 +171,12 @@ All notable changes are documented here. The format follows
 
 ### Changed
 
+- **`rasn` 0.29, `tcap` 3, `gsm_map` 4, `gsm_cap` 4 and `inap` 3** (were
+  0.28, 2, 3, 3 and 2). Their types are in this crate's API (dialogue and
+  component values, the typed MAP and CAP views), so an embedding binary moves
+  with this release. rasn 0.29 itself refuses a malformed OPTIONAL member or
+  last list element that 0.28 dropped; the strict decoders already refused
+  them, and still do.
 - **An established association is not displaced by a later one.** A second
   SCTP association for an association that has one waits, unread, for up to
   two seconds for the first to end, and is then aborted and counted. Before,
@@ -321,8 +329,8 @@ All notable changes are documented here. The format follows
 - An adjacent point reached through a linkset of several links had one route
   per link, so the links counted as a combined linkset of themselves.
 
-An M2PA link between this release and 3.0.0 does not come into service: 3.0.0
-does not answer the link test or acknowledge User Data. Upgrade both ends, or
+An M2PA link between this release and 4.1.0 or older does not come into
+service: those do not answer the link test or acknowledge User Data. Upgrade both ends, or
 set `link_test: { enabled: false }` and expect T7 to fail the link under
 traffic.
 
