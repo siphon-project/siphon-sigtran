@@ -1036,6 +1036,12 @@ struct Labelled {
     invoke_timeouts: BTreeMap<i64, u64>,
     /// `sigtran_admission_refused_total{reason,action}`.
     admission_refused: BTreeMap<(&'static str, &'static str), u64>,
+    /// `sigtran_association_dial_attempts_total{assoc}`.
+    dial_attempts: BTreeMap<String, u64>,
+    /// `sigtran_association_dial_failures_total{assoc,reason}`.
+    dial_failures: BTreeMap<(String, &'static str), u64>,
+    /// `sigtran_association_dial_backoff_seconds{assoc}`, in milliseconds.
+    dial_backoff_ms: BTreeMap<String, u64>,
 }
 
 static LABELLED: Mutex<Option<Labelled>> = Mutex::new(None);
@@ -1046,6 +1052,100 @@ fn labelled() -> MutexGuard<'static, Option<Labelled>> {
         *g = Some(Labelled::default());
     }
     g
+}
+
+/// Why an attempt to dial a `client` association failed, for
+/// [`dial_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialFailure {
+    /// The far end answered the INIT with an ABORT: nothing listens there.
+    Refused,
+    /// No answer within the connect timeout of the association.
+    Timeout,
+    /// No route to the far end, or the network or the host is down.
+    Unreachable,
+    /// The local addresses or the local port could not be bound.
+    Local,
+    /// Any other error of the connect.
+    Other,
+}
+
+impl DialFailure {
+    /// Every reason, in label order.
+    pub const ALL: [DialFailure; 5] = [
+        Self::Refused,
+        Self::Timeout,
+        Self::Unreachable,
+        Self::Local,
+        Self::Other,
+    ];
+
+    /// The `reason` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::Timeout => "timeout",
+            Self::Unreachable => "unreachable",
+            Self::Local => "local",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Count one attempt to dial a `client` association.
+pub fn dial_attempt(assoc: &str) {
+    if let Some(m) = labelled().as_mut() {
+        *m.dial_attempts.entry(assoc.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// How often a `client` association was dialled.
+pub fn dial_attempts(assoc: &str) -> u64 {
+    labelled()
+        .as_ref()
+        .and_then(|m| m.dial_attempts.get(assoc).copied())
+        .unwrap_or(0)
+}
+
+/// Count one failed attempt to dial a `client` association.
+pub fn dial_failure(assoc: &str, reason: DialFailure) {
+    if let Some(m) = labelled().as_mut() {
+        *m.dial_failures
+            .entry((assoc.to_string(), reason.label()))
+            .or_insert(0) += 1;
+    }
+}
+
+/// How often dialling a `client` association failed for the reason.
+pub fn dial_failures(assoc: &str, reason: DialFailure) -> u64 {
+    labelled()
+        .as_ref()
+        .and_then(|m| {
+            m.dial_failures
+                .get(&(assoc.to_string(), reason.label()))
+                .copied()
+        })
+        .unwrap_or(0)
+}
+
+/// Set the `sigtran_association_dial_backoff_seconds{assoc}` gauge: how long
+/// the association waits before it is dialled again, zero while it is being
+/// dialled or is established.
+pub fn set_dial_backoff(assoc: &str, delay: std::time::Duration) {
+    if let Some(m) = labelled().as_mut() {
+        m.dial_backoff_ms
+            .insert(assoc.to_string(), delay.as_millis() as u64);
+    }
+}
+
+/// The back-off a `client` association is in.
+pub fn dial_backoff(assoc: &str) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        labelled()
+            .as_ref()
+            .and_then(|m| m.dial_backoff_ms.get(assoc).copied())
+            .unwrap_or(0),
+    )
 }
 
 /// A single M2PA link liveness value, for [`set_m2pa_link_state`].
@@ -1637,6 +1737,46 @@ pub fn render() -> String {
 
         help(
             &mut out,
+            "sigtran_association_dial_attempts_total",
+            "Attempts to dial a client association.",
+            "counter",
+        );
+        for (assoc, v) in &m.dial_attempts {
+            line(
+                &mut out,
+                "sigtran_association_dial_attempts_total",
+                &[("assoc", assoc)],
+                *v,
+            );
+        }
+        help(
+            &mut out,
+            "sigtran_association_dial_failures_total",
+            "Attempts to dial a client association that failed, by reason.",
+            "counter",
+        );
+        for ((assoc, reason), v) in &m.dial_failures {
+            line(
+                &mut out,
+                "sigtran_association_dial_failures_total",
+                &[("assoc", assoc), ("reason", reason)],
+                *v,
+            );
+        }
+        help(
+            &mut out,
+            "sigtran_association_dial_backoff_seconds",
+            "How long a client association waits before it is dialled again (0 while dialled or established).",
+            "gauge",
+        );
+        for (assoc, ms) in &m.dial_backoff_ms {
+            out.push_str("sigtran_association_dial_backoff_seconds");
+            labels(&mut out, &[("assoc", assoc)]);
+            out.push_str(&format!(" {}.{:03}\n", ms / 1000, ms % 1000));
+        }
+
+        help(
+            &mut out,
             "sigtran_asp_state",
             "M3UA ASP state (0 inactive, 1 active).",
             "gauge",
@@ -1941,6 +2081,9 @@ mod tests {
             "sigtran_rx_discarded_total",
             "sigtran_association_refused_total",
             "sigtran_association_state",
+            "sigtran_association_dial_attempts_total",
+            "sigtran_association_dial_failures_total",
+            "sigtran_association_dial_backoff_seconds",
             "sigtran_asp_state",
             "sigtran_linkset_available",
             "sigtran_linkset_active_links",
@@ -2057,6 +2200,21 @@ mod tests {
         content_rule_hit("sri-sm-np", "python");
         content_rule_hit("sri-sm-np", "python");
         invoke_timeout(45);
+
+        dial_attempt("xit-1");
+        dial_attempt("xit-1");
+        dial_failure("xit-1", DialFailure::Refused);
+        set_dial_backoff("xit-1", std::time::Duration::from_millis(1500));
+        assert_eq!(dial_attempts("xit-1"), 2);
+        assert_eq!(dial_failures("xit-1", DialFailure::Refused), 1);
+        assert_eq!(dial_failures("xit-1", DialFailure::Timeout), 0);
+        assert_eq!(dial_backoff("xit-1").as_millis(), 1500);
+        let text = render();
+        assert!(text.contains("sigtran_association_dial_attempts_total{assoc=\"xit-1\"} 2"));
+        assert!(text.contains(
+            "sigtran_association_dial_failures_total{assoc=\"xit-1\",reason=\"refused\"} 1"
+        ));
+        assert!(text.contains("sigtran_association_dial_backoff_seconds{assoc=\"xit-1\"} 1.500"));
 
         assert_eq!(mtp3mg_events(2000, Mtp3MgKind::Pause), 1);
         assert_eq!(content_rule_hits("sri-sm-np", "python"), 2);

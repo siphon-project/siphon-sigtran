@@ -361,6 +361,9 @@ call. The families:
 |---|---|---|
 | `sigtran_association_state` | gauge | `assoc`, `adaptation` |
 | `sigtran_association_refused_total` | counter | `reason` |
+| `sigtran_association_dial_attempts_total` | counter | `assoc` |
+| `sigtran_association_dial_failures_total` | counter | `assoc`, `reason` |
+| `sigtran_association_dial_backoff_seconds` | gauge | `assoc` |
 | `sigtran_asp_state` | gauge | `asp`, `as` |
 | `sigtran_linkset_available` | gauge | `linkset` |
 | `sigtran_linkset_active_links` | gauge | `linkset` |
@@ -431,6 +434,21 @@ stderr with the addresses, at most one a second per endpoint. `unknown-peer`
 moving is someone who is not configured knocking; `duplicate` moving is a peer
 that dials while its association is up, or one that came back from another
 port before the old association had failed.
+
+The dial families are about the `client` associations
+([the `dial` block](configuration.md#dial)).
+`sigtran_association_dial_attempts_total{assoc}` counts every attempt to
+establish one, `sigtran_association_dial_failures_total{assoc,reason}` those
+that failed: `refused` (the far end answered the INIT with an ABORT: nothing
+listens there), `timeout` (no answer within `connect_timeout_ms`),
+`unreachable` (no route, or the network or host is down), `local` (the local
+addresses or port could not be bound) and `other`. The difference of the two
+is how often the association was established, so a peer that accepts and
+drops shows as attempts without failures.
+`sigtran_association_dial_backoff_seconds{assoc}` is the wait that is running
+before the next attempt, and `0` while the association is being dialled or is
+established: together with `sigtran_association_state` at `0` it says "down,
+next attempt in so long". Alert on the state, not on a single failure.
 
 The M3UA families ([M3UA management](#m3ua-management)):
 
