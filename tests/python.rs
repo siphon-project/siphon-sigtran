@@ -961,3 +961,74 @@ fn a_script_decides_a_prepaid_call_through_the_typed_cap_views() {
         }
     }
 }
+
+// A handler that calls back into the node while the node runs it, and has
+// another thread call into the node (forcing a stop-the-world collection there)
+// before it answers. The handler also tries to register one: the engine is in
+// use, so that is refused rather than waited for.
+const REENTER: &str = r#"
+import gc
+import threading
+
+import siphon
+from siphon import gsm_map
+
+node = siphon.configure("""
+node: { point_code: 1000, variant: ITU }
+associations: []
+sccp:
+  local_ssns: [6]
+""")
+seen = []
+
+@gsm_map.on_operation("sri-sm")
+def on_sri(dlg, op):
+    seen.append(("handler", node.open_dialogues()))
+    def other():
+        gc.collect()
+        seen.append(("thread", node.open_dialogues()))
+        gc.collect()
+    thread = threading.Thread(target=other)
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive(), "another thread could not reach the node"
+    try:
+        gsm_map.on_operation("mt-forward-sm")(lambda dlg, op: None)
+    except siphon.SigtranError as error:
+        seen.append(("register", "refused"))
+    dlg.end()
+
+begin = node.assemble_begin(op="sri-sm", called_gt="15550100", called_ssn=6, calling_gt="15550180")
+out = node.deliver(begin, opc=2000, dpc=1000)
+assert node.decode(out[0]).kind == "end"
+assert seen == [("handler", 0), ("thread", 0), ("register", "refused")], seen
+assert node.sweep(ahead=60) == []
+assert node.open_dialogues() == 0
+"#;
+
+/// The node never holds its engine's lock while a handler runs: a handler that
+/// calls back into the node, and another thread that does while it runs, both
+/// get through. On a regression this deadlocks, so the script runs on a thread
+/// of its own and the test fails after a deadline instead of hanging.
+#[test]
+fn a_handler_can_call_back_into_the_node_while_it_runs() {
+    let _node = NODE.lock().unwrap_or_else(|e| e.into_inner());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = Python::attach(|py| {
+            mount(py).map_err(|e| e.to_string())?;
+            let globals = PyDict::new(py);
+            let code = CString::new(REENTER).map_err(|e| e.to_string())?;
+            py.run(code.as_c_str(), Some(&globals), None).map_err(|e| {
+                e.print(py);
+                e.to_string()
+            })
+        });
+        let _ = done_tx.send(outcome);
+    });
+    match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("the re-entering script failed: {error}"),
+        Err(_) => panic!("deadlock: the script did not finish within 30 s"),
+    }
+}

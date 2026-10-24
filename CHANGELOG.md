@@ -7,6 +7,22 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A slow timeout handler no longer holds up the node.** The dialogue timers
+  ran on the task that hands inbound messages to the dialogue lanes, so while
+  an invocation-timeout or idle-timeout handler (a script among them) ran,
+  no inbound dialogue was dispatched. The timers of a dialogue now run on its
+  own lane, on a blocking thread like every other handler turn, and the Abort
+  a timer produces is still sent. A handler turn that runs for more than 10 s
+  is logged as an error every 10 s, naming its lane.
+- **The loopback `Node` (`siphon.configure(...)`) no longer holds its engine
+  lock while a handler runs.** A handler that called back into the node, or
+  another thread that did while one ran, could deadlock. Registering a
+  handler while one is running is refused with `SigtranError`. A node or
+  handler that `configure` or a re-registration replaces is released after the
+  lock, not under it.
+
 ## [5.0.0] — 2026-10-22
 
 ### Added

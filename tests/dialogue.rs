@@ -1437,6 +1437,69 @@ fn invoke_timer_ages_out_an_outstanding_invoke() {
     assert_eq!(e.open_dialogues(), 0, "the timed-out dialogue was removed");
 }
 
+/// The transport runs the timers in two halves: the claim, on the task that
+/// dispatches inbound messages, and the expiry, on the dialogue's lane. A due
+/// dialogue is claimed once until it is expired or given back, and expiring it
+/// is what `sweep` does for it.
+#[test]
+fn a_due_dialogue_is_claimed_once_and_expired_on_its_own() {
+    let mut e = DialogueEngine::new(Tcap {
+        invoke_timer_ms: 100_000,
+        dialogue_timer_ms: 50,
+        max_dialogues: 100,
+    });
+    e.register(8, gsm_map::op_codes::MO_FORWARD_SM, Arc::new(KeepOpen));
+    let arg = rasn::ber::encode(&gsm_map::operations::mo_forward_sm::MoForwardSmArg::new(
+        SmRpDa::ServiceCentreAddressDa(isdn(OUR_GT).into()),
+        SmRpOa::MsIsdn(isdn(PEER_GT).into()),
+        vec![0x00].into(),
+    ))
+    .unwrap();
+    let _ = e.deliver(
+        &begin_msu(
+            gsm_map::op_codes::MO_FORWARD_SM,
+            arg,
+            &AC_MO_RELAY,
+            SubsystemNumber::Msc,
+            &[0x08],
+        ),
+        "ingress",
+    );
+    assert_eq!(e.open_dialogues(), 1);
+
+    let now = Instant::now();
+    assert!(e.claim_expired(now).is_empty(), "nothing is due yet");
+    let later = now + Duration::from_secs(5);
+    let claimed = e.claim_expired(later);
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        e.claim_expired(later).is_empty(),
+        "a claimed dialogue is not claimed again"
+    );
+    e.release_claim(&claimed[0]);
+    assert_eq!(
+        e.claim_expired(later),
+        claimed,
+        "a dialogue given back is claimed again"
+    );
+    assert!(
+        e.expire(&claimed[0], now).is_empty(),
+        "not due at `now`: left alone"
+    );
+    assert_eq!(e.open_dialogues(), 1);
+    assert_eq!(e.claim_expired(later), claimed, "and claimable again");
+
+    let aborts = e.expire(&claimed[0], later);
+    assert_eq!(aborts.len(), 1, "the idle dialogue is aborted to the peer");
+    assert_eq!(aborts[0].0, "ingress");
+    assert_eq!(e.open_dialogues(), 0, "and removed");
+    assert!(
+        e.expire(&claimed[0], later).is_empty(),
+        "a dialogue that is gone"
+    );
+    assert!(e.sweep(later).is_empty());
+}
+
 #[test]
 fn dialogue_timer_ages_out_an_idle_dialogue() {
     let before = metrics::dialogue_timeouts();
