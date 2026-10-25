@@ -1,0 +1,24 @@
+# Clippy configuration for siphon-sigtran.
+#
+# disallowed-methods: waits that park the calling thread. On a thread attached
+# to the interpreter (a script API, a handler's continuation, an extension
+# callback) any of them holds a garbage collection's stop-the-world open for as
+# long as it waits, and a wait that needs tokio to finish never ends. Each wait
+# goes through `siphon::script::blocking` (`released` / `blocking_released` /
+# `block_on_released`, which release the interpreter when the thread holds it),
+# or runs on a dedicated thread that never attaches. An exception is an
+# `#[allow(clippy::disallowed_methods)]` on the enclosing fn with the reason
+# beside it, only for a dedicated thread that never attaches or for startup.
+# Test, bench and example crates allow it at their root.
+disallowed-methods = [
+  { path = "tokio::runtime::Handle::block_on", reason = "parks the thread; use siphon::script::blocking::block_on_released" },
+  { path = "tokio::runtime::Runtime::block_on", reason = "parks the thread; startup only" },
+  { path = "tokio::task::block_in_place", reason = "use siphon::script::blocking::blocking_released" },
+  { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "blocking getaddrinfo; resolve asynchronously or wrap in blocking_released" },
+  { path = "std::net::TcpStream::connect", reason = "blocking connect; use tokio, or wrap in blocking_released" },
+  { path = "std::net::TcpStream::connect_timeout", reason = "blocking connect; use tokio, or wrap in blocking_released" },
+  { path = "std::thread::sleep", reason = "parks the thread; tokio::time::sleep, or a dedicated thread that never attaches" },
+  { path = "tokio::sync::mpsc::Receiver::blocking_recv", reason = "parks the thread; await it, or wrap in blocking_released" },
+  { path = "tokio::sync::mpsc::UnboundedReceiver::blocking_recv", reason = "parks the thread; await it, or wrap in blocking_released" },
+  { path = "tokio::sync::oneshot::Receiver::blocking_recv", reason = "parks the thread; await it, or wrap in blocking_released" },
+]

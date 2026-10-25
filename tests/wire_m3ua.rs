@@ -21,6 +21,7 @@
 //! T(r), T(ack) and T(beat) are configuration keys in milliseconds; the tests
 //! set them to a few hundred, so nothing waits on a default.
 
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 use std::sync::Arc;
 use std::time::Duration;
 

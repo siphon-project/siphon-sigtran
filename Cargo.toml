@@ -80,15 +80,13 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "ma
 # match byte-for-byte across every crate that depends on siphon-sip in one build
 # graph (a composing siphon binary), or cargo resolves two separate copies.
 # branch=main tracks the latest lib; the consumer's Cargo.lock still pins a
-# concrete SHA.
-siphon-sip = { git = "https://github.com/siphon-project/siphon-sip", branch = "main", optional = true }
+# concrete SHA. `version` is the floor: 1.15.4 carries the executor-dispatch
+# helpers (`script::blocking::awaitable`, the released waits, the async pool).
+siphon-sip = { git = "https://github.com/siphon-project/siphon-sip", branch = "main", version = "1.15.4", optional = true }
 # pyo3 must track siphon-sip's pin (currently 0.29): both link the `python`
 # native library, and cargo refuses two versions of a `links` crate in one graph.
 # auto-initialize boots the interpreter for the Rust integration tests.
 pyo3 = { version = "0.29", optional = true, features = ["auto-initialize"] }
-# Bridges an async handler / an originating helper's future onto tokio, the same
-# way the sibling addons (siphon-smpp, siphon-http) expose their awaitables.
-pyo3-async-runtimes = { version = "0.29", optional = true, features = ["tokio-runtime"] }
 
 [dev-dependencies]
 # criterion drives the routing-brain benches (benches/routing.rs).
@@ -98,7 +96,7 @@ criterion = "0.8"
 default = []
 # The siphon addon face: links siphon-sip + pyo3 and compiles the `python`
 # module. Used by `cargo {test,clippy} --features python`.
-python = ["dep:siphon-sip", "dep:pyo3", "dep:pyo3-async-runtimes"]
+python = ["dep:siphon-sip", "dep:pyo3"]
 
 [[bench]]
 name = "routing"

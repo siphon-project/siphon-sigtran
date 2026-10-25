@@ -618,13 +618,26 @@ impl TransportHandle {
                     maybe = rx.recv() => {
                         let Some(origination) = maybe else { break };
                         let dpc = origination.req.dpc;
+                        // The handler's `on_start` (and its `on_closed`, when the
+                        // Begin cannot go) runs on a blocking thread, as every
+                        // other handler turn does, never on this task.
+                        let engine = Arc::clone(&engine);
+                        let begun = tokio::task::spawn_blocking(move || {
+                            engine.begin(origination.req, origination.handler)
+                        })
+                        .await;
                         // An error is already logged with the dialogue's
                         // identifiers, and the handler's `on_closed` has told
                         // whoever is waiting on it.
-                        let Ok((_tid, frames)) =
-                            engine.begin(origination.req, origination.handler)
-                        else {
-                            continue;
+                        let frames = match begun {
+                            Ok(Ok((_tid, frames))) => frames,
+                            Ok(Err(_)) => continue,
+                            Err(error) => {
+                                eprintln!(
+                                    "siphon-sigtran: ERROR: an originating dialogue handler panicked: {error}"
+                                );
+                                continue;
+                            }
                         };
                         let Some(via) = resolve_egress(&router, &tenant, dpc) else {
                             eprintln!(

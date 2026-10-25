@@ -13,6 +13,7 @@
 //!
 //! Every value is synthetic: `+1-555-01xx` global titles, decimal point codes.
 
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

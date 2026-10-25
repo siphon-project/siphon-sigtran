@@ -22,6 +22,25 @@ All notable changes are documented here. The format follows
   handler while one is running is refused with `SigtranError`. A node or
   handler that `configure` or a re-registration replaces is released after the
   lock, not under it.
+- **Script handlers on the live node run on siphon's script executor, never
+  on a tokio thread.** A dialogue turn used to call its handler attached on
+  the lane's blocking thread, and an `async def` handler ran there on an
+  event loop of its own. A thread of tokio that waits attached holds every
+  garbage collection's stop-the-world open. Now the handler is called in a
+  siphon executor job; an `async def` handler finishes on siphon's
+  asyncio pool (bounded by its coroutine timeout, then cancelled)
+  and what it staged is read in a second job, while the lane waits released.
+  The loopback `Node` still runs handlers on the calling thread; its own
+  event loop is used only when siphon is not running. The `begin(...)`
+  helpers use siphon's awaitable bridge, and an originated `Begin` is built
+  on a blocking thread too.
+
+### Changed
+
+- Requires siphon-sip 1.15.4 or later, for its executor dispatch helpers.
+  `pyo3-async-runtimes` is no longer a direct dependency. A `clippy.toml` disallows the waits that park a thread
+  (`block_on`, `block_in_place`, `thread::sleep`, blocking receives and
+  connects) outside tests, benches and examples.
 
 ## [5.0.0] — 2026-10-22
 

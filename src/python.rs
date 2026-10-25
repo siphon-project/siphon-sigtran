@@ -66,6 +66,9 @@ use crate::transport::framing::{Msu, SI_SCCP};
 use crate::transport::{Origination, TransportHandle};
 
 mod cap;
+#[cfg(test)]
+mod thread_tests;
+mod turn;
 
 // ── Error ────────────────────────────────────────────────────────────────────
 create_exception!(
@@ -1799,11 +1802,13 @@ fn replay(dlg: &mut CoreDialogue, cmds: Vec<DlgCmd>) -> Result<(), crate::dialog
 // ── The Python termination handler bridge ────────────────────────────────────
 
 /// A [`TerminationHandler`] backed by a Python callable. On each leg it builds a
-/// [`PyDialogue`] + [`PyIncomingOp`], calls the handler (driving an `async def`
-/// to completion on an asyncio loop), and replays the staged commands onto the
-/// real dialogue.
+/// [`PyDialogue`] + [`PyIncomingOp`], calls the handler (an `async def` one
+/// finishing on siphon's asyncio pool; see the `turn` module for where each
+/// runs), and replays the staged commands onto the real dialogue.
 struct PyHandler {
-    func: Py<PyAny>,
+    /// Shared, so a turn can take it to the thread that runs it without
+    /// touching the callable's reference count.
+    func: Arc<Py<PyAny>>,
 }
 
 /// Which leg of the dialogue is re-entering the handler, and the decoded view to
@@ -1838,61 +1843,26 @@ impl PyHandler {
                 .find_map(PeerComponent::mistyped_parameter),
             Leg::Start | Leg::Event(_) => None,
         };
-        Python::attach(|py| {
-            let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec(), ac)) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("siphon-sigtran: building Dialogue failed: {e}");
-                    return Vec::new();
-                }
-            };
-
-            let call = match leg {
-                Leg::Begin(o) => {
-                    let arg = PyIncomingOp {
-                        operation_code: o.operation_code,
-                        invoke_id: i64::from(o.invoke_id),
-                        calling_gt: o.calling_gt.clone(),
-                        called_gt: o.called_gt.clone(),
-                        argument: o.argument.clone(),
-                        further: o.further.iter().map(PeerComp::from_core).collect(),
-                    };
-                    match Bound::new(py, arg) {
-                        Ok(a) => self.func.bind(py).call1((&pydlg, &a)),
-                        Err(e) => {
-                            eprintln!("siphon-sigtran: building IncomingOp failed: {e}");
-                            return Vec::new();
-                        }
-                    }
-                }
-                Leg::Continue(peer) => match Bound::new(py, PyPeerTurn::from_peer(peer)) {
-                    Ok(t) => self.func.bind(py).call1((&pydlg, &t)),
-                    Err(e) => {
-                        eprintln!("siphon-sigtran: building PeerTurn failed: {e}");
-                        return Vec::new();
-                    }
-                },
-                Leg::Event(event) => match Bound::new(py, PyPeerTurn::from_event(event)) {
-                    Ok(t) => self.func.bind(py).call1((&pydlg, &t)),
-                    Err(e) => {
-                        eprintln!("siphon-sigtran: building PeerTurn failed: {e}");
-                        return Vec::new();
-                    }
-                },
-                Leg::Start => self.func.bind(py).call1((&pydlg,)),
-            };
-
-            let raised = match call {
-                Ok(result) => drive(py, &result).err(),
-                Err(e) => Some(e),
-            };
-            match raised {
-                None => {
-                    let cmds = pydlg.borrow().take();
-                    cmds
-                }
-                Some(e) => handler_raised(py, &e, rejection, otid, dtid),
-            }
+        let arg = match leg {
+            Leg::Begin(o) => turn::TurnArg::Begin(PyIncomingOp {
+                operation_code: o.operation_code,
+                invoke_id: i64::from(o.invoke_id),
+                calling_gt: o.calling_gt.clone(),
+                called_gt: o.called_gt.clone(),
+                argument: o.argument.clone(),
+                further: o.further.iter().map(PeerComp::from_core).collect(),
+            }),
+            Leg::Continue(peer) => turn::TurnArg::Peer(PyPeerTurn::from_peer(peer)),
+            Leg::Event(event) => turn::TurnArg::Peer(PyPeerTurn::from_event(event)),
+            Leg::Start => turn::TurnArg::Start,
+        };
+        turn::run(turn::ScriptTurn {
+            func: Arc::clone(&self.func),
+            otid: otid.to_vec(),
+            dtid: dtid.to_vec(),
+            application_context: ac.to_vec(),
+            arg,
+            rejection,
         })
     }
 }
@@ -2054,7 +2024,7 @@ impl TerminationHandler for OriginationHandler {
 /// Call a Python leg callback `func(dialogue, peer_turn)` and replay the commands
 /// it stages onto the real dialogue. The follow-up-leg counterpart of
 /// [`PyHandler::run`], shared by the script-driven [`OriginationScriptHandler`].
-fn call_python_leg(func: &Py<PyAny>, dlg: &mut CoreDialogue, turn: PyPeerTurn) -> bool {
+fn call_python_leg(func: &Arc<Py<PyAny>>, dlg: &mut CoreDialogue, turn: PyPeerTurn) -> bool {
     let cmds = call_python_turn(
         func,
         dlg.otid(),
@@ -2069,39 +2039,20 @@ fn call_python_leg(func: &Py<PyAny>, dlg: &mut CoreDialogue, turn: PyPeerTurn) -
 
 /// Call `func(dialogue, turn)` and return the commands it staged.
 fn call_python_turn(
-    func: &Py<PyAny>,
+    func: &Arc<Py<PyAny>>,
     otid: &[u8],
     dtid: &[u8],
     ac: &[u32],
     turn: PyPeerTurn,
 ) -> Vec<DlgCmd> {
     let rejection = turn.rejection;
-    Python::attach(|py| {
-        let pydlg = match Bound::new(py, PyDialogue::new(otid.to_vec(), dtid.to_vec(), ac)) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("siphon-sigtran: building Dialogue failed: {e}");
-                return Vec::new();
-            }
-        };
-        let turn = match Bound::new(py, turn) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("siphon-sigtran: building PeerTurn failed: {e}");
-                return Vec::new();
-            }
-        };
-        let raised = match func.bind(py).call1((&pydlg, &turn)) {
-            Ok(result) => drive(py, &result).err(),
-            Err(e) => Some(e),
-        };
-        match raised {
-            None => {
-                let cmds = pydlg.borrow().take();
-                cmds
-            }
-            Some(e) => handler_raised(py, &e, rejection, otid, dtid),
-        }
+    turn::run(turn::ScriptTurn {
+        func: Arc::clone(func),
+        otid: otid.to_vec(),
+        dtid: dtid.to_vec(),
+        application_context: ac.to_vec(),
+        arg: turn::TurnArg::Peer(turn),
+        rejection,
     })
 }
 
@@ -2114,7 +2065,7 @@ struct OriginationScriptHandler {
     op: i64,
     arg: Option<Vec<u8>>,
     class: OperationClass,
-    on_reply: Py<PyAny>,
+    on_reply: Arc<Py<PyAny>>,
 }
 
 impl TerminationHandler for OriginationScriptHandler {
@@ -2206,7 +2157,9 @@ fn origination_begin<'py>(
     tx.send(Origination { req, handler })
         .map_err(|_| err("sigtran node stopped: origination channel closed"))?;
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    // The future runs on a tokio worker and returns plain Rust: the
+    // `PeerTurn` object is built in the completion step, off the workers.
+    siphon::script::blocking::awaitable(py, async move {
         let peer = resp_rx
             .await
             .map_err(|_| err("originated dialogue closed with no response"))?
@@ -2222,11 +2175,12 @@ static IDLE_LOOPS: Mutex<Vec<Py<PyAny>>> = Mutex::new(Vec::new());
 /// Loops kept idle at most; one per handler running at the same time is enough.
 const IDLE_LOOPS_KEPT: usize = 64;
 
-/// Drive a possibly-async result to completion. A plain return value is done; a
-/// coroutine is run on an asyncio event loop of its own for the duration,
-/// mirroring how an `async def` handler runs on siphon's runtime. A loop the
-/// handler leaves with no task pending is reused by a later handler; one with
-/// tasks still pending is closed, as every loop was before.
+/// Drive a possibly-async result to completion on an asyncio event loop of its
+/// own, on this attached thread. Only for a coroutine with nowhere else to go:
+/// siphon is not running (no asyncio pool), as when a script or a test drives
+/// the loopback node by itself. Inside siphon an `async def` handler finishes on
+/// siphon's pool (see the `turn` module). A loop the handler leaves with no task
+/// pending is reused by a later one; one with tasks still pending is closed.
 fn drive(py: Python<'_>, result: &Bound<'_, PyAny>) -> PyResult<()> {
     let asyncio = py.import("asyncio")?;
     if !asyncio
@@ -3513,7 +3467,7 @@ fn register_termination_inner(op: i64, func: &Bound<'_, PyAny>, catch_all: bool)
     let mut replaced = Vec::new();
     for ssn in ssns {
         let handler: Arc<dyn TerminationHandler> = Arc::new(PyHandler {
-            func: func.clone().unbind(),
+            func: Arc::new(func.clone().unbind()),
         });
         replaced.extend(engine.registered(ssn, op, catch_all));
         if catch_all {
@@ -4232,7 +4186,7 @@ impl Node {
             op: invoke.op,
             arg: invoke.arg.resolve(&ac.arcs).map_err(err)?,
             class: invoke.class,
-            on_reply,
+            on_reply: Arc::new(on_reply),
         });
         let engine = self.state.engine();
         let (_tid, frames) = engine.begin(req, handler).map_err(err)?;

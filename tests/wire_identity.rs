@@ -14,6 +14,7 @@
 //! The node reads the peer's addresses from it and aborts it, so the peer
 //! sees the association come up and then an ABORT.
 
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;

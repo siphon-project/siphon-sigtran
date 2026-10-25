@@ -13,6 +13,7 @@
 //! sequential test (the interpreter is shared across the binary's tests).
 
 #![cfg(feature = "python")]
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 
 use std::ffi::CString;
 use std::sync::Mutex;

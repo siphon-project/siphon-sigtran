@@ -11,6 +11,7 @@
 //!
 //! No I/O is in any path. These isolate exactly the routing work.
 
+#![allow(clippy::disallowed_methods)] // not a handler thread
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 use siphon_sigtran::config::Config;
