@@ -7,6 +7,16 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [5.1.0] — 2026-10-25
+
+### Added
+
+- `DialogueEngine::claim_expired`, `DialogueEngine::expire` and
+  `DialogueEngine::release_claim`: the two halves of `sweep`, for a caller
+  that runs the timers of each dialogue somewhere else than the task that
+  finds them due. `dialogue::tid_lane` gives the lane of a dialogue by its
+  transaction id, the same one `dialogue_lane` gives its messages.
+
 ### Fixed
 
 - **A slow timeout handler no longer holds up the node.** The dialogue timers
