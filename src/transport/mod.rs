@@ -176,6 +176,47 @@ const DIALOGUE_LANES: usize = 32;
 /// Deliveries a lane holds before the transport waits for it.
 const LANE_DEPTH: usize = 256;
 
+/// What a dialogue lane of [`TransportHandle::serve_dialogues`] runs.
+enum LaneWork {
+    /// An inbound message for a dialogue on this lane.
+    Deliver(LocalDelivery),
+    /// Timers due on the dialogue with this (our) transaction id, claimed by
+    /// [`DialogueEngine::claim_expired`].
+    Timers(crate::dialogue::Tid),
+}
+
+/// How long a handler turn runs before its lane says so, and again every time
+/// that long passes. A handler on a blocking thread cannot be stopped from
+/// outside, and what it returns (an answer, the Abort of a timer) must still be
+/// sent, so the lane keeps waiting; the log names the lane that is held up.
+const TURN_STALL: Duration = Duration::from_secs(10);
+
+/// Run one handler turn of `lane` on a blocking thread, off the runtime's
+/// workers, and wait for it. A turn that runs past [`TURN_STALL`] is logged as
+/// an error each time that passes; the other lanes, and the dispatch of
+/// inbound messages to them, carry on meanwhile.
+async fn handler_turn<T, F>(
+    lane: usize,
+    what: &str,
+    turn: F,
+) -> std::result::Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let started = Instant::now();
+    let mut running = tokio::task::spawn_blocking(turn);
+    loop {
+        match tokio::time::timeout(TURN_STALL, &mut running).await {
+            Ok(done) => return done,
+            Err(_) => eprintln!(
+                "siphon-sigtran: ERROR: a dialogue {what} handler on lane {lane} has run for {}s; the dialogues of that lane wait for it",
+                started.elapsed().as_secs()
+            ),
+        }
+    }
+}
+
 /// A message the router decided terminates locally, handed to the dialogue SAP
 /// over the transport's local-delivery channel. Carries the decoded MSU plus the
 /// association it arrived on, so the dialogue engine's reply goes back to the
@@ -436,9 +477,13 @@ impl TransportHandle {
     /// Attach a [`DialogueEngine`] to the running node: spawn a task that pumps
     /// every locally-terminated MSU into [`DialogueEngine::deliver`], sends the
     /// engine's replies back to the peer that asked (over the ingress
-    /// association), and periodically ages out expired dialogues via
-    /// [`DialogueEngine::sweep`]. Takes the local-delivery receiver, so call it
-    /// once, after registering the engine's handlers.
+    /// association), and once a second runs the dialogue timers that are due
+    /// (what [`DialogueEngine::sweep`] does, split into
+    /// [`DialogueEngine::claim_expired`] and [`DialogueEngine::expire`] so that
+    /// every handler, a timeout callback included, runs on a blocking thread and
+    /// never on the task that dispatches inbound messages). Takes the
+    /// local-delivery receiver, so call it once, after registering the engine's
+    /// handlers.
     pub fn serve_dialogues(&mut self, engine: Arc<DialogueEngine>) {
         let Some(mut rx) = self.local_rx.take() else {
             return;
@@ -452,28 +497,54 @@ impl TransportHandle {
         // `dialogue_lane`), and runs each on a blocking thread, since a handler
         // (a script among them) may take as long as it likes. One task for all
         // of them made every dialogue wait for the slowest handler before it.
+        // The timers of a dialogue run on its lane too (see `tid_lane`): a
+        // timeout callback is a handler like any other, and the task below,
+        // which hands every inbound message to its lane, never waits for one.
         let mut lanes = Vec::with_capacity(DIALOGUE_LANES);
-        for _ in 0..DIALOGUE_LANES {
-            let (lane_tx, mut lane_rx) = mpsc::channel::<LocalDelivery>(LANE_DEPTH);
+        for lane in 0..DIALOGUE_LANES {
+            let (lane_tx, mut lane_rx) = mpsc::channel::<LaneWork>(LANE_DEPTH);
             let engine = Arc::clone(&engine);
             let registry = registry.clone();
+            let router = router.clone();
+            let tenant = tenant.clone();
             self.tasks.push(tokio::spawn(async move {
-                while let Some(delivery) = lane_rx.recv().await {
+                while let Some(work) = lane_rx.recv().await {
                     let engine = Arc::clone(&engine);
-                    let ingress = delivery.ingress_assoc.clone();
-                    let delivered = tokio::task::spawn_blocking(move || {
-                        engine.deliver(&delivery.msu, &delivery.ingress_assoc)
-                    })
-                    .await;
-                    match delivered {
-                        Ok(outs) => {
-                            for out in outs {
-                                send_reply(&registry, &ingress, &out).await;
+                    match work {
+                        LaneWork::Deliver(delivery) => {
+                            let ingress = delivery.ingress_assoc.clone();
+                            let delivered = handler_turn(lane, "message", move || {
+                                engine.deliver(&delivery.msu, &delivery.ingress_assoc)
+                            })
+                            .await;
+                            match delivered {
+                                Ok(outs) => {
+                                    for out in outs {
+                                        send_reply(&registry, &ingress, &out).await;
+                                    }
+                                }
+                                Err(error) => eprintln!(
+                                    "siphon-sigtran: ERROR: a dialogue handler on `{ingress}` panicked: {error}"
+                                ),
                             }
                         }
-                        Err(error) => eprintln!(
-                            "siphon-sigtran: ERROR: a dialogue handler on `{ingress}` panicked: {error}"
-                        ),
+                        LaneWork::Timers(tid) => {
+                            let expired = handler_turn(lane, "timeout", move || {
+                                engine.expire(&tid, Instant::now())
+                            })
+                            .await;
+                            match expired {
+                                Ok(outs) => {
+                                    for (assoc, out) in outs {
+                                        send_sweep_abort(&registry, &router, &tenant, &assoc, &out)
+                                            .await;
+                                    }
+                                }
+                                Err(error) => eprintln!(
+                                    "siphon-sigtran: ERROR: a dialogue timeout handler panicked: {error}"
+                                ),
+                            }
+                        }
                     }
                 }
             }));
@@ -489,13 +560,25 @@ impl TransportHandle {
                         let Some(delivery) = maybe else { break };
                         let lane = (crate::dialogue::dialogue_lane(&delivery.msu)
                             % DIALOGUE_LANES as u64) as usize;
-                        if lanes[lane].send(delivery).await.is_err() {
+                        if lanes[lane].send(LaneWork::Deliver(delivery)).await.is_err() {
                             break;
                         }
                     }
                     _ = sweep.tick() => {
-                        for (assoc, out) in engine.sweep(Instant::now()) {
-                            send_sweep_abort(&registry, &router, &tenant, &assoc, &out).await;
+                        // Only the claim runs here, which looks at the timers
+                        // and calls no handler. A lane that is full still has
+                        // its earlier work to get through: the dialogue is given
+                        // back and claimed again on a later tick, never dropped.
+                        for tid in engine.claim_expired(Instant::now()) {
+                            let lane = (crate::dialogue::tid_lane(&tid)
+                                % DIALOGUE_LANES as u64) as usize;
+                            if let Err(
+                                mpsc::error::TrySendError::Full(LaneWork::Timers(tid))
+                                | mpsc::error::TrySendError::Closed(LaneWork::Timers(tid)),
+                            ) = lanes[lane].try_send(LaneWork::Timers(tid))
+                            {
+                                engine.release_claim(&tid);
+                            }
                         }
                     }
                 }

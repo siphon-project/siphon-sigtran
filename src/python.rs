@@ -159,7 +159,10 @@ type Triplet = (Vec<u8>, Vec<u8>, Vec<u8>);
 /// namespace singletons can all drive one node.
 struct NodeState {
     router: Mutex<Router>,
-    engine: Mutex<DialogueEngine>,
+    /// The engine the decorators register into. Taken out of the mutex as an
+    /// `Arc` to run it (see [`NodeState::engine`]): the lock is held only to
+    /// register or to clone, never while a handler runs.
+    engine: Mutex<Arc<DialogueEngine>>,
     tenant: String,
     /// The subsystems we own; a termination decorator registers on each.
     local_ssns: Vec<u8>,
@@ -173,10 +176,19 @@ impl NodeState {
             .unwrap_or_default();
         NodeState {
             router: Mutex::new(Router::new(cfg)),
-            engine: Mutex::new(DialogueEngine::new(cfg.tcap.clone())),
+            engine: Mutex::new(Arc::new(DialogueEngine::new(cfg.tcap.clone()))),
             tenant: DEFAULT_TENANT.to_string(),
             local_ssns,
         }
+    }
+
+    /// The engine, to run. The handlers it calls are scripts, and a script may
+    /// call back into the node, or another thread may: holding the engine's
+    /// lock across a handler would deadlock the first, and park the second on
+    /// a Rust lock while attached to Python, where a stop-the-world never
+    /// reaches it.
+    fn engine(&self) -> Arc<DialogueEngine> {
+        Arc::clone(&self.engine.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// A minimal empty node (PC 1, ITU, no tables) so the namespaces work before
@@ -201,7 +213,11 @@ fn node() -> Arc<NodeState> {
 
 fn set_node(state: Arc<NodeState>) {
     let cell = NODE.get_or_init(|| Mutex::new(Arc::new(NodeState::default_node())));
-    *cell.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    let previous = std::mem::replace(&mut *cell.lock().unwrap_or_else(|e| e.into_inner()), state);
+    // The node it replaces may be the last owner of the script handlers it
+    // registered. Dropping those releases Python objects, which can run Python
+    // code, so that happens here, after the lock is released.
+    drop(previous);
 }
 
 fn lock_router(n: &NodeState) -> std::sync::MutexGuard<'_, Router> {
@@ -3463,21 +3479,27 @@ fn inap_monitor_mode(v: i64) -> PyResult<inap::types::MonitorMode> {
 
 /// Register a Python termination handler for `op` on every owned subsystem (so
 /// the handler fires whichever local SSN the message was addressed to).
-fn register_termination(op: i64, func: &Bound<'_, PyAny>) {
-    register_termination_inner(op, func, false);
+fn register_termination(op: i64, func: &Bound<'_, PyAny>) -> PyResult<()> {
+    register_termination_inner(op, func, false)
 }
 
 /// Register a Python catch-all handler for `op` on every owned subsystem. It is
 /// lower priority than a specific [`register_termination`], so a bare
 /// `@ns.on_operation` never shadows an explicit `on_operation("<name>")`,
 /// whichever registered first.
-fn register_catch_all(op: i64, func: &Bound<'_, PyAny>) {
-    register_termination_inner(op, func, true);
+fn register_catch_all(op: i64, func: &Bound<'_, PyAny>) -> PyResult<()> {
+    register_termination_inner(op, func, true)
 }
 
-fn register_termination_inner(op: i64, func: &Bound<'_, PyAny>, catch_all: bool) {
+fn register_termination_inner(op: i64, func: &Bound<'_, PyAny>, catch_all: bool) -> PyResult<()> {
     let n = node();
-    let mut engine = n.engine.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = n.engine.lock().unwrap_or_else(|e| e.into_inner());
+    // Handlers are registered while the script loads. Only a node method that
+    // is running the engine at this moment (on another thread, or the handler
+    // doing the registering) holds it too.
+    let engine = Arc::get_mut(&mut guard).ok_or_else(|| {
+        err("cannot register a handler while the node is running a dialogue handler")
+    })?;
     let ssns: Vec<u8> = if n.local_ssns.is_empty() {
         // No configured owned SSNs (an unconfigured node): register on the MAP
         // and CAP subsystems so a standalone script still terminates.
@@ -3485,16 +3507,24 @@ fn register_termination_inner(op: i64, func: &Bound<'_, PyAny>, catch_all: bool)
     } else {
         n.local_ssns.clone()
     };
+    // A handler registered again replaces the one before it, which may hold
+    // the last reference to a Python callable. Keep those until the lock is
+    // released: releasing a Python object can run Python code.
+    let mut replaced = Vec::new();
     for ssn in ssns {
         let handler: Arc<dyn TerminationHandler> = Arc::new(PyHandler {
             func: func.clone().unbind(),
         });
+        replaced.extend(engine.registered(ssn, op, catch_all));
         if catch_all {
             engine.register_fallback(ssn, op, handler);
         } else {
             engine.register(ssn, op, handler);
         }
     }
+    drop(guard);
+    drop(replaced);
+    Ok(())
 }
 
 /// A namespace's terminatable operations as `(kebab-name, local operation code)`.
@@ -3523,7 +3553,7 @@ fn on_operation_impl<'py>(
         // register it as a catch-all over every operation now and return it.
         Some(value) if value.is_callable() => {
             for (_, op) in table {
-                register_catch_all(*op, &value);
+                register_catch_all(*op, &value)?;
             }
             Ok(value)
         }
@@ -3588,9 +3618,9 @@ fn make_on_operation_decorator(
             let func = args.get_item(0)?;
             for op in &ops {
                 if catch_all {
-                    register_catch_all(*op, &func);
+                    register_catch_all(*op, &func)?;
                 } else {
-                    register_termination(*op, &func);
+                    register_termination(*op, &func)?;
                 }
             }
             Ok(func.unbind())
@@ -3944,11 +3974,7 @@ pub struct Node {
 impl Node {
     /// The number of currently-open TCAP dialogues.
     fn open_dialogues(&self) -> usize {
-        self.state
-            .engine
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .open_dialogues()
+        self.state.engine().open_dialogues()
     }
 
     /// Render the Prometheus metrics text.
@@ -3976,7 +4002,7 @@ impl Node {
             sls: 0,
             payload,
         };
-        let engine = self.state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let engine = self.state.engine();
         engine
             .deliver(&msu, "loopback")
             .into_iter()
@@ -3992,7 +4018,7 @@ impl Node {
     #[pyo3(signature = (ahead=0.0))]
     fn sweep<'py>(&self, py: Python<'py>, ahead: f64) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let now = std::time::Instant::now() + seconds_arg(ahead, "ahead")?;
-        let engine = self.state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let engine = self.state.engine();
         Ok(engine
             .sweep(now)
             .into_iter()
@@ -4208,7 +4234,7 @@ impl Node {
             class: invoke.class,
             on_reply,
         });
-        let engine = self.state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let engine = self.state.engine();
         let (_tid, frames) = engine.begin(req, handler).map_err(err)?;
         Ok(frames
             .into_iter()
@@ -4307,10 +4333,7 @@ fn runtime_task(
         };
         let engine = {
             let mut guard = node.engine.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::new(std::mem::replace(
-                &mut *guard,
-                DialogueEngine::new(cfg.tcap.clone()),
-            ))
+            std::mem::replace(&mut *guard, Arc::new(DialogueEngine::new(cfg.tcap.clone())))
         };
 
         let handle = script.tokio_handle().clone();

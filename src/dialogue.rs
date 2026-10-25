@@ -965,6 +965,9 @@ struct Record {
     dialogue: Dialogue,
     ingress_assoc: String,
     last_activity: Instant,
+    /// Claimed by [`DialogueEngine::claim_expired`]: its timers are due and
+    /// waiting for [`DialogueEngine::expire`], so the next claim passes it by.
+    claimed: bool,
 }
 
 #[derive(Default)]
@@ -1026,6 +1029,23 @@ impl DialogueEngine {
     ) {
         self.fallback_handlers
             .insert((ssn, operation_code), handler);
+    }
+
+    /// The handler registered for one (SSN, operation) pair: the catch-all one
+    /// when `fallback`, the specific one otherwise.
+    #[cfg(feature = "python")]
+    pub(crate) fn registered(
+        &self,
+        ssn: u8,
+        operation_code: i64,
+        fallback: bool,
+    ) -> Option<Arc<dyn TerminationHandler>> {
+        let handlers = if fallback {
+            &self.fallback_handlers
+        } else {
+            &self.handlers
+        };
+        handlers.get(&(ssn, operation_code)).cloned()
     }
 
     /// The number of currently-open dialogues (deterministic per engine; the
@@ -1533,6 +1553,7 @@ impl DialogueEngine {
             dialogue,
             ingress_assoc: ingress_assoc.to_string(),
             last_activity,
+            claimed: false,
         };
         self.lock().dialogues.insert(tid, rec);
         metrics::dialogue_opened();
@@ -1548,92 +1569,139 @@ impl DialogueEngine {
     /// handler gets [`TerminationHandler::on_invoke_timeout`] (a class 4
     /// operation just returns to idle), and a dialogue idle past its idle
     /// timeout is aborted. Returns `(ingress, MSU)` pairs to send: whatever the
-    /// handlers flushed, and the aborts. Call it periodically (the transport
-    /// does) or with an explicit `now` in a test.
+    /// handlers flushed, and the aborts. Call it with an explicit `now` in a
+    /// test. The transport runs the same two halves apart instead,
+    /// [`claim_expired`](Self::claim_expired) and [`expire`](Self::expire), so
+    /// that no handler runs on the task that dispatches inbound messages.
     pub fn sweep(&self, now: Instant) -> Vec<(String, Msu)> {
-        let due: Vec<Record> = {
+        self.claim_expired(now)
+            .iter()
+            .flat_map(|tid| self.expire(tid, now))
+            .collect()
+    }
+
+    /// The dialogues whose timers are due at `now`, by our transaction id. Runs
+    /// no handler and holds the engine only to look. Each one is claimed until
+    /// [`expire`](Self::expire) runs its timers (or
+    /// [`release_claim`](Self::release_claim) gives it back), so a claim made
+    /// while an earlier one is still waiting does not return it again.
+    pub fn claim_expired(&self, now: Instant) -> Vec<Tid> {
+        let mut inner = self.lock();
+        inner
+            .dialogues
+            .iter_mut()
+            .filter(|(_, rec)| !rec.claimed && timers_due(rec, now))
+            .map(|(tid, rec)| {
+                rec.claimed = true;
+                tid.clone()
+            })
+            .collect()
+    }
+
+    /// Give back a dialogue [`claim_expired`](Self::claim_expired) returned and
+    /// that will not be expired now: the next claim returns it again.
+    pub fn release_claim(&self, tid: &[u8]) {
+        if let Some(rec) = self.lock().dialogues.get_mut(tid) {
+            rec.claimed = false;
+        }
+    }
+
+    /// Run the timers of one dialogue that are due at `now`, as
+    /// [`sweep`](Self::sweep) does for all of them, and return what to send. A
+    /// dialogue that has gone (ended by the peer in the meantime) or whose
+    /// timers are no longer due (a message from the peer came first) is left
+    /// alone.
+    pub fn expire(&self, tid: &[u8], now: Instant) -> Vec<(String, Msu)> {
+        let rec = {
             let mut inner = self.lock();
-            let tids: Vec<Tid> = inner
-                .dialogues
-                .iter()
-                .filter(|(_, rec)| {
-                    let invoke_expired = rec
-                        .dialogue
-                        .outstanding
-                        .iter()
-                        .any(|o| o.deadline.is_some_and(|d| now >= d));
-                    invoke_expired || idle_expired(rec, now)
-                })
-                .map(|(tid, _)| tid.clone())
-                .collect();
-            tids.iter()
-                .filter_map(|tid| inner.dialogues.remove(tid))
-                .collect()
+            match inner.dialogues.get_mut(tid) {
+                None => return Vec::new(),
+                Some(rec) if !timers_due(rec, now) => {
+                    rec.claimed = false;
+                    return Vec::new();
+                }
+                Some(_) => {}
+            }
+            match inner.dialogues.remove(tid) {
+                Some(rec) => rec,
+                None => return Vec::new(),
+            }
         };
 
-        let mut out = Vec::new();
-        for rec in due {
-            metrics::dialogue_closed();
-            let idle = idle_expired(&rec, now);
-            let Record {
-                handler,
-                dialogue: mut dlg,
-                ingress_assoc,
-                last_activity,
-            } = rec;
+        metrics::dialogue_closed();
+        let idle = idle_expired(&rec, now);
+        let Record {
+            handler,
+            dialogue: mut dlg,
+            ingress_assoc,
+            last_activity,
+            ..
+        } = rec;
 
-            // Q.774 3.2.1.1.3, "Invocation timeout": "the state machine returns
-            // to Idle, with notification to the TC-user by means of a
-            // TC-L-CANCEL indication (in the case of a class 1, 2 or 3
-            // operation)".
-            let (expired, running): (Vec<Outstanding>, Vec<Outstanding>) = dlg
-                .outstanding
-                .drain(..)
-                .partition(|o| o.deadline.is_some_and(|d| now >= d));
-            dlg.outstanding = running;
-            for invoke in expired {
-                if dlg.closed.is_some() {
-                    break;
-                }
-                if invoke.class == OperationClass::Four {
-                    continue;
-                }
-                if invoke.class == OperationClass::One {
-                    // The one class for which silence is an abnormal situation.
-                    metrics::invoke_timeout(invoke.op);
-                }
-                let timeout = InvokeTimeout {
+        // Q.774 3.2.1.1.3, "Invocation timeout": "the state machine returns
+        // to Idle, with notification to the TC-user by means of a
+        // TC-L-CANCEL indication (in the case of a class 1, 2 or 3
+        // operation)".
+        let (expired, running): (Vec<Outstanding>, Vec<Outstanding>) = dlg
+            .outstanding
+            .drain(..)
+            .partition(|o| o.deadline.is_some_and(|d| now >= d));
+        dlg.outstanding = running;
+        for invoke in expired {
+            if dlg.closed.is_some() {
+                break;
+            }
+            if invoke.class == OperationClass::Four {
+                continue;
+            }
+            if invoke.class == OperationClass::One {
+                // The one class for which silence is an abnormal situation.
+                metrics::invoke_timeout(invoke.op);
+            }
+            let timeout = InvokeTimeout {
+                invoke_id: invoke.id,
+                operation_code: invoke.op,
+                class: invoke.class,
+            };
+            handler.on_invoke_timeout(&mut dlg, &timeout);
+            if dlg.closed == Some(CloseReason::Aborted) {
+                dlg.closed = Some(CloseReason::InvokeTimeout {
                     invoke_id: invoke.id,
                     operation_code: invoke.op,
-                    class: invoke.class,
-                };
-                handler.on_invoke_timeout(&mut dlg, &timeout);
-                if dlg.closed == Some(CloseReason::Aborted) {
-                    dlg.closed = Some(CloseReason::InvokeTimeout {
-                        invoke_id: invoke.id,
-                        operation_code: invoke.op,
-                    });
-                    metrics::abort(AbortSource::Local);
-                }
-            }
-
-            // Q.774 3.3.4, case 1 ("No reaction to transaction"): "covered by a
-            // local, implementation-dependent, mechanism which results in
-            // aborting the transaction locally". The idle timeout is that
-            // mechanism. The transaction sub-layer has no P-Abort cause for it
-            // (Q.772 2.3 lists five, none of them a timeout), so what the peer
-            // is sent, in case it is still there, is a TC-user abort.
-            if dlg.closed.is_none() && idle {
-                metrics::dialogue_timeout();
+                });
                 metrics::abort(AbortSource::Local);
-                let _ = dlg.abort_as(CloseReason::IdleTimeout);
             }
-
-            let frames = self.finish_turn(dlg, handler, &ingress_assoc, Turn::Timer, last_activity);
-            out.extend(frames.into_iter().map(|m| (ingress_assoc.clone(), m)));
         }
-        out
+
+        // Q.774 3.3.4, case 1 ("No reaction to transaction"): "covered by a
+        // local, implementation-dependent, mechanism which results in
+        // aborting the transaction locally". The idle timeout is that
+        // mechanism. The transaction sub-layer has no P-Abort cause for it
+        // (Q.772 2.3 lists five, none of them a timeout), so what the peer
+        // is sent, in case it is still there, is a TC-user abort.
+        if dlg.closed.is_none() && idle {
+            metrics::dialogue_timeout();
+            metrics::abort(AbortSource::Local);
+            let _ = dlg.abort_as(CloseReason::IdleTimeout);
+        }
+
+        let frames = self.finish_turn(dlg, handler, &ingress_assoc, Turn::Timer, last_activity);
+        frames
+            .into_iter()
+            .map(|m| (ingress_assoc.clone(), m))
+            .collect()
     }
+}
+
+/// Whether an invocation timer of the dialogue has expired, or the dialogue
+/// has been idle past its idle timeout.
+fn timers_due(rec: &Record, now: Instant) -> bool {
+    let invoke_expired = rec
+        .dialogue
+        .outstanding
+        .iter()
+        .any(|o| o.deadline.is_some_and(|d| now >= d));
+    invoke_expired || idle_expired(rec, now)
 }
 
 fn idle_expired(rec: &Record, now: Instant) -> bool {
@@ -1958,6 +2026,15 @@ pub fn dialogue_lane(inbound: &Msu) -> u64 {
         Ok(TcapMessage::Abort(abort)) => abort.dtid.to_vec(),
         _ => return 0,
     };
+    tid_lane(&tid)
+}
+
+/// The lane of a dialogue by the transaction id that keys it: ours, which is
+/// the destination transaction id of every message the peer sends after the
+/// Begin. [`dialogue_lane`] of those messages is the same, so the timers of a
+/// dialogue (see [`DialogueEngine::claim_expired`]) run on the lane its
+/// messages arrive on, one after the other.
+pub fn tid_lane(tid: &[u8]) -> u64 {
     // FNV-1a: stable, and good enough to spread transaction IDs.
     tid.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)

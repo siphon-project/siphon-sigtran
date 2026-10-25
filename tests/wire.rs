@@ -1557,6 +1557,168 @@ async fn wire_terminates_dialogues_side_by_side() {
     handle.shutdown();
 }
 
+/// An HLR that answers UpdateLocation with an InsertSubscriberData of its own,
+/// on a 100 ms invocation timer, and whose timeout callback blocks until the
+/// test lets it go (5 s at most), as a script that waits on a store does.
+struct StuckTimeout {
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+impl TerminationHandler for StuckTimeout {
+    fn on_begin(&self, dlg: &mut Dialogue, _op: &IncomingOp) {
+        dlg.invoke_with(
+            gsm_map::operations::subscriber_data::op_codes::INSERT_SUBSCRIBER_DATA,
+            None,
+            siphon_sigtran::dialogue::OperationClass::One,
+            Some(Duration::from_millis(100)),
+        )
+        .expect("invoke");
+        dlg.send().expect("send");
+    }
+
+    fn on_invoke_timeout(
+        &self,
+        dlg: &mut Dialogue,
+        _timeout: &siphon_sigtran::dialogue::InvokeTimeout,
+    ) {
+        use std::sync::atomic::Ordering;
+        self.entered.store(true, Ordering::SeqCst);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !self.released.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        dlg.abort().expect("abort");
+    }
+}
+
+/// The TCAP message type carried by an M3UA DATA frame the node sent.
+fn tcap_of_m3ua(frame: &[u8]) -> TcapMessage {
+    let msu = msu_of_m3ua(frame);
+    let udt = match SccpMessage::decode(&msu.payload).expect("decode sccp") {
+        SccpMessage::Udt(udt) => udt,
+        other => panic!("expected a UDT, got {other:?}"),
+    };
+    tcap::decode(&udt.data).expect("decode tcap")
+}
+
+/// A timeout callback that takes its time holds up its own dialogue, not the
+/// node: while one is running, a Begin of another dialogue on the same
+/// association is still answered at once. The Abort the callback asks for is
+/// still sent once it returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_a_slow_timeout_callback_does_not_hold_up_other_dialogues() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(mut handle) = start_node(TERMINATION_NODE, "wire_slow_timeout").await else {
+        return;
+    };
+    let entered = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let mut engine = DialogueEngine::new(Tcap::default());
+    engine.register(
+        6,
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        Arc::new(WireHlr),
+    );
+    engine.register(
+        6,
+        gsm_map::op_codes::UPDATE_LOCATION,
+        Arc::new(StuckTimeout {
+            entered: entered.clone(),
+            released: released.clone(),
+        }),
+    );
+    let engine = Arc::new(engine);
+    handle.serve_dialogues(engine.clone());
+    let ingress = handle.bound_addr("ingress").expect("ingress bound");
+    let Some(mut peer) = AspPeer::connect(ingress, 0).await else {
+        eprintln!("SKIP wire_slow_timeout: ingress connect failed");
+        return;
+    };
+    sleep(Duration::from_millis(150)).await;
+
+    // Dialogue A: the HLR continues it with an invoke nobody answers.
+    let invoke = Component::Invoke(Invoke {
+        invoke_id: 1,
+        linked_id: None,
+        operation_code: OperationCode::Local(gsm_map::op_codes::UPDATE_LOCATION),
+        parameter: Some(Any::new(update_location_arg(HLR_IMSI))),
+    });
+    let begin = tcap_begin_tid(
+        &[0x61, 0x62, 0x63, 0x01],
+        Some(aarq(&AC_NET_LOC_UP)),
+        vec![invoke],
+    );
+    let sccp = sccp_udt_to_ssn(SubsystemNumber::Hlr, &begin);
+    peer.send_in(&m3ua_sccp(&sccp, OPC_UPSTREAM, NODE_PC, 0))
+        .await;
+    let continued = peer.recv_out().await.expect("the HLR's Continue");
+    assert!(
+        matches!(tcap_of_m3ua(&continued), TcapMessage::Continue(_)),
+        "dialogue A is held open"
+    );
+
+    // The sweep finds A's timer expired and its callback starts, and stays.
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < until,
+            "the timeout callback never ran"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    // Dialogue B, while A's callback is still running.
+    let sccp = sccp_udt_to_ssn(
+        SubsystemNumber::Hlr,
+        &tcap_begin_tid(
+            &[0x61, 0x62, 0x63, 0x02],
+            Some(aarq(&AC_SRI_SM)),
+            vec![Component::Invoke(Invoke {
+                invoke_id: 1,
+                linked_id: None,
+                operation_code: OperationCode::Local(
+                    gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+                ),
+                parameter: Some(Any::new(sri_sm_arg("15559999"))),
+            })],
+        ),
+    );
+    let sent = std::time::Instant::now();
+    peer.send_in(&m3ua_sccp(&sccp, OPC_UPSTREAM, NODE_PC, 1))
+        .await;
+    // The callback lets go of itself 5 s after it started, so on a node where
+    // it holds everything up the first frame is A's Abort, seconds later.
+    let first = peer.recv_out().await;
+    let waited = sent.elapsed();
+    released.store(true, Ordering::SeqCst);
+    let first = first.expect("a frame after B's Begin");
+    if let TcapMessage::Abort(abort) = tcap_of_m3ua(&first) {
+        panic!(
+            "dialogue B waited for A's timeout callback: A's Abort (dtid {:02x?}) came first",
+            abort.dtid.to_vec()
+        );
+    }
+    assert!(
+        decode_sri_sm_reply(&first).is_some(),
+        "B's answer is an SRI-SM result, got {}",
+        tcap_of_m3ua(&first)
+    );
+    assert!(
+        waited < Duration::from_secs(1),
+        "B was answered {waited:?} after its Begin"
+    );
+
+    // Once A's callback returns, the Abort it asked for goes to the peer.
+    let aborted = peer.recv_out().await.expect("A's Abort");
+    match tcap_of_m3ua(&aborted) {
+        TcapMessage::Abort(abort) => assert_eq!(abort.dtid.to_vec(), vec![0x61, 0x62, 0x63, 0x01]),
+        other => panic!("expected an Abort, got {other}"),
+    }
+    assert_eq!(engine.open_dialogues(), 0);
+    peer.close();
+    handle.shutdown();
+}
+
 // ── Scenario 8a: the same in an XUDT ──────────────────────────────────────────
 
 /// The Begin arrives in an unsegmented XUDT (Q.713 4.18) for a subsystem of
