@@ -21,6 +21,7 @@
 //! Every level-3 timer is a configuration key; the tests set them to hundreds
 //! of milliseconds, so nothing waits on a default.
 
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 use std::sync::Arc;
 use std::time::Duration;
 

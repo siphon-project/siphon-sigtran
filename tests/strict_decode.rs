@@ -12,6 +12,7 @@
 //! Wireshark when `tshark` is installed. Every value is synthetic (test PLMN
 //! 001/01, `+1-555-01xx` numbers).
 
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 use std::sync::{Arc, Mutex};
 
 use tcap::{Component, Reject, TcapMessage};

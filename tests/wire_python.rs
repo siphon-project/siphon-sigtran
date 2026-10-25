@@ -26,6 +26,7 @@
 //! All values are synthetic (test PLMN 001/01, `+1-555-01xx`, decimal PCs).
 
 #![cfg(feature = "python")]
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 
 use std::ffi::CString;
 use std::io::Write as _;

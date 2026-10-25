@@ -2,6 +2,7 @@
 //! validates. Guards the published examples against config-model and YAML
 //! parser changes.
 
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 use std::path::{Path, PathBuf};
 
 use siphon_sigtran::config::Config;

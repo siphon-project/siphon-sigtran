@@ -18,6 +18,7 @@
 //! level 2 and send no traffic restart allowed, so the node is given a T18 and
 //! a T21 that run out at once.
 
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 use std::sync::Arc;
 use std::time::Duration;
 

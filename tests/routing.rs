@@ -15,6 +15,7 @@
 //! All data is synthetic: test PLMN MCC 001 / MNC 01, +1-555-01xx global
 //! titles, and decimal point codes (1000/2000/3000-style).
 
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 use std::sync::Arc;
 use std::time::Duration;
 

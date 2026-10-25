@@ -11,6 +11,7 @@
 //! Every wait of the node is a configuration key in milliseconds (the `dial:`
 //! block of an association), and the tests set them to tens of milliseconds.
 
+#![allow(clippy::disallowed_methods)] // a test harness: its waits run on test threads that are not handler threads
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

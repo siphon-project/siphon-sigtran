@@ -15,6 +15,7 @@
 //!
 //! Run: `cargo run --release --example leak_check`
 
+#![allow(clippy::disallowed_methods)] // not a handler thread
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};
 

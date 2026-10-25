@@ -105,6 +105,7 @@
 //! (1000/2000/3000-style) that resemble nothing real. No captured traffic.
 
 #![warn(missing_docs)]
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod admission;
 pub mod config;
