@@ -7,6 +7,12 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [5.1.1] — 2026-10-26
+
+### Changed
+
+- tokio 1.53.3 -> 1.54.1 (lock only).
+
 ## [5.1.0] — 2026-10-25
 
 ### Added
