@@ -19,6 +19,11 @@ use crate::m2pa_peer::Frame;
 
 pub const PPID_M3UA: u32 = 3;
 
+/// How long `next` waits for a message the test expects. It returns as soon as
+/// the message arrives, so this only bounds a failure; the timing a test does
+/// check is measured with its own bounds. 3 s ran out on a loaded runner.
+const NEXT_DEADLINE: Duration = Duration::from_secs(15);
+
 // Message classes and types (3.1.2).
 pub const ERR: (u8, u8) = (0, 0);
 pub const NTFY: (u8, u8) = (0, 1);
@@ -430,7 +435,7 @@ impl Peer {
 
     /// The next message from the node.
     pub async fn next(&mut self) -> Received {
-        self.within(Duration::from_secs(3))
+        self.within(NEXT_DEADLINE)
             .await
             .expect("a message from the node")
     }

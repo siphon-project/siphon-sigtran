@@ -48,10 +48,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
       # libpython for the `--features python` build/link and the addon tests
-      # that boot the interpreter.
-      - uses: actions/setup-python@v7
+      # that boot the interpreter. Free-threaded, the interpreter siphon-sip
+      # embeds: the stop-the-world tests only mean something without the GIL,
+      # and SIGTRAN_REQUIRE_FREE_THREADED makes them fail rather than skip if
+      # the build ever links a GIL interpreter.
+      - id: python
+        uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.14t"
+
+      - name: Link against the free-threaded interpreter
+        run: |
+          echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
+          echo "SIGTRAN_REQUIRE_FREE_THREADED=1" >> "$GITHUB_ENV"
+          "${{ steps.python.outputs.python-path }}" -c "import sys, sysconfig; print(sys.version); assert sysconfig.get_config_var('Py_GIL_DISABLED') == 1 and not sys._is_gil_enabled(), 'not free-threaded'"
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -107,9 +117,17 @@ jobs:
             libsctp-dev tshark "linux-modules-extra-$(uname -r)" || \
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libsctp-dev tshark
 
-      - uses: actions/setup-python@v7
+      # Free-threaded, as in the `rust` job: the script suites run here too.
+      - id: python
+        uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.14t"
+
+      - name: Link against the free-threaded interpreter
+        run: |
+          echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
+          echo "SIGTRAN_REQUIRE_FREE_THREADED=1" >> "$GITHUB_ENV"
+          "${{ steps.python.outputs.python-path }}" -c "import sys, sysconfig; print(sys.version); assert sysconfig.get_config_var('Py_GIL_DISABLED') == 1 and not sys._is_gil_enabled(), 'not free-threaded'"
 
       - name: Require kernel SCTP and tshark (never skip silently)
         run: |

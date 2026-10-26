@@ -8,6 +8,10 @@
 //! tokio that attaches holds every garbage collection's stop-the-world open for
 //! as long as it waits, so a collection loop runs on another thread throughout.
 //! Every wait has a deadline, so a regression fails instead of hanging.
+//!
+//! The deadlock it guards against exists only without the GIL, so on a GIL
+//! interpreter the test says SKIP and tests nothing (and fails instead when
+//! `SIGTRAN_REQUIRE_FREE_THREADED` is set, as CI does).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -119,8 +123,47 @@ fn bytes_of(value: Bound<'_, PyAny>) -> Vec<u8> {
         .to_vec()
 }
 
+/// Whether the interpreter runs without the GIL: built free-threaded, and the
+/// GIL not switched back on (`PYTHON_GIL=1`, or a module that needs it).
+fn gil_disabled(py: Python<'_>) -> bool {
+    let built = py
+        .import("sysconfig")
+        .and_then(|sysconfig| sysconfig.call_method1("get_config_var", ("Py_GIL_DISABLED",)))
+        .and_then(|value| value.extract::<Option<i64>>())
+        .ok()
+        .flatten()
+        == Some(1);
+    let enabled = py
+        .import("sys")
+        .and_then(|sys| sys.call_method0("_is_gil_enabled"))
+        .and_then(|value| value.extract::<bool>())
+        .unwrap_or(true);
+    built && !enabled
+}
+
+/// `false` after saying SKIP on stderr when the interpreter holds a GIL: a
+/// stop-the-world test proves nothing there. The line bypasses the harness's
+/// output capture so it shows on a passing run. With
+/// `SIGTRAN_REQUIRE_FREE_THREADED` set it fails instead.
+fn free_threaded(test: &str) -> bool {
+    if Python::attach(gil_disabled) {
+        return true;
+    }
+    let message = format!("SKIP (not free-threaded): {test}: the interpreter has a GIL");
+    assert!(
+        std::env::var_os("SIGTRAN_REQUIRE_FREE_THREADED").is_none(),
+        "SIGTRAN_REQUIRE_FREE_THREADED is set but {message}"
+    );
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{message}");
+    false
+}
+
 #[test]
 fn no_handler_runs_on_a_tokio_thread_while_collections_run() {
+    if !free_threaded("no_handler_runs_on_a_tokio_thread_while_collections_run") {
+        return;
+    }
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(drive_dialogues);
@@ -349,6 +392,10 @@ fn drive_dialogues() {
         (seen, collections[0])
     });
     let _ = collecting.join();
+    assert!(
+        Python::attach(gil_disabled),
+        "the GIL came back on during the run, so the collections stopped nothing"
+    );
 
     eprintln!("handler steps and their threads: {seen:?}; {collections} collections");
     let tags: Vec<&str> = seen.iter().map(|(tag, _)| tag.as_str()).collect();

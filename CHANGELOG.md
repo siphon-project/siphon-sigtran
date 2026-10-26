@@ -7,6 +7,10 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- crypto-bigint 0.7.8 -> 0.7.9 (lock only, 0.7.8 was yanked).
+
 ## [5.1.1] — 2026-10-26
 
 ### Changed
