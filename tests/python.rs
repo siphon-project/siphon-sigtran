@@ -1011,8 +1011,15 @@ assert node.open_dialogues() == 0
 /// calls back into the node, and another thread that does while it runs, both
 /// get through. On a regression this deadlocks, so the script runs on a thread
 /// of its own and the test fails after a deadline instead of hanging.
+///
+/// The collections only stop the world without the GIL, so on a GIL
+/// interpreter the test says SKIP (and fails instead when
+/// `SIGTRAN_REQUIRE_FREE_THREADED` is set, as CI does).
 #[test]
 fn a_handler_can_call_back_into_the_node_while_it_runs() {
+    if !free_threaded("a_handler_can_call_back_into_the_node_while_it_runs") {
+        return;
+    }
     let _node = NODE.lock().unwrap_or_else(|e| e.into_inner());
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1032,4 +1039,44 @@ fn a_handler_can_call_back_into_the_node_while_it_runs() {
         Ok(Err(error)) => panic!("the re-entering script failed: {error}"),
         Err(_) => panic!("deadlock: the script did not finish within 30 s"),
     }
+    assert!(
+        Python::attach(gil_disabled),
+        "the GIL came back on during the run, so the collections stopped nothing"
+    );
+}
+
+/// Whether the interpreter runs without the GIL: built free-threaded, and the
+/// GIL not switched back on (`PYTHON_GIL=1`, or a module that needs it).
+fn gil_disabled(py: Python<'_>) -> bool {
+    let built = py
+        .import("sysconfig")
+        .and_then(|sysconfig| sysconfig.call_method1("get_config_var", ("Py_GIL_DISABLED",)))
+        .and_then(|value| value.extract::<Option<i64>>())
+        .ok()
+        .flatten()
+        == Some(1);
+    let enabled = py
+        .import("sys")
+        .and_then(|sys| sys.call_method0("_is_gil_enabled"))
+        .and_then(|value| value.extract::<bool>())
+        .unwrap_or(true);
+    built && !enabled
+}
+
+/// `false` after saying SKIP on stderr when the interpreter holds a GIL: a
+/// stop-the-world test proves nothing there. The line bypasses the harness's
+/// output capture so it shows on a passing run. With
+/// `SIGTRAN_REQUIRE_FREE_THREADED` set it fails instead.
+fn free_threaded(test: &str) -> bool {
+    if Python::attach(gil_disabled) {
+        return true;
+    }
+    let message = format!("SKIP (not free-threaded): {test}: the interpreter has a GIL");
+    assert!(
+        std::env::var_os("SIGTRAN_REQUIRE_FREE_THREADED").is_none(),
+        "SIGTRAN_REQUIRE_FREE_THREADED is set but {message}"
+    );
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{message}");
+    false
 }
