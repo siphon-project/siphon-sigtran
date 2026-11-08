@@ -100,8 +100,10 @@ use crate::mtp3::route::Destination;
 use crate::routing::{Inbound, RouteDecision, Router};
 
 pub mod dial;
+pub mod dns;
 mod forward;
 pub mod framing;
+mod groups;
 pub mod identity;
 mod m2pa;
 mod m3ua;
@@ -279,6 +281,17 @@ impl TransportHandle {
         tenant_id: &str,
         router: Arc<Router>,
     ) -> Result<Self> {
+        Self::start_tenant_with_resolver(config, tenant_id, router, Arc::new(dns::SystemResolver))
+            .await
+    }
+
+    /// Start with an injected DNS resolver, also used on reconnect and refresh.
+    pub async fn start_tenant_with_resolver(
+        config: &Config,
+        tenant_id: &str,
+        router: Arc<Router>,
+        resolver: Arc<dyn dns::Resolver>,
+    ) -> Result<Self> {
         let registry = Arc::new(
             Registry::build(config, tenant_id)
                 .ok_or_else(|| TransportError::Config(format!("unknown tenant `{tenant_id}`")))?,
@@ -363,7 +376,6 @@ impl TransportHandle {
             for assoc in members {
                 let slot = registry
                     .slot(&assoc.id)
-                    .cloned()
                     .ok_or_else(|| TransportError::Config(format!("no slot for `{}`", assoc.id)))?;
                 let addrs = assoc
                     .peer_ips()
@@ -412,7 +424,6 @@ impl TransportHandle {
             }
             let slot = registry
                 .slot(&assoc.id)
-                .cloned()
                 .ok_or_else(|| TransportError::Config(format!("no slot for `{}`", assoc.id)))?;
             // A link that is not connected yet still has its queue served.
             if assoc.adaptation == Adaptation::M2pa {
@@ -423,8 +434,19 @@ impl TransportHandle {
                     0,
                 )));
             }
+            if assoc.all_addresses {
+                tasks.push(tokio::spawn(groups::run(
+                    assoc.clone(),
+                    resolver.clone(),
+                    ctx.clone(),
+                    shutdown_rx.clone(),
+                )));
+                continue;
+            }
             let dialled = Dialled {
-                peer: socket_addrs(assoc)?,
+                peer: assoc.addrs.clone(),
+                port: assoc.port,
+                resolver: resolver.clone(),
                 local: local_addrs(assoc)?,
                 settings: dial_settings(assoc),
                 sctp: sctp_cfg.clone(),
@@ -960,7 +982,7 @@ async fn send_reply(registry: &Registry, assoc_id: &str, msu: &Msu) {
             (framing::wrap_m3ua(msu, rc), 1u16, 3u32)
         }
         Adaptation::M2pa => {
-            forward::send_on_link(slot, msu);
+            forward::send_on_link(&slot, msu);
             return;
         }
         Adaptation::Sua => {
@@ -988,7 +1010,9 @@ async fn send_reply(registry: &Registry, assoc_id: &str, msu: &Msu) {
 struct Dialled {
     slot: Arc<registry::AssocSlot>,
     /// The addresses of the far end (`addrs` and `port`).
-    peer: Vec<SocketAddr>,
+    peer: Vec<String>,
+    port: u16,
+    resolver: Arc<dyn dns::Resolver>,
     /// The addresses to dial from; empty leaves them to the kernel.
     local: Vec<SocketAddr>,
     settings: dial::Settings,
@@ -999,7 +1023,10 @@ struct Dialled {
 
 /// The timers of a `client` association from its `dial:` block.
 fn dial_settings(a: &Association) -> dial::Settings {
-    let block = a.dial.clone().unwrap_or_default();
+    let block = a.dial.clone().unwrap_or_else(|| crate::config::Dial {
+        backoff_max_ms: a.reconnect_max_seconds.saturating_mul(1000),
+        ..Default::default()
+    });
     dial::Settings {
         connect_timeout: Duration::from_millis(block.connect_timeout_ms),
         initial: Duration::from_millis(block.backoff_initial_ms),
@@ -1091,6 +1118,8 @@ async fn dial_association(dialled: Dialled, ctx: TaskCtx, mut shutdown: watch::R
     let Dialled {
         slot,
         peer,
+        port,
+        resolver,
         local,
         settings,
         sctp,
@@ -1103,6 +1132,9 @@ async fn dial_association(dialled: Dialled, ctx: TaskCtx, mut shutdown: watch::R
     let mut established: Option<Arc<SctpAssociation>> = None;
     let mut error = String::new();
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
         let mut input = None;
         for action in actions {
             match action {
@@ -1140,7 +1172,14 @@ async fn dial_association(dialled: Dialled, ctx: TaskCtx, mut shutdown: watch::R
                 dial::Action::Connect => {
                     metrics::set_dial_backoff(&id, Duration::ZERO);
                     metrics::dial_attempt(&id);
-                    let connect = SctpAssociation::connect_from(&local, &peer, &sctp);
+                    let connect = async {
+                        let addresses = dns::resolve(resolver.as_ref(), &peer, port).await
+                            .map_err(async_sctp::SctpError::Io)?;
+                        if addresses.is_empty() {
+                            return Err(async_sctp::SctpError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "DNS returned no addresses")));
+                        }
+                        SctpAssociation::connect_from(&local, &addresses, &sctp).await
+                    };
                     let outcome = tokio::select! {
                         _ = shutdown.changed() => return,
                         outcome = attempt(connect, settings.connect_timeout) => outcome,
@@ -1281,6 +1320,30 @@ mod tests {
         for (error, reason) in table {
             assert_eq!(failure(&error), reason, "{error}");
         }
+    }
+
+    #[test]
+    fn reconnect_cap_and_legacy_dial_settings() {
+        let association = |extra: &str| {
+            Config::parse(&format!(
+            "node: {{ point_code: 1000, variant: ITU }}\nassociations:\n  - {{ id: peer, adaptation: m3ua, role: client, addrs: [peer.example], port: 2905{extra} }}\n"
+        )).unwrap().associations.remove(0)
+        };
+        let default = dial_settings(&association(""));
+        assert_eq!(default.initial, Duration::from_secs(1));
+        assert_eq!(default.max, Duration::from_secs(30));
+        assert_eq!(default.jitter_percent, 20);
+        assert_eq!(
+            dial_settings(&association(", reconnect_max_seconds: 5")).max,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            dial_settings(&association(
+                ", reconnect_max_seconds: 5, dial: { backoff_max_ms: 2000 }"
+            ))
+            .max,
+            Duration::from_secs(2)
+        );
     }
 
     #[test]

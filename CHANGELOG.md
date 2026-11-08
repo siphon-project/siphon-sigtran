@@ -7,8 +7,23 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Client ASP DNS lookup on every dial, with injectable resolution and a
+  `reconnect_max_seconds` cap (default 30) over the existing jittered reconnect loop.
+- Opt-in M3UA `all_addresses` groups with periodic DNS refresh (`resolve_seconds`,
+  default 30), independently handshaken members in every configured AS, and
+  ASP Down on address withdrawal. TCAP affinity across members is outside scope.
+
+### Fixed
+
+- Independently acknowledged client ASPs remain eligible for first-active Override
+  routing; gateway-side Override displacement is unchanged.
+
 ### Changed
 
+- `Registry::slot` returns an owned `Arc` so a DNS member can be safely removed
+  while callers hold its handle.
 - crypto-bigint 0.7.8 -> 0.7.9 (lock only, 0.7.8 was yanked).
 
 ## [5.1.1] — 2026-10-26

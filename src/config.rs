@@ -163,10 +163,19 @@ pub struct Association {
     pub adaptation: Adaptation,
     /// server (listen) or client (connect).
     pub role: Role,
-    /// One or more IP addresses (SCTP multihoming).
+    /// IP addresses (SCTP multihoming), or DNS names for clients.
     pub addrs: Vec<String>,
     /// SCTP port.
     pub port: u16,
+    /// Resolve one client name into independently dialled M3UA ASP members.
+    #[serde(default)]
+    pub all_addresses: bool,
+    /// DNS refresh interval for `all_addresses`, in seconds.
+    #[serde(default = "default_dns_seconds")]
+    pub resolve_seconds: u64,
+    /// Maximum reconnect backoff in seconds (the `dial` block takes precedence).
+    #[serde(default = "default_dns_seconds")]
+    pub reconnect_max_seconds: u64,
     /// For a `server` association: every IP address of the peer it accepts
     /// (all of them for a multihomed peer). A peer is this association's when
     /// every address it presents is listed; anyone else who reaches the
@@ -206,6 +215,10 @@ pub struct Association {
     /// of this association. Absent means every default of [`M3uaPeer`].
     #[serde(default)]
     pub m3ua: Option<M3uaPeer>,
+}
+
+fn default_dns_seconds() -> u64 {
+    30
 }
 
 impl Association {
@@ -1259,6 +1272,32 @@ impl Config {
             if !seen.insert(a.id.as_str()) {
                 return Err(Error::validation(format!(
                     "duplicate association id `{}`",
+                    a.id
+                )));
+            }
+            if a.resolve_seconds == 0 || a.reconnect_max_seconds == 0 {
+                return Err(Error::validation(format!(
+                    "association `{}`: resolve_seconds and reconnect_max_seconds must be positive",
+                    a.id
+                )));
+            }
+            if a.all_addresses
+                && (a.role != Role::Client
+                    || a.adaptation != Adaptation::M3ua
+                    || a.addrs.len() != 1)
+            {
+                return Err(Error::validation(format!(
+                    "association `{}`: all_addresses requires a client M3UA ASP with one address",
+                    a.id
+                )));
+            }
+            if self
+                .associations
+                .iter()
+                .any(|group| group.all_addresses && a.id.starts_with(&format!("{}@", group.id)))
+            {
+                return Err(Error::validation(format!(
+                    "association `{}` conflicts with a DNS member namespace",
                     a.id
                 )));
             }

@@ -97,15 +97,18 @@ The SCTP transport plane: one entry per association.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `id` | *(required)* | Association id, referenced by AS `asps` and linkset `links`. Unique. |
+| `id` | *(required)* | Association id, referenced by AS `asps` and linkset `links`. Unique; the `<group-id>@` prefix is reserved when that DNS group is enabled. |
 | `adaptation` | *(required)* | `m3ua` (RFC 4666) or `m2pa` (RFC 4165). |
 | `role` | *(required)* | `server` (we listen) or `client` (we connect). |
-| `addrs` | *(required)* | One or more IP addresses. More than one enables SCTP multihoming. |
+| `addrs` | *(required)* | IP literals; clients also accept DNS names and `host:port` (IPv6 with a port uses `[address]:port`). Names are resolved on every dial. Without `all_addresses`, the resolved list describes one multihomed SCTP peer. |
 | `port` | *(required)* | SCTP port. Convention: 2905 for M3UA, 3565 for M2PA. For a `server`, `0` asks the kernel for a port of its own (a test, not a deployment). |
 | `peer_addrs` | `[]` *(server only)* | Every IP address of the peer this association accepts: all of them for a multihomed peer. See [who a listening association accepts](#peer-identity). Empty accepts whoever connects first and logs a warning at start. |
 | `peer_port` | *(none: any port)* *(server only)* | The SCTP port of the peer. Needs `peer_addrs`. Not `0`. |
 | `local_addrs` | `[]` *(client only)* | The local IP addresses the association is dialled from; more than one makes this end multihomed. Empty leaves the choice to the kernel, which then offers the peer **every** address of the host: a peer that accepts by source address (`peer_addrs` on its side) needs this set. |
 | `local_port` | *(none: any port)* *(client only)* | The local SCTP port the association is dialled from. Without `local_addrs` it is bound on every address. Not `0`. |
+| `all_addresses` | `false` | Client M3UA only: expand the single `addrs` entry into one association per resolved socket address. |
+| `resolve_seconds` | `30` | Positive DNS refresh interval for `all_addresses`. |
+| `reconnect_max_seconds` | `30` | Positive reconnect cap in seconds when `dial` is absent. An explicit `dial` block takes precedence, including its defaults. |
 | `dial` | *(client only)* every default below | How the association is dialled, and dialled again: see [the `dial` block](#dial). |
 | `adjacent_pc` | *(m2pa only)* | The adjacent point code reached directly over this link. An adjacent PC is an **implicit route**; it needs no `mtp3_routes` entry. |
 | `m2pa` | *(m2pa only)* every default below | Level 2 of the link: see [the `m2pa` block](#m2pa-link). |
@@ -173,6 +176,29 @@ the same to an M3UA and a SUA association.
 Without `peer_addrs` an association accepts whoever connects first to its
 port, as every release before this key did, and a line at start says so in
 capitals. It then needs an address and port of its own.
+
+### DNS member groups
+
+With `all_addresses: true`, the configured ASP is a template. Every resolved
+address gets a member named `<id>@<address:port>` (IPv6 addresses are bracketed).
+Each member inherits every AS membership of the template and independently
+retries connections, then completes ASP Up / ASP Active before carrying traffic.
+The template itself never dials. Members expand at the template's position in
+AS order and are ordered by their names, making Override choose the first active
+member and Loadshare choose by SLS across the active members. Broadcast uses all
+active members. Separate client gateways' Active acknowledgements do not displace
+one another; server-side Override still follows RFC 4666's displacement procedure.
+
+Resolution happens immediately and every `resolve_seconds`. Duplicate answers
+are collapsed. A successful answer withdraws missing members: their live
+associations send ASP Down, close, and leave every AS and the registry. A lookup
+error or timeout retains the previous set; a successful empty answer removes all
+members. Unchanged members keep their associations. DNS and connect failures are
+logged and retried without preventing startup. Each lookup is bounded by
+`dial.connect_timeout_ms`; ordinary dialing bounds lookup and connect together.
+
+TCAP dialogue affinity across members is not provided. A TC-CONTINUE arriving on
+a different member from its TC-BEGIN is outside this feature's scope.
 
 ### The `dial` block { #dial }
 

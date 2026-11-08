@@ -386,6 +386,7 @@ pub struct Aspm {
     asps: Vec<AspEntry>,
     servers: Vec<AsState>,
     out: Vec<Action>,
+    free_members: Vec<usize>,
 }
 
 impl Aspm {
@@ -403,8 +404,45 @@ impl Aspm {
                 .collect(),
             servers: vec![AsState::Down; layout.servers.len()],
             out: Vec::new(),
+            free_members: Vec::new(),
             layout,
         }
+    }
+
+    /// Add a client member with every AS membership of its template.
+    pub(crate) fn add_member(&mut self, template: usize, name: String) -> usize {
+        let mut spec = self.layout.asps[template].clone();
+        spec.name = name;
+        let entry = AspEntry {
+            up: false,
+            identifier: None,
+            active: vec![false; spec.servers.len()],
+        };
+        let index = if let Some(index) = self.free_members.pop() {
+            self.layout.asps[index] = spec;
+            self.asps[index] = entry;
+            index
+        } else {
+            self.layout.asps.push(spec);
+            self.asps.push(entry);
+            self.asps.len() - 1
+        };
+        for server in &self.layout.asps[index].servers {
+            self.layout.servers[*server].asps.push(index);
+        }
+        index
+    }
+
+    /// Remove a member after its association has reported Lost.
+    pub(crate) fn remove_member(&mut self, index: usize) {
+        for server in &self.layout.asps[index].servers {
+            self.layout.servers[*server]
+                .asps
+                .retain(|asp| *asp != index);
+        }
+        self.layout.asps[index].servers.clear();
+        self.layout.asps[index].name.clear();
+        self.free_members.push(index);
     }
 
     /// The domain this was built for.
@@ -636,7 +674,9 @@ impl Aspm {
         // previously active ASP in the AS is now considered to be in the
         // state ASP-INACTIVE ... The SGP or IPSP then MUST send a Notify
         // message ("Alternate ASP_Active") to the previously active ASP".
-        let displaced: Vec<AspId> = if self.layout.servers[server].mode == TrafficMode::Override {
+        let displaced: Vec<AspId> = if self.layout.asps[asp].gateway
+            && self.layout.servers[server].mode == TrafficMode::Override
+        {
             self.layout.servers[server]
                 .asps
                 .iter()
@@ -960,6 +1000,48 @@ mod tests {
                 recovery: Some(T_R),
             }],
         }
+    }
+
+    #[test]
+    fn independent_client_override_peers_remain_active() {
+        let mut layout = layout(TrafficMode::Override, 2, 1);
+        for asp in &mut layout.asps {
+            asp.gateway = false;
+        }
+        let mut m = Aspm::new(layout);
+        for asp in [0, 1] {
+            m.handle(Input::PeerUp { asp });
+            m.handle(Input::PeerActive {
+                asp,
+                contexts: None,
+            });
+        }
+        assert_eq!(m.asp_state(0, 0), AspState::Active);
+        assert_eq!(m.asp_state(1, 0), AspState::Active);
+    }
+
+    #[test]
+    fn dns_members_join_leave_and_reuse_state_slots() {
+        let mut layout = layout(TrafficMode::Loadshare, 1, 1);
+        layout.asps[0].gateway = false;
+        layout.servers[0].recovery = None;
+        let mut m = Aspm::new(layout);
+        let a = m.add_member(0, "peer@192.0.2.1:2905".into());
+        let b = m.add_member(0, "peer@192.0.2.2:2905".into());
+        for asp in [a, b] {
+            m.handle(Input::PeerUp { asp });
+            m.handle(Input::PeerActive {
+                asp,
+                contexts: None,
+            });
+            assert_eq!(m.asp_state(asp, 0), AspState::Active);
+        }
+        m.handle(Input::Lost { asp: a });
+        m.remove_member(a);
+        assert!(!m.layout.servers[0].asps.contains(&a));
+        assert_eq!(m.server_state(0), AsState::Active);
+        assert_eq!(m.add_member(0, "peer@192.0.2.3:2905".into()), a);
+        assert_eq!(m.asp_state(a, 0), AspState::Down);
     }
 
     fn machine(mode: TrafficMode, asps: usize) -> Aspm {
