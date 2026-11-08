@@ -7,6 +7,8 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [6.0.0] — 2026-11-08
+
 ### Added
 
 - Client ASP DNS lookup on every dial, with injectable resolution and a
