@@ -670,3 +670,119 @@ linksets:
     assert_eq!(metrics::dial_attempts("waiting"), attempts);
     assert_eq!(metrics::dial_backoff("waiting"), Duration::ZERO);
 }
+
+// DNS is injected; the associations and M3UA handshakes use real SCTP.
+struct DnsSet(std::sync::Mutex<Vec<SocketAddr>>);
+impl siphon_sigtran::transport::dns::Resolver for DnsSet {
+    fn lookup<'a>(&'a self, _: &'a str, _: u16) -> siphon_sigtran::transport::dns::Lookup<'a> {
+        let answer = self.0.lock().unwrap().clone();
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+async fn start_dns(yaml: &str, dns: Arc<DnsSet>) -> TransportHandle {
+    let cfg = Config::parse(yaml).unwrap();
+    TransportHandle::start_tenant_with_resolver(&cfg, "default", Arc::new(Router::new(&cfg)), dns)
+        .await
+        .unwrap()
+}
+
+async fn data_reaches_selected(handle: &TransportHandle, peer: &mut Peer, sls: u8) {
+    use siphon_sigtran::mtp3::route::Destination;
+    let chosen = handle
+        .registry()
+        .select(&Destination::ApplicationServer("far".into()), sls);
+    assert_eq!(chosen.len(), 1);
+    let bytes = m3ua_peer::data(Some(RC_FAR), NODE, FAR, SI_USER, NI, sls, &[42]);
+    chosen[0].assoc.send(&bytes, 1, 3).await.unwrap();
+    let received = peer.until(m3ua_peer::DATA).await;
+    assert_eq!(received.frame.bytes, bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn dns_is_resolved_again_after_start_failure_and_drop_and_traffic_resumes() {
+    let (Some(first), Some(second)) = (m3ua_peer::Listening::bind(), m3ua_peer::Listening::bind())
+    else {
+        eprintln!("SKIP DNS reconnect: no kernel SCTP");
+        return;
+    };
+    let dns = Arc::new(DnsSet(std::sync::Mutex::new(vec![])));
+    let yaml = as_an_asp(first.port, "")
+        .replace("addrs: [127.0.0.1]", "addrs: [peer.example]")
+        .replace("to-gateway", "dns-peer");
+    let handle = start_dns(&yaml, dns.clone()).await;
+    assert!(at_least(|| metrics::dial_attempts("dns-peer"), 2).await);
+    *dns.0.lock().unwrap() = vec![SocketAddr::from(([127, 0, 0, 1], first.port))];
+    let mut peer = first.accept().await.expect("resolved on retry");
+    bring_up(&mut peer).await;
+    assert!(carrying(&handle, "dns-peer", true).await);
+    data_reaches_selected(&handle, &mut peer, 0).await;
+    *dns.0.lock().unwrap() = vec![SocketAddr::from(([127, 0, 0, 1], second.port))];
+    drop(peer);
+    let mut peer = second.accept().await.expect("resolved after drop");
+    bring_up(&mut peer).await;
+    assert!(carrying(&handle, "dns-peer", true).await);
+    data_reaches_selected(&handle, &mut peer, 0).await;
+    handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn dns_members_route_by_sls_override_and_withdraw_with_asp_down() {
+    use siphon_sigtran::mtp3::route::Destination;
+    for mode in ["loadshare", "override", "broadcast"] {
+        let (Some(first), Some(second)) =
+            (m3ua_peer::Listening::bind(), m3ua_peer::Listening::bind())
+        else {
+            eprintln!("SKIP DNS member routing: no kernel SCTP");
+            return;
+        };
+        let a = SocketAddr::from(([127, 0, 0, 1], first.port));
+        let b = SocketAddr::from(([127, 0, 0, 1], second.port));
+        let dns = Arc::new(DnsSet(std::sync::Mutex::new(vec![b, a, a])));
+        let yaml = as_an_asp(first.port, ", all_addresses: true, resolve_seconds: 1")
+            .replace("addrs: [127.0.0.1]", "addrs: [peer.example]")
+            .replace("traffic_mode: override", &format!("traffic_mode: {mode}"));
+        let handle = start_dns(&yaml, dns.clone()).await;
+        let mut pa = first.accept().await.expect("member a");
+        let mut pb = second.accept().await.expect("member b");
+        bring_up(&mut pa).await;
+        bring_up(&mut pb).await;
+        let an = format!("to-gateway@{a}");
+        let bn = format!("to-gateway@{b}");
+        assert!(carrying(&handle, &an, true).await);
+        assert!(carrying(&handle, &bn, true).await);
+        let dest = Destination::ApplicationServer("far".into());
+        let selected = |sls| {
+            handle
+                .registry()
+                .select(&dest, sls)
+                .iter()
+                .map(|s| s.slot.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut names = vec![an.clone(), bn.clone()];
+        names.sort();
+        for sls in 0..8 {
+            let expected = match mode {
+                "loadshare" => vec![names[usize::from(sls) % 2].clone()],
+                "override" => vec![names[0].clone()],
+                _ => names.clone(),
+            };
+            assert_eq!(selected(sls), expected);
+        }
+        *dns.0.lock().unwrap() = vec![b];
+        pa.until(m3ua_peer::ASPDN).await;
+        timeout(Duration::from_secs(3), async {
+            while handle.registry().slot(&an).is_some() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("removed from registry");
+        for sls in 0..8 {
+            assert_eq!(selected(sls), vec![bn.clone()]);
+        }
+        data_reaches_selected(&handle, &mut pb, 1).await;
+        handle.shutdown();
+    }
+}

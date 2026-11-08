@@ -260,6 +260,8 @@ pub struct AssocSlot {
     pub(crate) asp: Option<usize>,
     /// For an m3ua association: the servers it is configured in.
     memberships: Vec<Membership>,
+    member_flags: Option<Vec<AtomicBool>>,
+    template: Option<String>,
     /// For an m3ua association: its `m3ua:` block.
     pub(crate) m3ua: M3uaPeer,
     /// An SCTP association has the slot: see [`AssocSlot::occupy`].
@@ -299,6 +301,8 @@ impl AssocSlot {
             role,
             asp: None,
             memberships: Vec::new(),
+            member_flags: None,
+            template: None,
             m3ua: M3uaPeer::default(),
             occupied: AtomicBool::new(false),
             vacated: tokio::sync::Notify::new(),
@@ -323,6 +327,11 @@ impl AssocSlot {
     /// taken again by the time this returns: [`occupy`](Self::occupy) says.
     pub(crate) async fn vacated(&self) {
         self.vacated.notified().await;
+    }
+
+    /// Whether this slot is a DNS-expanded client member.
+    pub(crate) fn is_member(&self) -> bool {
+        self.member_flags.is_some()
     }
 
     /// The Application Servers this M3UA association is configured in.
@@ -461,6 +470,7 @@ pub struct Registry {
     tenant: TenantId,
     variant: Variant,
     assocs: HashMap<String, Arc<AssocSlot>>,
+    members: RwLock<BTreeMap<String, Arc<AssocSlot>>>,
     application_servers: Vec<AsEntry>,
     linksets: Vec<LinksetEntry>,
     /// The links by their number in signalling network management.
@@ -626,6 +636,7 @@ impl Registry {
             tenant: tenant_id.to_string(),
             variant: tenant.variant,
             assocs,
+            members: RwLock::new(BTreeMap::new()),
             application_servers,
             linksets,
             links,
@@ -737,8 +748,95 @@ impl Registry {
     }
 
     /// The M3UA association with this number in ASP state maintenance.
-    pub(crate) fn asp_slot(&self, asp: usize) -> Option<&Arc<AssocSlot>> {
-        self.assocs.values().find(|slot| slot.asp == Some(asp))
+    pub(crate) fn asp_slot(&self, asp: usize) -> Option<Arc<AssocSlot>> {
+        self.assocs
+            .values()
+            .find(|slot| slot.asp == Some(asp))
+            .cloned()
+            .or_else(|| {
+                self.members
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .find(|slot| slot.asp == Some(asp))
+                    .cloned()
+            })
+    }
+
+    pub(crate) fn add_member(
+        &self,
+        template: &AssocSlot,
+        name: String,
+        asp: usize,
+    ) -> Arc<AssocSlot> {
+        let mut slot = AssocSlot::new(name.clone(), template.adaptation, None, Role::Client);
+        slot.asp = Some(asp);
+        slot.m3ua = template.m3ua.clone();
+        slot.memberships = template.memberships.clone();
+        slot.member_flags = Some(
+            slot.memberships
+                .iter()
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+        );
+        slot.template = Some(template.id.clone());
+        let slot = Arc::new(slot);
+        self.members
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name, slot.clone());
+        slot
+    }
+
+    pub(crate) fn remove_member(&self, name: &str) {
+        self.members
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+    }
+
+    /// Expand templates in configuration order, with members in address order.
+    fn server_slots(&self, entry: &AsEntry) -> Vec<Arc<AssocSlot>> {
+        let members = self.members.read().unwrap_or_else(|e| e.into_inner());
+        entry
+            .members
+            .iter()
+            .flat_map(|slot| {
+                std::iter::once(slot.clone()).chain(
+                    members
+                        .values()
+                        .filter(|m| m.template.as_deref() == Some(slot.id.as_str()))
+                        .cloned(),
+                )
+            })
+            .collect()
+    }
+
+    fn slot_active(&self, slot: &AssocSlot, membership: &Membership) -> bool {
+        if let Some(flags) = &slot.member_flags {
+            return slot
+                .memberships
+                .iter()
+                .position(|m| m.server == membership.server)
+                .is_some_and(|i| flags[i].load(Ordering::Relaxed));
+        }
+        self.member_active(membership)
+    }
+
+    fn slot_carries(&self, entry: &AsEntry, slot: &AssocSlot) -> bool {
+        if slot.member_flags.is_some() {
+            slot.sender().is_some()
+                && slot
+                    .memberships
+                    .iter()
+                    .any(|m| m.context == entry.routing_context && self.slot_active(slot, m))
+        } else {
+            entry
+                .members
+                .iter()
+                .position(|m| m.id == slot.id)
+                .is_some_and(|i| entry.carries(i))
+        }
     }
 
     /// How many Application Servers the domain has.
@@ -763,12 +861,9 @@ impl Registry {
         let Some(entry) = self.application_servers.get(server) else {
             return Vec::new();
         };
-        entry
-            .members
-            .iter()
-            .enumerate()
-            .filter(|(position, _)| entry.carries(*position))
-            .map(|(_, slot)| slot.clone())
+        self.server_slots(entry)
+            .into_iter()
+            .filter(|slot| self.slot_carries(entry, slot))
             .collect()
     }
 
@@ -778,6 +873,16 @@ impl Registry {
         let Some(entry) = self.application_servers.get(server) else {
             return;
         };
+        if let Some(flags) = &slot.member_flags {
+            for (index, membership) in slot.memberships.iter().enumerate() {
+                if membership.server == server {
+                    flags[index].store(active, Ordering::Relaxed);
+                }
+            }
+            slot.set_active(flags.iter().any(|flag| flag.load(Ordering::Relaxed)));
+            metrics::set_asp_state(&slot.id, &entry.name, active);
+            return;
+        }
         for membership in slot.memberships.iter().filter(|m| m.server == server) {
             if let Some(flag) = entry.active.get(membership.position) {
                 flag.store(active, Ordering::Relaxed);
@@ -794,6 +899,13 @@ impl Registry {
     /// accepted. What the ASP state machine holds follows when the task of
     /// the association reports it lost.
     pub(crate) fn quiesce(&self, slot: &AssocSlot) {
+        if let Some(flags) = &slot.member_flags {
+            for flag in flags {
+                flag.store(false, Ordering::Relaxed);
+            }
+            slot.set_active(false);
+            return;
+        }
         for membership in &slot.memberships {
             if let Some(flag) = self
                 .application_servers
@@ -819,7 +931,7 @@ impl Registry {
         let mut active = slot
             .memberships
             .iter()
-            .filter(|m| self.member_active(m))
+            .filter(|m| self.slot_active(slot, m))
             .peekable();
         if active.peek().is_none() {
             return Admission::NotActive;
@@ -962,15 +1074,26 @@ impl Registry {
         self.variant
     }
 
-    /// The slot for an association id.
-    pub fn slot(&self, id: &str) -> Option<&Arc<AssocSlot>> {
-        self.assocs.get(id)
+    /// An owned handle to the slot for a configured association or DNS member.
+    pub fn slot(&self, id: &str) -> Option<Arc<AssocSlot>> {
+        self.assocs.get(id).cloned().or_else(|| {
+            self.members
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id)
+                .cloned()
+        })
     }
 
     /// The routing context + traffic mode of the AS an m3ua ASP association
     /// belongs to (for the ASP-ACTIVE it should send). `None` if the association
     /// is not an ASP of any AS.
     pub fn as_membership(&self, assoc_id: &str) -> Option<(u32, TrafficMode)> {
+        let slot = self.slot(assoc_id);
+        let assoc_id = slot
+            .as_ref()
+            .and_then(|s| s.template.as_deref())
+            .unwrap_or(assoc_id);
         self.application_servers
             .iter()
             .find(|a| a.asps.iter().any(|x| x == assoc_id))
@@ -983,6 +1106,11 @@ impl Registry {
     /// route-reflect guard compares against the resolved egress. `None` for an
     /// association that carries neither (e.g. a pure ingress SG association).
     pub fn inbound_destination(&self, assoc_id: &str) -> Option<Destination> {
+        let slot = self.slot(assoc_id);
+        let assoc_id = slot
+            .as_ref()
+            .and_then(|s| s.template.as_deref())
+            .unwrap_or(assoc_id);
         if let Some(a) = self
             .application_servers
             .iter()
@@ -1014,7 +1142,14 @@ impl Registry {
     pub fn recompute(&self, router: &Router) {
         let _one_at_a_time = self.recomputing.lock().unwrap_or_else(|e| e.into_inner());
         // Per-association transport state, plus the M2PA link-liveness gauge.
-        for slot in self.assocs.values() {
+        let members: Vec<_> = self
+            .members
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for slot in self.assocs.values().chain(members.iter()) {
             let assoc_state = if slot.is_carrying() {
                 2
             } else if slot.sender().is_some() {
@@ -1093,8 +1228,11 @@ impl Registry {
                 let Some(a) = self.application_servers.iter().find(|a| a.name == *name) else {
                     return Vec::new();
                 };
-                let slots = &a.members;
-                let active: Vec<bool> = (0..slots.len()).map(|i| a.carries(i)).collect();
+                let slots = self.server_slots(a);
+                let active: Vec<bool> = slots
+                    .iter()
+                    .map(|slot| self.slot_carries(a, slot))
+                    .collect();
                 choose(a.traffic_mode, &active, sls)
                     .into_iter()
                     .filter_map(|i| {
@@ -1457,8 +1595,8 @@ mtp3_routes:
         );
         for (index, asp) in layout.asps.iter().enumerate() {
             assert_eq!(
-                r.asp_slot(index).map(|s| s.id.as_str()),
-                Some(asp.name.as_str())
+                r.asp_slot(index).map(|s| s.id.clone()),
+                Some(asp.name.clone())
             );
         }
         assert_eq!(layout.servers[0].asps, [0, 1]);
@@ -1472,30 +1610,83 @@ mtp3_routes:
     }
 
     #[test]
+    fn dns_member_states_are_independent_and_withdrawal_removes_every_membership() {
+        let r = servers();
+        let template = r.slot("a").unwrap();
+        let a = r.add_member(&template, "a@192.0.2.1:2905".into(), 10);
+        let b = r.add_member(&template, "a@192.0.2.2:2905".into(), 11);
+        assert_eq!(a.memberships(), template.memberships());
+        r.set_asp_active(&a, 0, true);
+        assert_eq!(r.admits(&a, Some(100)), Admission::Active);
+        assert_eq!(r.admits(&a, Some(200)), Admission::NotActive);
+        assert_eq!(r.admits(&b, Some(100)), Admission::NotActive);
+        assert_eq!(r.admits(&template, Some(100)), Admission::NotActive);
+        r.set_asp_active(&b, 0, true);
+        r.set_asp_active(&b, 1, true);
+        for server in &r.application_servers[..2] {
+            let slots = r.server_slots(server);
+            let active: Vec<_> = slots
+                .iter()
+                .map(|slot| {
+                    slot.memberships()
+                        .iter()
+                        .any(|m| m.context == server.routing_context && r.slot_active(slot, m))
+                })
+                .collect();
+            let ids = |sls| {
+                choose(server.traffic_mode, &active, sls)
+                    .iter()
+                    .map(|i| slots[*i].id.as_str())
+                    .collect::<Vec<_>>()
+            };
+            if server.traffic_mode == TrafficMode::Loadshare {
+                assert_eq!(ids(0), [a.id.as_str()]);
+                assert_eq!(ids(1), [b.id.as_str()]);
+            } else {
+                assert_eq!(ids(0), [b.id.as_str()]);
+            }
+        }
+        r.quiesce(&a);
+        assert_eq!(r.admits(&a, None), Admission::NotActive);
+        r.remove_member(&a.id);
+        assert!(r.slot(&a.id).is_none());
+        assert!(r.asp_slot(10).is_none());
+        for server in &r.application_servers[..2] {
+            let slots = r.server_slots(server);
+            assert!(!slots.iter().any(|slot| slot.id == a.id));
+            assert!(slots.iter().any(|slot| slot.id == b.id));
+        }
+        assert_eq!(
+            r.inbound_destination(&b.id),
+            Some(Destination::ApplicationServer("one".into()))
+        );
+    }
+
+    #[test]
     fn traffic_is_admitted_by_the_server_of_its_routing_context() {
         let r = servers();
         let a = r.slot("a").unwrap();
         // Active nowhere: whatever it names.
         for context in [None, Some(100), Some(999)] {
-            assert_eq!(r.admits(a, context), Admission::NotActive);
+            assert_eq!(r.admits(&a, context), Admission::NotActive);
         }
-        r.set_asp_active(a, 0, true);
+        r.set_asp_active(&a, 0, true);
         assert!(a.active.load(Ordering::Relaxed));
-        assert_eq!(r.admits(a, None), Admission::Active);
-        assert_eq!(r.admits(a, Some(100)), Admission::Active);
+        assert_eq!(r.admits(&a, None), Admission::Active);
+        assert_eq!(r.admits(&a, Some(100)), Admission::Active);
         // Configured in the server of 200, not active in it.
-        assert_eq!(r.admits(a, Some(200)), Admission::NotActive);
-        assert_eq!(r.admits(a, Some(999)), Admission::Unconfigured);
+        assert_eq!(r.admits(&a, Some(200)), Admission::NotActive);
+        assert_eq!(r.admits(&a, Some(999)), Admission::Unconfigured);
         // An association in no server is never active.
         let spare = r.slot("spare").unwrap();
-        r.set_asp_active(spare, 0, true);
-        assert_eq!(r.admits(spare, None), Admission::NotActive);
-        r.set_asp_active(a, 0, false);
+        r.set_asp_active(&spare, 0, true);
+        assert_eq!(r.admits(&spare, None), Admission::NotActive);
+        r.set_asp_active(&a, 0, false);
         assert!(!a.active.load(Ordering::Relaxed));
-        assert_eq!(r.admits(a, Some(100)), Admission::NotActive);
+        assert_eq!(r.admits(&a, Some(100)), Admission::NotActive);
         // A server this domain does not have.
-        r.set_asp_active(a, 9, true);
-        assert_eq!(r.admits(a, None), Admission::NotActive);
+        r.set_asp_active(&a, 9, true);
+        assert_eq!(r.admits(&a, None), Admission::NotActive);
     }
 
     #[test]
@@ -1545,7 +1736,7 @@ mtp3_routes:
             assert_eq!(router.is_reachable("default", 2000), route, "{state:?}");
         }
         // Nobody has an association: nobody is selected, active or not.
-        r.set_asp_active(r.slot("a").unwrap(), 0, true);
+        r.set_asp_active(&r.slot("a").unwrap(), 0, true);
         assert!(r.active_asps(0).is_empty());
         assert!(r.active_asps(9).is_empty());
         assert!(r

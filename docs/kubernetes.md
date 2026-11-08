@@ -10,6 +10,41 @@ identity model is strict, so the YAML in this guide is a **template** for *your*
 composing siphon binary and your cluster, not a shipped runnable image; see
 [Deployment](deployment.md).
 
+## Equivalent client instances with DNS-discovered peers
+
+Where the peer accepts equivalent client instances, each instance can use the
+same client ASP configuration and discover peer pod addresses through DNS. Use a
+name whose answers contain the individual peer addresses (for example, a headless
+Service), rather than a single virtual address, to create one association per pod:
+
+```yaml
+node: { point_code: 1000, variant: ITU }
+associations:
+  - id: peer
+    adaptation: m3ua
+    role: client
+    addrs: [peer.example]
+    port: 2905
+    all_addresses: true
+    resolve_seconds: 30
+    reconnect_max_seconds: 30
+application_servers:
+  - { name: peer-as, routing_context: 1, traffic_mode: loadshare, asps: [peer] }
+mtp3_routes:
+  - { dpc: 2000, as: peer-as, priority: 1 }
+```
+
+Each instance independently maintains `peer@<address:port>` members and retries
+failed associations with exponential backoff starting at one second, capped at
+30 seconds, with jitter. Pod address changes are reconciled on DNS refresh;
+traffic resumes only after the new member's M3UA handshake. Without
+`all_addresses`, DNS is resolved at each dial for one association.
+
+This does not provide TCAP dialogue affinity across members or instances. A
+TC-CONTINUE reaching a different member than the one that began the dialogue is
+outside scope. The provisioning constraints below still apply when the peer
+requires stable source addresses or a distinct identity for each instance.
+
 ## HA first, throughput second
 
 One pod already routes millions of MSU per second ([Performance](performance.md)),

@@ -277,19 +277,30 @@ fn encode(message: &Message, offending: &[u8]) -> M3uaMessage {
 // ── ASP state maintenance, the task ──────────────────────────────────────────
 
 /// One event for ASP state maintenance, from the task of an association.
-pub(crate) struct Request {
-    input: Input,
-    /// The message the event is, for the Diagnostic Information of an Error.
-    offending: Vec<u8>,
-    /// Told once everything the event calls for has been done.
-    done: Option<oneshot::Sender<()>>,
+pub(crate) enum Request {
+    Event {
+        input: Input,
+        /// The message the event is, for the Diagnostic Information of an Error.
+        offending: Vec<u8>,
+        /// Told once everything the event calls for has been done.
+        done: Option<oneshot::Sender<()>>,
+    },
+    Add {
+        template: String,
+        name: String,
+        done: oneshot::Sender<Option<Arc<AssocSlot>>>,
+    },
+    Remove {
+        name: String,
+        done: oneshot::Sender<()>,
+    },
 }
 
 /// Report an event to ASP state maintenance and wait until it has been acted
 /// on: what the association receives next finds the state it leaves.
 async fn submit(ctx: &TaskCtx, input: Input, offending: &[u8]) {
     let (done, acted) = oneshot::channel();
-    let request = Request {
+    let request = Request::Event {
         input,
         offending: offending.to_vec(),
         done: Some(done),
@@ -321,10 +332,41 @@ struct Layer {
 
 impl Layer {
     async fn serve(&mut self, request: Request) {
-        let actions = self.machine.handle(request.input);
-        self.perform(actions, &request.offending).await;
-        if let Some(done) = request.done {
-            let _ = done.send(());
+        match request {
+            Request::Event {
+                input,
+                offending,
+                done,
+            } => {
+                let actions = self.machine.handle(input);
+                self.perform(actions, &offending).await;
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
+            Request::Add {
+                template,
+                name,
+                done,
+            } => {
+                let slot = self.ctx.registry.slot(&template).and_then(|slot| {
+                    let asp = self.machine.add_member(slot.asp?, name.clone());
+                    Some(self.ctx.registry.add_member(&slot, name, asp))
+                });
+                let _ = done.send(slot);
+            }
+            Request::Remove { name, done } => {
+                if let Some(slot) = self.ctx.registry.slot(&name) {
+                    if let Some(asp) = slot.asp {
+                        let actions = self.machine.handle(Input::Lost { asp });
+                        self.perform(actions, &[]).await;
+                        self.machine.remove_member(asp);
+                    }
+                    self.ctx.registry.remove_member(&name);
+                    self.ctx.registry.recompute(&self.ctx.router);
+                }
+                let _ = done.send(());
+            }
         }
     }
 
@@ -359,7 +401,7 @@ impl Layer {
                 }
                 Action::Asp { asp, server, state } => {
                     if let Some(slot) = registry.asp_slot(asp) {
-                        registry.set_asp_active(slot, server, state == AspState::Active);
+                        registry.set_asp_active(&slot, server, state == AspState::Active);
                         changed = true;
                     }
                 }
@@ -1601,7 +1643,12 @@ impl Peer {
                 }
             };
             tokio::select! {
-                _ = shutdown.changed() => break,
+                _ = shutdown.changed() => {
+                    if !self.gateway && self.slot.is_member() {
+                        self.send(&M3uaMessage::asp_down(None)).await;
+                    }
+                    break;
+                },
                 r = self.assoc.recv() => {
                     let Ok((data, info)) = r else { break };
                     if info.ppid != PPID_M3UA {
