@@ -48,6 +48,19 @@ pub fn inbound_from_msu(msu: &Msu) -> Inbound {
     inbound
 }
 
+/// The DTID of a TC-CONTINUE / TC-END / TC-ABORT carried in an SCCP message, the
+/// transaction id an `instance` GTT group routes on. `None` for a TC-BEGIN (it has
+/// no DTID), a unidirectional, a segment, or anything that does not decode.
+pub fn tcap_dtid(sccp: &SccpMessage) -> Option<Vec<u8>> {
+    use tcap::TcapMessage;
+    match tcap::decode(sccp.data()).ok()? {
+        TcapMessage::Continue(c) => Some(c.dtid.to_vec()),
+        TcapMessage::End(e) => Some(e.dtid.to_vec()),
+        TcapMessage::Abort(a) => Some(a.dtid.to_vec()),
+        _ => None,
+    }
+}
+
 /// Map an SCCP Global Title into the GTT selector fields the resolver matches on.
 fn selector_from_gt(gt: &GlobalTitle) -> GttSelector {
     let digits = gt.digits().unwrap_or_default().to_string();
@@ -167,6 +180,13 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
                 Screening::Segmented => metrics::content_segment_unscreened(),
                 Screening::NotApplicable => {}
             }
+        }
+    }
+    // An `instance` GTT group routes on the DTID: decode it only for a domain
+    // that has one.
+    if msu.si == framing::SI_SCCP && ctx.router.tenant_has_instance_groups(&ctx.tenant) {
+        if let Ok(sccp) = SccpMessage::decode(&msu.payload) {
+            inbound.tcap_dtid = tcap_dtid(&sccp);
         }
     }
     // The signalling link selection of the label picks among routes of equal

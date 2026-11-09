@@ -7,6 +7,21 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- TCAP instance routing, for a function that runs as several instances behind
+  one global title. `tcap.instance_bits` and `tcap.instance` put the instance
+  index in the transaction ids (OTIDs) a node allocates, right under the marker
+  bit (`crate::tid`); off by default, and the ids are unchanged then. A
+  `gtt_groups` entry with `mode: instance` (`instance_bits`, and an `instance`
+  per member) routes a TC-CONTINUE, TC-END or TC-ABORT to the member whose index
+  its DTID carries, at whichever relay receives it, and shares a TC-BEGIN
+  round-robin over the members that are reachable. A DTID that is not one of
+  the group's is shared like a Begin. `Inbound::tcap_dtid`, `Pick`,
+  `GttResolver::translate_for` and `transport::tcap_dtid` carry it. `Inbound`
+  and `config::Tcap`, `GroupMember` and `GttGroup` gain a field each: build them
+  with `..Default::default()` (or `..Tcap::default()`).
+
 ## [6.0.0] — 2026-11-08
 
 ### Added

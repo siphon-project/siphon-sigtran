@@ -70,10 +70,39 @@ pub enum GttResult {
     },
 }
 
+/// What the message being translated adds to a group's choice of member: the
+/// transaction id it carries, and whether a destination is reachable.
+#[derive(Clone, Copy)]
+pub struct Pick<'a> {
+    /// The DTID of a TC-CONTINUE / TC-END / TC-ABORT, `None` for any other
+    /// message (a TC-BEGIN has none).
+    pub dtid: Option<&'a [u8]>,
+    /// Whether a destination point code currently resolves to an egress.
+    pub live: &'a dyn Fn(u32) -> bool,
+}
+
+fn always_live(_: u32) -> bool {
+    true
+}
+
+impl Pick<'_> {
+    /// A pick with no transaction id and every destination reachable.
+    pub fn none() -> Pick<'static> {
+        Pick {
+            dtid: None,
+            live: &always_live,
+        }
+    }
+}
+
 /// A GTT group's runtime selection state (weighted round-robin cursor).
 #[derive(Debug)]
 struct GroupState {
     mode: GroupMode,
+    /// Instance mode: the instance field width of the members' transaction ids.
+    instance_bits: u8,
+    /// Instance mode: `(instance, dpc, ssn)` per member.
+    instances: Vec<(u32, u32, u8)>,
     /// Members expanded for selection: `(dpc, ssn)` repeated per weight (share)
     /// or ordered by cost (cost).
     members: Vec<(u32, u8)>,
@@ -94,6 +123,7 @@ impl GroupState {
                 m.sort_by_key(|(cost, _, _)| *cost);
                 m.into_iter().map(|(_, dpc, ssn)| (dpc, ssn)).collect()
             }
+            GroupMode::Instance => group.members.iter().map(|x| (x.dpc.0, x.ssn)).collect(),
             GroupMode::Share => {
                 let mut expanded = Vec::new();
                 for x in &group.members {
@@ -105,8 +135,19 @@ impl GroupState {
                 expanded
             }
         };
+        let instances = if group.mode == GroupMode::Instance {
+            group
+                .members
+                .iter()
+                .filter_map(|x| x.instance.map(|i| (i, x.dpc.0, x.ssn)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             mode: group.mode,
+            instance_bits: group.instance_bits,
+            instances,
             members,
             cursor: AtomicUsize::new(0),
         }
@@ -120,11 +161,46 @@ impl GroupState {
         }
         match self.mode {
             GroupMode::Cost => Some(self.members[0]),
-            GroupMode::Share => {
+            GroupMode::Share | GroupMode::Instance => {
                 let n = self.cursor.fetch_add(1, Ordering::Relaxed);
                 Some(self.members[n % self.members.len()])
             }
         }
+    }
+
+    /// Pick a member for a message. Every mode but `instance` ignores the pick.
+    ///
+    /// Instance mode: a message whose DTID carries the index of one of the
+    /// members goes to that member whether or not it is reachable (the
+    /// dialogue lives there and nowhere else, so a down member is an
+    /// undeliverable message, not a reason to hand the dialogue to another
+    /// instance). Any other message, a TC-BEGIN or an id that is not one of
+    /// the group's, is shared round-robin over the reachable members; with
+    /// none reachable it takes the next member in turn and the caller finds
+    /// it has no route.
+    fn select_for(&self, pick: &Pick<'_>) -> Option<(u32, u8)> {
+        if self.mode != GroupMode::Instance {
+            return self.select();
+        }
+        if let Some(index) = pick
+            .dtid
+            .and_then(|tid| crate::tid::instance_of(tid, self.instance_bits))
+        {
+            if let Some((_, dpc, ssn)) = self.instances.iter().find(|(i, _, _)| *i == index) {
+                return Some((*dpc, *ssn));
+            }
+        }
+        let first = self.select()?;
+        if (pick.live)(first.0) {
+            return Some(first);
+        }
+        for _ in 1..self.members.len() {
+            let next = self.select()?;
+            if (pick.live)(next.0) {
+                return Some(next);
+            }
+        }
+        Some(first)
     }
 
     /// Cost mode: the ordered fail-over list (primary first).
@@ -164,12 +240,25 @@ impl GttResolver {
     /// Translate a global title. Returns the first matching rule's result, or
     /// `None` for no-translation.
     pub fn translate(&self, sel: &GttSelector) -> Option<GttResult> {
+        self.translate_for(sel, &Pick::none())
+    }
+
+    /// [`translate`](Self::translate) for a message that carries a transaction
+    /// id and for a node that knows which destinations are reachable: an
+    /// `instance` group routes on them (see [`Pick`]).
+    pub fn translate_for(&self, sel: &GttSelector, pick: &Pick<'_>) -> Option<GttResult> {
         for rule in &self.rules {
             if rule_matches(rule, sel) {
-                return self.result_of(&rule.to);
+                return self.result_of(&rule.to, pick);
             }
         }
         None
+    }
+
+    /// Whether any group routes on the transaction id, so the caller needs to
+    /// decode it from the message.
+    pub fn has_instance_groups(&self) -> bool {
+        self.groups.values().any(|g| g.mode == GroupMode::Instance)
     }
 
     /// The ordered cost-mode fail-over list for a group (primary first), if the
@@ -193,7 +282,12 @@ impl GttResolver {
     /// into a [`GttResult`], selecting a group member where needed. This is the
     /// shared translation both GTT and content routing go through.
     pub fn resolve_target(&self, target: &RouteTarget) -> Option<GttResult> {
-        self.result_of(target)
+        self.result_of(target, &Pick::none())
+    }
+
+    /// [`resolve_target`](Self::resolve_target) with a [`Pick`].
+    pub fn resolve_target_for(&self, target: &RouteTarget, pick: &Pick<'_>) -> Option<GttResult> {
+        self.result_of(target, pick)
     }
 
     /// Prepend a GTT rule live: a script programming the table via
@@ -204,7 +298,7 @@ impl GttResolver {
         self.rules.insert(0, rule);
     }
 
-    fn result_of(&self, target: &RouteTarget) -> Option<GttResult> {
+    fn result_of(&self, target: &RouteTarget, pick: &Pick<'_>) -> Option<GttResult> {
         if let Some(tenant) = &target.tenant {
             // Cross-tenant hand-off carries a concrete dpc/ssn in the target.
             return Some(GttResult::Tenant {
@@ -217,7 +311,7 @@ impl GttResolver {
             return Some(GttResult::Local);
         }
         if let Some(group) = &target.group {
-            let (dpc, ssn) = self.groups.get(group)?.select()?;
+            let (dpc, ssn) = self.groups.get(group)?.select_for(pick)?;
             return Some(GttResult::Dpc { dpc, ssn });
         }
         if let Some(dpc) = target.dpc {

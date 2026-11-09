@@ -121,6 +121,7 @@ pub mod python;
 pub mod routing;
 pub mod sccp;
 pub mod tenant;
+pub mod tid;
 pub mod transport;
 
 pub use config::Config;

@@ -409,6 +409,7 @@ fn sri_sm_with_a_malformed_trailing_component_is_dropped_not_routed() {
         called_ssn,
         view: None,
         content_undecodable: true,
+        ..Default::default()
     });
     match decision {
         RouteDecision::Drop { reason } => assert!(reason.contains("content rules"), "{reason}"),

@@ -34,6 +34,8 @@ use tcap::{
     ReturnResultValue, TcapMessage,
 };
 
+mod common;
+
 use siphon_sigtran::config::Tcap;
 use siphon_sigtran::dialogue::{
     Dialogue, DialogueEngine, IncomingOp, OperationClass, OutgoingBegin, PeerComponent, PeerTurn,
@@ -1343,6 +1345,7 @@ fn dialogue_ceiling_refuses_over_the_limit() {
         invoke_timer_ms: 100_000,
         dialogue_timer_ms: 100_000,
         max_dialogues: 1,
+        ..Tcap::default()
     });
     e.register(
         6,
@@ -1399,6 +1402,7 @@ fn invoke_timer_ages_out_an_outstanding_invoke() {
         invoke_timer_ms: 50,
         dialogue_timer_ms: 100_000,
         max_dialogues: 100,
+        ..Tcap::default()
     });
     e.register(
         6,
@@ -1448,6 +1452,7 @@ fn a_due_dialogue_is_claimed_once_and_expired_on_its_own() {
         invoke_timer_ms: 100_000,
         dialogue_timer_ms: 50,
         max_dialogues: 100,
+        ..Tcap::default()
     });
     e.register(8, gsm_map::op_codes::MO_FORWARD_SM, Arc::new(KeepOpen));
     let arg = rasn::ber::encode(&gsm_map::operations::mo_forward_sm::MoForwardSmArg::new(
@@ -1508,6 +1513,7 @@ fn dialogue_timer_ages_out_an_idle_dialogue() {
         invoke_timer_ms: 100_000,
         dialogue_timer_ms: 50,
         max_dialogues: 100,
+        ..Tcap::default()
     });
     e.register(8, gsm_map::op_codes::MO_FORWARD_SM, Arc::new(KeepOpen));
 
@@ -1579,4 +1585,62 @@ fn an_end_for_a_transaction_that_is_not_open_is_counted() {
     );
     assert!(e.deliver(&late, "peer").is_empty());
     assert!(metrics::tcap_discards(metrics::TcapDiscard::UnknownTransaction) > before);
+}
+
+fn instance_begin(engine: &DialogueEngine) -> (Vec<u8>, Vec<Msu>) {
+    engine
+        .begin(
+            OutgoingBegin {
+                application_context: AC_MT_RELAY.to_vec(),
+                called: SccpAddress::with_gt(gt(MSC_NUM), Some(SubsystemNumber::Msc)),
+                calling: SccpAddress::with_gt(gt(OUR_GT), Some(SubsystemNumber::Msc)),
+                opc: OUR_PC,
+                dpc: PEER_PC,
+                ni: 0,
+                sls: 0,
+                ingress_assoc: "msc".into(),
+            },
+            Arc::new(SmscMtOriginator {
+                segments: 2,
+                sent: Mutex::new(0),
+            }),
+        )
+        .expect("begin")
+}
+
+#[test]
+fn originated_transaction_ids_carry_the_instance_index() {
+    // Instances of one function behind a shared global title each stamp their
+    // own index into the OTIDs they allocate, so a relay can send the peer's
+    // TC-CONTINUE / TC-END back to the instance that holds the dialogue.
+    for instance in [0u32, 2, 15] {
+        let engine = DialogueEngine::new(Tcap {
+            instance_bits: 4,
+            instance,
+            ..Tcap::default()
+        });
+        for _ in 0..3 {
+            let (our_tid, out) = instance_begin(&engine);
+            assert_eq!(our_tid.len(), 4);
+            assert_eq!(
+                siphon_sigtran::tid::instance_of(&our_tid, 4),
+                Some(instance),
+                "OTID {our_tid:02x?}"
+            );
+            // The OTID on the wire is the one the engine returned.
+            assert_eq!(otid_of(&decode_reply(&out[0])), our_tid);
+            // Wireshark, which shares none of our code, reads the same OTID.
+            if let Some(wireshark) = common::dissect_unchecked(&[&out[0]]) {
+                let want: String = our_tid.iter().map(|b| format!("{b:02x}")).collect();
+                wireshark.hex("tcap.otid", &want);
+            }
+        }
+    }
+}
+
+#[test]
+fn without_an_instance_field_the_transaction_ids_are_unchanged() {
+    let engine = DialogueEngine::new(Tcap::default());
+    let (our_tid, _) = instance_begin(&engine);
+    assert_eq!(our_tid, 0x8000_0001u32.to_be_bytes().to_vec());
 }

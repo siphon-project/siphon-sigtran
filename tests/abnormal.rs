@@ -1054,6 +1054,7 @@ fn timers(invoke_timer_ms: u64, dialogue_timer_ms: u64) -> Tcap {
         invoke_timer_ms,
         dialogue_timer_ms,
         max_dialogues: 100,
+        ..Tcap::default()
     }
 }
 
