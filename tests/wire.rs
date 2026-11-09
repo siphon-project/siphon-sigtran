@@ -3354,3 +3354,150 @@ async fn wire_admission_aborts_a_refused_begin_that_terminates_here() {
     peer.close();
     handle.shutdown();
 }
+
+// ── Instance routing: one global title, several instances ────────────────────
+
+const INSTANCE_NODE: &str = r#"
+node: { point_code: 1000, variant: ITU, network_indicator: international }
+associations:
+  - { id: ingress, adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+  - { id: asp-0,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+  - { id: asp-1,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+  - { id: asp-2,   adaptation: m3ua, role: server, addrs: [127.0.0.1], port: 0 }
+application_servers:
+  - { name: caller, traffic_mode: override, routing_context: 0,   asps: [ingress] }
+  - { name: inst-0, traffic_mode: override, routing_context: 110, asps: [asp-0] }
+  - { name: inst-1, traffic_mode: override, routing_context: 111, asps: [asp-1] }
+  - { name: inst-2, traffic_mode: override, routing_context: 112, asps: [asp-2] }
+mtp3_routes:
+  - { dpc: 110, as: inst-0, priority: 1 }
+  - { dpc: 111, as: inst-1, priority: 1 }
+  - { dpc: 112, as: inst-2, priority: 1 }
+sccp:
+  local_ssns: [8]
+  gtt_groups:
+    - name: fn
+      mode: instance
+      instance_bits: 2
+      members:
+        - { dpc: 110, ssn: 8, instance: 0 }
+        - { dpc: 111, ssn: 8, instance: 1 }
+        - { dpc: 112, ssn: 8, instance: 2 }
+  gtt:
+    - { match: { gt_prefix: "15550110" }, to: { group: fn } }
+"#;
+
+/// A UDT to the function's shared global title carrying `tcap_bytes`.
+fn udt_to_shared_gt(tcap_bytes: &[u8]) -> Vec<u8> {
+    let gt = |digits: &str| GlobalTitle::Gt0100 {
+        translation_type: 0,
+        numbering_plan: 1,
+        encoding_scheme: 2,
+        nature_of_address: 4,
+        digits: digits.to_string(),
+    };
+    SccpMessage::Udt(UnitData::new(
+        SccpAddress::with_gt(gt("15550110"), Some(SubsystemNumber::Msc)),
+        SccpAddress::with_gt(gt("15550199"), Some(SubsystemNumber::Hlr)),
+        tcap_bytes.to_vec(),
+    ))
+    .encode()
+    .expect("encode udt")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_instance_group_routes_a_dtid_to_its_instance_and_shares_begins() {
+    let Some(handle) = start_node(INSTANCE_NODE, "wire_instance_group").await else {
+        return;
+    };
+    let ingress = handle.bound_addr("ingress").expect("ingress");
+    let mut peers = Vec::new();
+    for (index, name) in ["asp-0", "asp-1", "asp-2"].into_iter().enumerate() {
+        let addr = handle.bound_addr(name).expect("asp bound");
+        match AspPeer::connect(addr, 110 + index as u32).await {
+            Some(peer) => peers.push(peer),
+            None => {
+                eprintln!("SKIP wire_instance_group: an ASP connect failed");
+                return;
+            }
+        }
+    }
+    let Some(src) = AspPeer::connect(ingress, 0).await else {
+        eprintln!("SKIP wire_instance_group: the caller connect failed");
+        return;
+    };
+    for (index, dpc) in [110, 111, 112].into_iter().enumerate() {
+        assert!(
+            wait_route(
+                handle.router(),
+                dpc,
+                &Destination::ApplicationServer(format!("inst-{index}"))
+            )
+            .await,
+            "AS inst-{index} never came up"
+        );
+    }
+
+    // A TC-END for each instance, as the HLR would answer: its DTID is the OTID
+    // that instance allocated (instance index in the two bits under the marker).
+    for instance in [2u32, 0, 1] {
+        let dtid = siphon_sigtran::tid::compose(2, instance, 41).to_be_bytes();
+        let end = tcap_end_bare(&dtid, None);
+        src.send_in(&m3ua_sccp(
+            &udt_to_shared_gt(&end),
+            OPC_UPSTREAM,
+            NODE_PC,
+            0,
+        ))
+        .await;
+        let frame = peers[instance as usize]
+            .recv_out()
+            .await
+            .unwrap_or_else(|| panic!("TC-END for instance {instance} never arrived"));
+        let msu = msu_of_m3ua(&frame);
+        assert_eq!(
+            msu.dpc,
+            110 + instance,
+            "relayed to the instance's point code"
+        );
+        match SccpMessage::decode(&msu.payload).expect("decode relayed") {
+            SccpMessage::Udt(u) => assert_eq!(u.data, end),
+            other => panic!("expected the relayed UDT, got {other:?}"),
+        }
+        if let Some(wireshark) = common::dissect_unchecked(&[&msu]) {
+            wireshark.clean().hex(
+                "tcap.dtid",
+                &dtid.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            );
+        }
+        for (other, peer) in peers.iter_mut().enumerate() {
+            if other != instance as usize {
+                assert!(
+                    peer.drain(Duration::from_millis(100)).await.is_empty(),
+                    "TC-END for instance {instance} also reached instance {other}"
+                );
+            }
+        }
+    }
+
+    // Three TC-BEGINs (no DTID) are shared: each instance gets exactly one.
+    for _ in 0..3 {
+        src.send_in(&m3ua_sccp(
+            &udt_to_shared_gt(&sri_sm_begin()),
+            OPC_UPSTREAM,
+            NODE_PC,
+            0,
+        ))
+        .await;
+    }
+    for (index, peer) in peers.iter_mut().enumerate() {
+        let got = peer.drain(Duration::from_millis(400)).await;
+        assert_eq!(got.len(), 1, "instance {index} got {} begins", got.len());
+    }
+
+    src.close();
+    for peer in peers {
+        peer.close();
+    }
+    handle.shutdown();
+}

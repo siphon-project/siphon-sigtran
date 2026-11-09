@@ -1066,9 +1066,16 @@ impl DialogueEngine {
     fn alloc_tid(&self) -> Tid {
         let mut inner = self.lock();
         inner.tid_counter = inner.tid_counter.wrapping_add(1);
-        // A non-zero, 4-octet id. The high bit marks it as ours so it never
-        // collides with a small peer OTID we might store under the same map.
-        (inner.tid_counter | 0x8000_0000).to_be_bytes().to_vec()
+        // A 4-octet id. The high bit marks it as ours so it never collides with
+        // a small peer OTID we might store under the same map; the next
+        // `instance_bits` bits carry this instance's index (see `crate::tid`).
+        crate::tid::compose(
+            self.config.instance_bits,
+            self.config.instance,
+            inner.tid_counter,
+        )
+        .to_be_bytes()
+        .to_vec()
     }
 
     fn take(&self, tid: &[u8]) -> Option<Record> {

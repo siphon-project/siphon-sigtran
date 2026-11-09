@@ -761,6 +761,12 @@ pub enum GroupMode {
     Cost,
     /// Share: weighted round-robin across members.
     Share,
+    /// Instance: the members are instances of one function behind a shared
+    /// global title. A message that carries a transaction id (a TC-CONTINUE,
+    /// TC-END or TC-ABORT) goes to the member whose `instance` index the id
+    /// carries (see [`crate::tid`]); a TC-BEGIN, which has none, is shared
+    /// round-robin over the members that are reachable.
+    Instance,
 }
 
 /// A member of a GTT group: a concrete (dpc, ssn) with a cost or weight.
@@ -776,6 +782,10 @@ pub struct GroupMember {
     /// Weight for a `share` group.
     #[serde(default)]
     pub weight: Option<u8>,
+    /// The member's instance index in an `instance` group: the value its
+    /// transaction ids carry in their instance field.
+    #[serde(default)]
+    pub instance: Option<u32>,
 }
 
 /// One `gtt_groups:` entry: a named result set for GTT.
@@ -787,6 +797,11 @@ pub struct GttGroup {
     pub mode: GroupMode,
     /// The candidate members.
     pub members: Vec<GroupMember>,
+    /// Width in bits of the instance field of the transaction ids the members
+    /// allocate (the members' `tcap.instance_bits`). Required for, and only
+    /// valid in, an `instance` group.
+    #[serde(default)]
+    pub instance_bits: u8,
 }
 
 /// The `match:` clause of a GTT rule.
@@ -900,6 +915,15 @@ pub struct Tcap {
     /// ceiling is refused with a P-Abort, cause resource limitation (counted as
     /// a local abort).
     pub max_dialogues: usize,
+    /// Width in bits of the instance field in the transaction ids (OTIDs) this
+    /// node allocates, `0` (the default) for none. A function that runs as
+    /// several instances behind one global title gives every instance the same
+    /// width and its own [`instance`](Self::instance), so a relay can route a
+    /// TC-CONTINUE / TC-END / TC-ABORT back to the instance that holds the
+    /// dialogue by reading the id (see [`crate::tid`]). At most 16.
+    pub instance_bits: u8,
+    /// This instance's index in the field, below `2^instance_bits`.
+    pub instance: u32,
 }
 
 impl Default for Tcap {
@@ -908,6 +932,8 @@ impl Default for Tcap {
             invoke_timer_ms: 15_000,
             dialogue_timer_ms: 30_000,
             max_dialogues: 100_000,
+            instance_bits: 0,
+            instance: 0,
         }
     }
 }
@@ -1266,6 +1292,20 @@ impl Config {
     /// Semantic validation across the whole config: point codes fit their
     /// variant, names are unique, and every reference resolves.
     fn validate(&self) -> Result<()> {
+        let tcap = &self.tcap;
+        if tcap.instance_bits > crate::tid::MAX_INSTANCE_BITS {
+            return Err(Error::validation(format!(
+                "tcap: instance_bits {} is over the maximum of {}",
+                tcap.instance_bits,
+                crate::tid::MAX_INSTANCE_BITS
+            )));
+        }
+        if u64::from(tcap.instance) >= 1u64 << tcap.instance_bits {
+            return Err(Error::validation(format!(
+                "tcap: instance {} does not fit in instance_bits {}",
+                tcap.instance, tcap.instance_bits
+            )));
+        }
         // Duplicate association ids.
         let mut seen = BTreeSet::new();
         for a in &self.associations {
@@ -1654,6 +1694,47 @@ impl Config {
                     .resolve(tenant.variant)
                     .map_err(|e| where_(format!("gtt_group `{}` member dpc: {e}", g.name)))?;
             }
+            if g.mode == GroupMode::Instance {
+                if g.instance_bits == 0 || g.instance_bits > crate::tid::MAX_INSTANCE_BITS {
+                    return Err(where_(format!(
+                        "gtt_group `{}`: instance_bits must be 1..={}",
+                        g.name,
+                        crate::tid::MAX_INSTANCE_BITS
+                    )));
+                }
+                let mut seen = BTreeSet::new();
+                for m in &g.members {
+                    let Some(instance) = m.instance else {
+                        return Err(where_(format!(
+                            "gtt_group `{}`: every member of an instance group needs an `instance`",
+                            g.name
+                        )));
+                    };
+                    if u64::from(instance) >= 1u64 << g.instance_bits {
+                        return Err(where_(format!(
+                            "gtt_group `{}`: instance {instance} does not fit in instance_bits {}",
+                            g.name, g.instance_bits
+                        )));
+                    }
+                    if !seen.insert(instance) {
+                        return Err(where_(format!(
+                            "gtt_group `{}`: instance {instance} is on two members",
+                            g.name
+                        )));
+                    }
+                    if m.cost.is_some() || m.weight.is_some() {
+                        return Err(where_(format!(
+                            "gtt_group `{}`: an instance group takes no cost or weight",
+                            g.name
+                        )));
+                    }
+                }
+            } else if g.instance_bits != 0 || g.members.iter().any(|m| m.instance.is_some()) {
+                return Err(where_(format!(
+                    "gtt_group `{}`: instance_bits and instance are for mode `instance` only",
+                    g.name
+                )));
+            }
         }
         for rule in &tenant.sccp.gtt {
             self.validate_target(&rule.to, tenant, &group_names)
@@ -1912,6 +1993,75 @@ content_routing:
         assert_eq!(cfg.tcap.invoke_timer_ms, 15_000);
         assert_eq!(cfg.tcap.dialogue_timer_ms, 30_000);
         assert_eq!(cfg.tcap.max_dialogues, 100_000);
+    }
+
+    #[test]
+    fn tcap_instance_field_parses_and_is_off_by_default() {
+        let cfg = Config::parse(SAMPLE).unwrap();
+        assert_eq!((cfg.tcap.instance_bits, cfg.tcap.instance), (0, 0));
+        let yaml = r#"
+node: { point_code: 1000, variant: ITU }
+tcap: { instance_bits: 4, instance: 2 }
+sccp:
+  local_ssns: [6, 8]
+"#;
+        let cfg = Config::parse(yaml).unwrap();
+        assert_eq!((cfg.tcap.instance_bits, cfg.tcap.instance), (4, 2));
+    }
+
+    #[test]
+    fn tcap_instance_must_fit_its_field() {
+        for (bits, instance) in [(4, 16), (0, 1), (17, 0)] {
+            let yaml = format!(
+                "node: {{ point_code: 1000, variant: ITU }}\n\
+                 tcap: {{ instance_bits: {bits}, instance: {instance} }}\n\
+                 sccp:\n  local_ssns: [6]\n"
+            );
+            assert!(
+                Config::parse(&yaml).is_err(),
+                "bits {bits} instance {instance} must be rejected"
+            );
+        }
+    }
+
+    fn group_yaml(group: &str) -> String {
+        format!(
+            "node: {{ point_code: 100, variant: ITU }}\n\
+             sccp:\n  local_ssns: [6]\n  gtt_groups:\n    - {group}\n"
+        )
+    }
+
+    #[test]
+    fn an_instance_group_parses() {
+        let cfg = Config::parse(&group_yaml(
+            "{ name: g, mode: instance, instance_bits: 2, members: [{dpc: 110, ssn: 8, instance: 0}, {dpc: 111, ssn: 8, instance: 1}] }",
+        ))
+        .unwrap();
+        let g = &cfg.default_tenant().unwrap().sccp.gtt_groups[0];
+        assert_eq!(g.mode, GroupMode::Instance);
+        assert_eq!(g.instance_bits, 2);
+        assert_eq!(g.members[1].instance, Some(1));
+    }
+
+    #[test]
+    fn a_malformed_instance_group_is_refused() {
+        for bad in [
+            // no width
+            "{ name: g, mode: instance, members: [{dpc: 110, ssn: 8, instance: 0}] }",
+            // member without an instance
+            "{ name: g, mode: instance, instance_bits: 2, members: [{dpc: 110, ssn: 8}] }",
+            // instance does not fit
+            "{ name: g, mode: instance, instance_bits: 1, members: [{dpc: 110, ssn: 8, instance: 2}] }",
+            // duplicate instance
+            "{ name: g, mode: instance, instance_bits: 2, members: [{dpc: 110, ssn: 8, instance: 1}, {dpc: 111, ssn: 8, instance: 1}] }",
+            // weight in an instance group
+            "{ name: g, mode: instance, instance_bits: 2, members: [{dpc: 110, ssn: 8, instance: 1, weight: 2}] }",
+            // instance in a share group
+            "{ name: g, mode: share, members: [{dpc: 110, ssn: 8, instance: 1}] }",
+            "{ name: g, mode: share, instance_bits: 2, members: [{dpc: 110, ssn: 8}] }",
+        ] {
+            assert!(Config::parse(&group_yaml(bad)).is_err(), "must refuse {bad}");
+        }
     }
 
     #[test]

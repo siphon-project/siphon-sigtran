@@ -439,8 +439,41 @@ Named result sets for GTT, for cost-based failover or weighted sharing:
 | Field | Meaning |
 |---|---|
 | `name` | Group name, referenced by `gtt` and content-rule `route` targets. |
-| `mode` | `cost` (lowest cost primary, others fail-over alternates) or `share` (weighted round-robin). |
-| `members` | `{dpc, ssn}` plus `cost` (for `cost` groups) or `weight` (for `share` groups). |
+| `mode` | `cost` (lowest cost primary, others fail-over alternates), `share` (weighted round-robin) or `instance` (see below). |
+| `members` | `{dpc, ssn}` plus `cost` (for `cost` groups), `weight` (for `share` groups) or `instance` (for `instance` groups). |
+| `instance_bits` | `instance` groups only: the width of the instance field in the members' transaction ids, 1 to 16. |
+
+An `instance` group is for a function that runs as several instances behind one
+global title, each instance with its own point code. Every instance sets
+`tcap.instance_bits` (the same value as the group's `instance_bits`) and its own
+`tcap.instance`, which puts the index in the OTID of every dialogue it opens or
+answers ([`tcap`](#tcap)). The node that translates the shared title then
+routes on the transaction id:
+
+- a TC-CONTINUE, TC-END or TC-ABORT goes to the member whose `instance` its
+  DTID carries, at whichever relay it arrives, with no state about the dialogue.
+  If that member is unreachable the message is undeliverable (it is not handed to
+  another instance, which does not hold the dialogue);
+- a TC-BEGIN has no DTID: it goes round-robin to the next reachable member;
+- a message whose DTID is not one of the group's (no marker bit, a length other
+  than four octets, an index no member has) is shared like a TC-BEGIN.
+
+```yaml
+sccp:
+  gtt_groups:
+    - name: sms-function
+      mode: instance
+      instance_bits: 2
+      members:
+        - { dpc: 110, ssn: 8, instance: 0 }
+        - { dpc: 111, ssn: 8, instance: 1 }
+        - { dpc: 112, ssn: 8, instance: 2 }
+  gtt:
+    - { match: { gt_prefix: "15550110" }, to: { group: sms-function } }
+```
+
+When every instance has a global title of its own, a plain `dpc` rule per title
+is enough and no group is needed.
 
 ### `gtt` { #gtt }
 
@@ -473,6 +506,8 @@ tcap:
   invoke_timer_ms: 15000       # default invocation timer (default)
   dialogue_timer_ms: 30000     # default idle timeout of a dialogue (default)
   max_dialogues: 100000        # Begin over the ceiling is refused with a P-Abort
+  instance_bits: 0             # width of the instance field in our OTIDs (0 = none)
+  instance: 0                  # this instance's index in that field
 ```
 
 | Field | Default | Meaning |
@@ -480,6 +515,8 @@ tcap:
 | `invoke_timer_ms` | `15000` | The invocation timer of an invoke that does not name its own. Its expiry is reported to the handler and means what the operation's class says ([operation classes](script-api.md#operation-classes)); only a class 1 expiry is counted in `sigtran_invoke_timeouts_total`, and only a handler (or the default for class 1) aborts the dialogue on it. |
 | `dialogue_timer_ms` | `30000` | How long a dialogue may go without a message in either direction before it is aborted (a U-Abort to the peer, the handler told, counted in `sigtran_dialogue_timeouts_total`). `0` disables it. A dialogue sets its own with `dlg.set_idle_timeout(...)`: a call-control dialogue that waits for the end of a call needs more than a request / response default. |
 | `max_dialogues` | `100000` | Ceiling on concurrently open dialogues. A `Begin` over it is refused with a P-Abort, cause resource limitation. |
+| `instance_bits` | `0` | Width in bits (at most 16) of the instance field in the transaction ids this node allocates. A 4-octet id is the marker bit, then this field, then a counter; `0` leaves the id as the marker and a 31-bit counter. |
+| `instance` | `0` | This instance's index in the field, below `2^instance_bits`. Pairs with an `instance` [`gtt_groups`](#gtt_groups) entry on the relay. |
 
 ## `content_routing` { #content-routing }
 

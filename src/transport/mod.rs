@@ -112,6 +112,7 @@ pub mod registry;
 mod sua;
 
 pub(crate) use forward::sccp_return;
+pub use forward::tcap_dtid;
 pub use framing::Msu;
 pub use m2pa::link::{
     Discard as M2paDiscard, Failure as M2paFailure, Link as M2paLink, LinkTimers as M2paTimers,

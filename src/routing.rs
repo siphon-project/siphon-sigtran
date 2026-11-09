@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::admission::AdmissionPolicy;
 use crate::content::{Action, MapView};
 use crate::mtp3::route::Destination;
-use crate::sccp::gtt::{GttResult, GttSelector};
+use crate::sccp::gtt::{GttResult, GttSelector, Pick};
 use crate::tenant::{Tenancy, TenantRuntime};
 
 /// A resolved routing decision for one inbound message.
@@ -88,6 +88,10 @@ pub struct Inbound {
     /// In a domain with content rules it is dropped where the rules would have
     /// been evaluated: a message that cannot be inspected has not passed them.
     pub content_undecodable: bool,
+    /// The DTID of a TC-CONTINUE / TC-END / TC-ABORT, for a domain whose GTT has
+    /// an `instance` group ([`Router::tenant_has_instance_groups`]): it routes
+    /// the message to the instance the id names. `None` for any other message.
+    pub tcap_dtid: Option<Vec<u8>>,
 }
 
 /// The top-level router. Holds the compiled [`Tenancy`] and resolves inbound
@@ -264,6 +268,15 @@ impl Router {
             .and_then(|rt| rt.isup_screen.as_ref())
     }
 
+    /// Whether a tenant has an `instance` GTT group. The transport decodes the
+    /// TCAP transaction id of an inbound SCCP message only when this is true, so
+    /// a node without one adds nothing to the routing hot path.
+    pub fn tenant_has_instance_groups(&self, tenant: &str) -> bool {
+        self.tenancy
+            .get(tenant)
+            .is_some_and(|rt| rt.gtt.has_instance_groups())
+    }
+
     /// Whether a tenant has any content rule. The transport decodes a
     /// [`MapView`](crate::content::MapView) for an inbound SCCP message only when
     /// this is true, so a node with no `content_routing` block adds no per-message
@@ -390,7 +403,7 @@ impl Router {
         if let (Some(engine), Some(view)) = (rt.content.as_ref(), msg.view.as_ref()) {
             if let Some(hit) = engine.evaluate(view) {
                 crate::metrics::content_rule_hit(&hit.rule, action_label(&hit.action));
-                if let Some(decision) = self.decision_from_action(rt, hit.action, sls) {
+                if let Some(decision) = self.decision_from_action(rt, hit.action, sls, msg) {
                     return decision;
                 }
             }
@@ -399,7 +412,12 @@ impl Router {
         // 3. SCCP GTT on the called-party GT (E.214 → E.164 pre-step first).
         if let Some(sel) = &msg.cdpa {
             let sel = self.pre_convert(rt, sel);
-            match rt.gtt.translate(&sel) {
+            let live = |dpc: u32| resolve_destination(rt, dpc, sls).is_some();
+            let pick = Pick {
+                dtid: msg.tcap_dtid.as_deref(),
+                live: &live,
+            };
+            match rt.gtt.translate_for(&sel, &pick) {
                 Some(result) => return self.decision_from_gtt(rt, result, sls),
                 None => {
                     crate::metrics::gtt_error(crate::metrics::GttError::NoTranslation);
@@ -479,6 +497,7 @@ impl Router {
         rt: &TenantRuntime,
         action: Action,
         sls: u8,
+        msg: &Inbound,
     ) -> Option<RouteDecision> {
         match action {
             Action::Screen => Some(RouteDecision::Drop {
@@ -495,7 +514,12 @@ impl Router {
                 // A content route target resolves through the same GTT machinery
                 // as a `to:` clause: dpc, group (cost primary / share cursor),
                 // local, or cross-tenant.
-                let result = rt.gtt.resolve_target(&target)?;
+                let live = |dpc: u32| resolve_destination(rt, dpc, sls).is_some();
+                let pick = Pick {
+                    dtid: msg.tcap_dtid.as_deref(),
+                    live: &live,
+                };
+                let result = rt.gtt.resolve_target_for(&target, &pick)?;
                 let mut decision = self.decision_from_gtt(rt, result, sls);
                 // Carry a `rewrite_cdpa_gt` action onto a concrete-DPC relay; the
                 // transport stamps it on the egress SCCP before forwarding.

@@ -40,10 +40,16 @@ failed associations with exponential backoff starting at one second, capped at
 traffic resumes only after the new member's M3UA handshake. Without
 `all_addresses`, DNS is resolved at each dial for one association.
 
-This does not provide TCAP dialogue affinity across members or instances. A
-TC-CONTINUE reaching a different member than the one that began the dialogue is
-outside scope. The provisioning constraints below still apply when the peer
-requires stable source addresses or a distinct identity for each instance.
+`all_addresses` alone does not give TCAP dialogue affinity: a TC-CONTINUE
+reaching a different member than the one that began the dialogue is not
+steered back. For instances of a function behind one shared global title, give
+each instance its own point code and put its index in the transaction ids it
+allocates (`tcap.instance_bits`, `tcap.instance`); the node that translates the
+title then routes a TC-CONTINUE, TC-END or TC-ABORT to the instance its DTID
+names, with an `instance` GTT group (see
+[`gtt_groups`](configuration.md#gtt_groups)). The provisioning constraints
+below still apply when the peer requires stable source addresses or a distinct
+identity for each instance.
 
 ## HA first, throughput second
 
