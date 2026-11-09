@@ -7,6 +7,8 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [7.0.0] — 2026-11-09
+
 ### Added
 
 - TCAP instance routing, for a function that runs as several instances behind
