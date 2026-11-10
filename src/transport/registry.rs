@@ -992,9 +992,11 @@ impl Registry {
         if pending.len() >= entry.pending_limit {
             drop(pending);
             metrics::m3ua_discard(M3uaDiscard::PendingFull, 1);
-            eprintln!(
-                "siphon-sigtran: the queue of pending application server `{name}` is full, message for dpc {} dropped",
-                msu.dpc
+            tracing::error!(
+                target: "siphon_sigtran",
+                application_server = %name,
+                dpc = msu.dpc,
+                "pending application server queue is full, message dropped"
             );
         } else {
             pending.push_back(msu.clone());
@@ -1040,9 +1042,10 @@ impl Registry {
         if buffer.len() >= self.rerouting_buffer {
             drop(held);
             metrics::mtp3_discard(metrics::Mtp3Discard::BufferFull, 1);
-            eprintln!(
-                "siphon-sigtran: controlled rerouting buffer for dpc {} is full, message dropped",
-                msu.dpc
+            tracing::error!(
+                target: "siphon_sigtran",
+                dpc = msu.dpc,
+                "controlled rerouting buffer is full, message dropped"
             );
         } else {
             buffer.push_back(msu.clone());

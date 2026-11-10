@@ -96,9 +96,10 @@ impl Runtime {
                     let (done, held) = oneshot::channel();
                     port.command(LinkCommand::Hold { done: Some(done) });
                     if tokio::time::timeout(HOLD_WAIT, held).await.is_err() {
-                        eprintln!(
-                            "siphon-sigtran: mtp3: link `{}` did not confirm that it buffers",
-                            self.link_name(link)
+                        tracing::error!(
+                            target: "siphon_sigtran",
+                            link = %self.link_name(link),
+                            "mtp3: link did not confirm that it buffers"
                         );
                     }
                 }
@@ -135,7 +136,23 @@ impl Runtime {
                     RouteStatus::Prohibited | RouteStatus::Restricted => Mtp3MgKind::Tfp,
                 };
                 metrics::mtp3mg_event(dpc, kind);
-                eprintln!("siphon-sigtran: mtp3: route to dpc {dpc} by {via} is {status:?}");
+                if status == RouteStatus::Allowed {
+                    tracing::info!(
+                        target: "siphon_sigtran",
+                        dpc = dpc,
+                        via = %via,
+                        state = ?status,
+                        "mtp3: route is allowed"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        dpc = dpc,
+                        via = %via,
+                        state = ?status,
+                        "mtp3: route is prohibited or restricted"
+                    );
+                };
             }
             Action::HoldDestination(dpc) => registry.hold_destination(dpc),
             Action::ReleaseDestination(dpc) => forward::release_destination(dpc, &self.ctx).await,
@@ -154,21 +171,40 @@ impl Runtime {
                     )
                 };
                 metrics::mtp3mg_event(dpc, kind);
-                eprintln!("siphon-sigtran: mtp3: dpc {dpc} is {word}");
+                if accessible {
+                    tracing::info!(
+                        target: "siphon_sigtran",
+                        dpc = dpc,
+                        state = word,
+                        "mtp3: destination is accessible"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        dpc = dpc,
+                        state = word,
+                        "mtp3: destination is inaccessible"
+                    );
+                };
                 registry.announce(change);
                 self.ctx.router.refresh_route_metrics(&self.ctx.tenant);
             }
             // What the user parts and the application servers are told
             // (RFC 4666 3.4.6): restricted, or available again.
             Action::Restricted { dpc, restricted } => {
-                eprintln!(
-                    "siphon-sigtran: mtp3: dpc {dpc} is {}",
-                    if restricted {
-                        "reached by a restricted route only"
-                    } else {
-                        "not restricted any more"
-                    }
-                );
+                if restricted {
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        dpc = dpc,
+                        "mtp3: destination is reached by a restricted route only"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "siphon_sigtran",
+                        dpc = dpc,
+                        "mtp3: destination is not restricted any more"
+                    );
+                };
                 registry.announce(if restricted {
                     DestinationChange::Restricted { dpc }
                 } else {
@@ -177,36 +213,45 @@ impl Runtime {
             }
             Action::Restarting(on) => {
                 registry.set_restarting(on);
-                eprintln!(
-                    "siphon-sigtran: mtp3: MTP restart {}",
-                    if on {
-                        "began: traffic from the linksets is discarded until it ends"
-                    } else {
-                        "ended"
-                    }
-                );
+                if on {
+                    tracing::info!(
+                        target: "siphon_sigtran",
+                        "mtp3: MTP restart began: traffic from the linksets is discarded until it ends"
+                    );
+                } else {
+                    tracing::info!(target: "siphon_sigtran", "mtp3: MTP restart ended");
+                };
             }
             // Q.704 11.2.3.2: a transfer-controlled is for the user parts. It
             // is counted and passed on to whoever subscribes; routing does not
             // change.
             Action::Congestion { dpc, status } => {
                 metrics::mtp3mg_event(dpc, Mtp3MgKind::Congestion);
-                eprintln!(
-                    "siphon-sigtran: mtp3: transfer-controlled for dpc {dpc}, status {status}"
+                tracing::warn!(
+                    target: "siphon_sigtran",
+                    dpc = dpc,
+                    state = status,
+                    "mtp3: transfer-controlled"
                 );
                 registry.announce(DestinationChange::Congested { dpc, status });
             }
             Action::Note(procedure, subject) => {
                 metrics::mtp3_procedure(procedure);
-                eprintln!(
-                    "siphon-sigtran: mtp3: {} ({})",
-                    procedure.label(),
-                    self.subject(subject)
+                tracing::info!(
+                    target: "siphon_sigtran",
+                    procedure = procedure.label(),
+                    subject = %self.subject(subject),
+                    "mtp3: management procedure"
                 );
             }
             Action::Ignored { name, why } => {
                 metrics::mtp3_discard(Mtp3Discard::Management, 1);
-                eprintln!("siphon-sigtran: mtp3: {name} not acted on: {why}");
+                tracing::warn!(
+                    target: "siphon_sigtran",
+                    message_type = name,
+                    reason = why,
+                    "mtp3: management message not acted on"
+                );
             }
         }
     }
@@ -226,7 +271,13 @@ impl Runtime {
             },
             Err(error) => {
                 metrics::mtp3_discard(Mtp3Discard::NoPath, 1);
-                eprintln!("siphon-sigtran: mtp3: {name} for dpc {dpc} not encoded: {error}");
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    message_type = name,
+                    dpc = dpc,
+                    error = %error,
+                    "mtp3: management message not encoded"
+                );
                 return;
             }
         };
@@ -234,7 +285,13 @@ impl Runtime {
             Ok(raw) => raw,
             Err(error) => {
                 metrics::mtp3_discard(Mtp3Discard::NoPath, 1);
-                eprintln!("siphon-sigtran: mtp3: {name} for dpc {dpc} not framed: {error}");
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    message_type = name,
+                    dpc = dpc,
+                    error = %error,
+                    "mtp3: management message not framed"
+                );
                 return;
             }
         };
@@ -255,9 +312,11 @@ impl Runtime {
                         metrics::mtp3_management(metrics::Dir::Tx, name);
                     } else {
                         metrics::mtp3_discard(Mtp3Discard::NoPath, 1);
-                        eprintln!(
-                            "siphon-sigtran: mtp3: {name} not sent, the queue of `{}` is full",
-                            self.link_name(link)
+                        tracing::error!(
+                            target: "siphon_sigtran",
+                            message_type = name,
+                            link = %self.link_name(link),
+                            "mtp3: management message not sent, link queue is full"
                         );
                     }
                 }
@@ -291,7 +350,12 @@ impl Runtime {
             }
             None => {
                 metrics::mtp3_discard(Mtp3Discard::NoPath, 1);
-                eprintln!("siphon-sigtran: mtp3: no link or route to dpc {dpc} for {name}");
+                tracing::warn!(
+                    target: "siphon_sigtran",
+                    dpc = dpc,
+                    message_type = name,
+                    "mtp3: no link or route for management message"
+                );
             }
         }
     }

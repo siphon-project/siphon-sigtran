@@ -112,7 +112,7 @@ fn start<'py>(py: Python<'py>, turn: ScriptTurn, outcome: &Outcome) -> Started<'
     let dialogue = match Bound::new(py, PyDialogue::new(otid, dtid, &application_context)) {
         Ok(dialogue) => dialogue,
         Err(error) => {
-            eprintln!("siphon-sigtran: building Dialogue failed: {error}");
+            tracing::error!(target: "siphon_sigtran", error = %error, "building Dialogue failed");
             return Started::Done(Vec::new());
         }
     };
@@ -120,14 +120,22 @@ fn start<'py>(py: Python<'py>, turn: ScriptTurn, outcome: &Outcome) -> Started<'
         TurnArg::Begin(op) => match Bound::new(py, op) {
             Ok(op) => func.bind(py).call1((&dialogue, &op)),
             Err(error) => {
-                eprintln!("siphon-sigtran: building IncomingOp failed: {error}");
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    error = %error,
+                    "building IncomingOp failed"
+                );
                 return Started::Done(Vec::new());
             }
         },
         TurnArg::Peer(peer) => match Bound::new(py, peer) {
             Ok(peer) => func.bind(py).call1((&dialogue, &peer)),
             Err(error) => {
-                eprintln!("siphon-sigtran: building PeerTurn failed: {error}");
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    error = %error,
+                    "building PeerTurn failed"
+                );
                 return Started::Done(Vec::new());
             }
         },
@@ -249,8 +257,10 @@ async fn dispatch(turn: ScriptTurn) -> Vec<DlgCmd> {
             outcome,
         }) => (receiver, future, dialogue, limit, outcome),
         Err(_) => {
-            eprintln!(
-                "siphon-sigtran: ERROR: dialogue {ids}: the termination handler did not run (the script executor shed or lost it)"
+            tracing::error!(
+                target: "siphon_sigtran",
+                transaction = %ids,
+                "dialogue termination handler did not run (the script executor shed or lost it)"
             );
             return Vec::new();
         }
@@ -273,8 +283,10 @@ async fn dispatch(turn: ScriptTurn) -> Vec<DlgCmd> {
     })
     .await;
     finished.unwrap_or_else(|_| {
-        eprintln!(
-            "siphon-sigtran: ERROR: dialogue {ids}: the end of an async termination handler was not read (the script executor stopped)"
+        tracing::error!(
+            target: "siphon_sigtran",
+            transaction = %ids,
+            "the end of an async dialogue termination handler was not read (the script executor stopped)"
         );
         Vec::new()
     })

@@ -66,6 +66,10 @@ serde-saphyr = { version = "2.0.0", default-features = false, features = ["deser
 # serde-saphyr itself reports only the line and column.
 serde_path_to_error = "0.1.20"
 thiserror = "2"
+# Operator log. Events go to whatever subscriber the host installs (siphon-sip's
+# under the `python` feature), the same as the other siphon extensions. No
+# default features: the `attributes` proc-macro (syn/quote) is not needed.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # ── async runtime (phase-2 transport; the routing brain itself is sync) ──────
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
@@ -91,6 +95,9 @@ pyo3 = { version = "0.29", optional = true, features = ["auto-initialize"] }
 [dev-dependencies]
 # criterion drives the routing-brain benches (benches/routing.rs).
 criterion = "0.8"
+# Captures the crate's log events in tests/logging.rs. Registry only, no
+# formatter: the host owns formatting.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
 [features]
 default = []

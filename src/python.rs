@@ -1787,10 +1787,13 @@ fn replay(dlg: &mut CoreDialogue, cmds: Vec<DlgCmd>) -> Result<(), crate::dialog
             DlgCmd::Abort => ("abort", dlg.abort()),
         };
         if let Err(e) = outcome {
-            eprintln!(
-                "siphon-sigtran: ERROR: dialogue otid={} dtid={}: {what}() failed: {e}",
-                hex(dlg.otid()),
-                hex(dlg.dtid())
+            tracing::error!(
+                target: "siphon_sigtran",
+                originating_transaction = %hex(dlg.otid()),
+                destination_transaction = %hex(dlg.dtid()),
+                operation = %what,
+                error = %e,
+                "dialogue operation failed"
             );
             dlg.discard_staged();
             return Err(e);
@@ -1886,11 +1889,21 @@ fn handler_raised(
     // that, the component to reject is the first of the turn.
     match cap::rejected_invoke(py, error).or(rejection) {
         Some((id, problem)) if error.is_instance_of::<MistypedParameter>(py) => {
-            eprintln!("siphon-sigtran: dialogue {ids}: rejecting the component: {error}");
+            tracing::error!(
+                target: "siphon_sigtran",
+                transaction = %ids,
+                error = %error,
+                "dialogue handler raised: rejecting the component"
+            );
             vec![DlgCmd::Reject { id, problem }, DlgCmd::End]
         }
         _ => {
-            eprintln!("siphon-sigtran: ERROR: dialogue {ids}: termination handler raised: {error}");
+            tracing::error!(
+                target: "siphon_sigtran",
+                transaction = %ids,
+                error = %error,
+                "dialogue termination handler raised"
+            );
             Vec::new()
         }
     }
@@ -4296,7 +4309,11 @@ fn runtime_task(
                 match TransportHandle::start_tenant(&cfg, DEFAULT_TENANT, router).await {
                     Ok(transport) => transport,
                     Err(error) => {
-                        eprintln!("siphon-sigtran: transport failed to start: {error}");
+                        tracing::error!(
+                            target: "siphon_sigtran",
+                            error = %error,
+                            "transport failed to start"
+                        );
                         return;
                     }
                 };

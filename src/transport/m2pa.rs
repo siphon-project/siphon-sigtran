@@ -154,9 +154,11 @@ impl Runner<'_> {
                     // RFC 4165 4.1.7: a send failure makes the association
                     // unusable, and the link goes out of service.
                     Err(error) => {
-                        eprintln!(
-                            "siphon-sigtran: m2pa link `{}`: send failed ({error}), link out of service",
-                            self.slot.id
+                        tracing::error!(
+                            target: "siphon_sigtran",
+                            link = %self.slot.id,
+                            error = %error,
+                            "m2pa: send failed, link out of service"
                         );
                         self.lost = true;
                         self.link.fail(Failure::Association, more);
@@ -169,9 +171,10 @@ impl Runner<'_> {
             }
             Action::Stop(timer) => self.deadlines.link[timer.index()] = None,
             Action::InService => {
-                eprintln!(
-                    "siphon-sigtran: m2pa link `{}` is in service at level 2",
-                    self.slot.id
+                tracing::info!(
+                    target: "siphon_sigtran",
+                    link = %self.slot.id,
+                    "m2pa: link is in service at level 2"
                 );
                 match self.test.as_mut() {
                     Some(test) => {
@@ -179,18 +182,22 @@ impl Runner<'_> {
                         test.begin(&mut out);
                         self.apply_test(out, more);
                     }
-                    None => eprintln!(
-                        "siphon-sigtran: m2pa link `{}` is available without a signalling link test",
-                        self.slot.id
-                    ),
+                    None => {
+                        tracing::warn!(
+                            target: "siphon_sigtran",
+                            link = %self.slot.id,
+                            "m2pa: link is available without a signalling link test"
+                        )
+                    }
                 }
             }
             Action::OutOfService(reason) => {
                 metrics::m2pa_link_failure(reason);
-                eprintln!(
-                    "siphon-sigtran: m2pa link `{}` is out of service ({})",
-                    self.slot.id,
-                    reason.label()
+                tracing::warn!(
+                    target: "siphon_sigtran",
+                    link = %self.slot.id,
+                    reason = reason.label(),
+                    "m2pa: link is out of service"
                 );
                 if let Some(test) = self.test.as_mut() {
                     let mut out = Vec::new();
@@ -200,18 +207,47 @@ impl Runner<'_> {
                 // Q.704 12.2.2: alignment is tried again after T17.
                 self.deadlines.restart = Some(Instant::now() + self.settings().restart);
             }
-            Action::RemoteProcessorOutage(on) => eprintln!(
-                "siphon-sigtran: m2pa link `{}`: remote processor outage {}",
-                self.slot.id,
-                if on { "began" } else { "ended" }
-            ),
+            Action::RemoteProcessorOutage(on) => {
+                if on {
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        link = %self.slot.id,
+                        "m2pa: remote processor outage began"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "siphon_sigtran",
+                        link = %self.slot.id,
+                        "m2pa: remote processor outage ended"
+                    );
+                }
+            }
             Action::Discarded { reason, count } => {
                 metrics::m2pa_discard(reason, count as u64);
-                eprintln!(
-                    "siphon-sigtran: m2pa link `{}` did not carry {count} message(s) ({})",
-                    self.slot.id,
-                    reason.label()
-                );
+                match reason {
+                    Discard::TxCongestion | Discard::TxLostOnFailure | Discard::Encode => {
+                        tracing::error!(
+                            target: "siphon_sigtran",
+                            link = %self.slot.id,
+                            count = count,
+                            reason = reason.label(),
+                            "m2pa: link did not carry messages"
+                        );
+                    }
+                    Discard::RxOutOfSequence
+                    | Discard::RxNotInService
+                    | Discard::RxAbnormalBsn
+                    | Discard::TxNotInService
+                    | Discard::TxFlushedByPeer => {
+                        tracing::warn!(
+                            target: "siphon_sigtran",
+                            link = %self.slot.id,
+                            count = count,
+                            reason = reason.label(),
+                            "m2pa: link did not carry messages"
+                        );
+                    }
+                }
             }
         }
     }
@@ -227,24 +263,27 @@ impl Runner<'_> {
                 TestAction::Stop(timer) => self.deadlines.test[timer.index()] = None,
                 TestAction::Available => {
                     metrics::link_test(LinkTestResult::Passed);
-                    eprintln!(
-                        "siphon-sigtran: m2pa link `{}` passed its signalling link test, available",
-                        self.slot.id
+                    tracing::info!(
+                        target: "siphon_sigtran",
+                        link = %self.slot.id,
+                        "m2pa: link passed its signalling link test, available"
                     );
                 }
                 TestAction::AttemptFailed => {
                     metrics::link_test(LinkTestResult::Failed);
-                    eprintln!(
-                        "siphon-sigtran: m2pa link `{}`: signalling link test not acknowledged correctly",
-                        self.slot.id
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        link = %self.slot.id,
+                        "m2pa: signalling link test not acknowledged correctly"
                     );
                 }
                 // Q.707 2.2: "the link is put out of service, restoration is
                 // attempted and a management system must be informed".
                 TestAction::Failed => {
-                    eprintln!(
-                        "siphon-sigtran: m2pa link `{}` failed its signalling link test twice",
-                        self.slot.id
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        link = %self.slot.id,
+                        "m2pa: link failed its signalling link test twice"
                     );
                     self.link.fail(Failure::LinkTest, more);
                 }
@@ -297,11 +336,12 @@ impl Runner<'_> {
         if self.ctx.registry.is_restarting() {
             metrics::msu(metrics::Dir::Rx, msu.si.0);
             metrics::mtp3_discard(Mtp3Discard::Restarting, 1);
-            eprintln!(
-                "siphon-sigtran: dropped a message received on `{}` for dpc {} (SI {}): this node's MTP is restarting",
-                self.slot.id,
-                msu.dpc.value(),
-                msu.si.0
+            tracing::warn!(
+                target: "siphon_sigtran",
+                link = %self.slot.id,
+                dpc = msu.dpc.value(),
+                si = msu.si.0,
+                "dropped a received message: this node's MTP is restarting"
             );
             return;
         }
@@ -337,10 +377,11 @@ impl Runner<'_> {
             }),
             None => {
                 metrics::mtp3_discard(Mtp3Discard::Management, 1);
-                eprintln!(
-                    "siphon-sigtran: {} received on `{}`, a link in no linkset: not acted on",
-                    message.name(),
-                    self.slot.id
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    message_type = message.name(),
+                    link = %self.slot.id,
+                    "message received on a link in no linkset: not acted on"
                 );
             }
         }
@@ -558,15 +599,22 @@ impl Runner<'_> {
 fn lost_with_the_link(link: &str, count: usize) {
     if count > 0 {
         metrics::m2pa_discard(Discard::TxLostOnFailure, count as u64);
-        eprintln!(
-            "siphon-sigtran: m2pa link `{link}`: {count} unacknowledged message(s) lost with the link"
+        tracing::error!(
+            target: "siphon_sigtran",
+            link = %link,
+            count = count,
+            "m2pa: unacknowledged messages lost with the link"
         );
     }
 }
 
 fn buffer_full(link: &str) {
     metrics::mtp3_discard(Mtp3Discard::BufferFull, 1);
-    eprintln!("siphon-sigtran: m2pa link `{link}`: changeover buffer full, message dropped");
+    tracing::error!(
+        target: "siphon_sigtran",
+        link = %link,
+        "m2pa: changeover buffer full, message dropped"
+    );
 }
 
 /// Say whether routing leads to the link, and have the route state follow.
@@ -607,12 +655,13 @@ async fn divert_all(
     metrics::mtp3_retrieved(Retrieved::Resent, diverted.resent as u64);
     metrics::mtp3_retrieved(Retrieved::Confirmed, diverted.confirmed as u64);
     metrics::mtp3_retrieved(Retrieved::LinkTest, diverted.link_tests as u64);
-    eprintln!(
-        "siphon-sigtran: m2pa link `{}`: changeover, {} message(s) to the alternative ({} of them sent before), {} accepted by the far end",
-        slot.id,
-        diverted.messages.len(),
-        diverted.resent,
-        diverted.confirmed
+    tracing::info!(
+        target: "siphon_sigtran",
+        link = %slot.id,
+        count = diverted.messages.len(),
+        resent = diverted.resent,
+        confirmed = diverted.confirmed,
+        "m2pa: changeover, messages diverted to the alternative, including previously sent messages; far-end acceptances confirmed"
     );
     // Sent, not acknowledged, and not to be sent again without the far end's
     // word on them: possibly lost, and counted as that.
@@ -649,9 +698,10 @@ pub async fn run_link(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let Some(port) = slot.link() else {
-        eprintln!(
-            "siphon-sigtran: `{}` is not an m2pa link, association not served",
-            slot.id
+        tracing::error!(
+            target: "siphon_sigtran",
+            association = %slot.id,
+            "m2pa: association is not an m2pa link, not served"
         );
         return;
     };
@@ -672,10 +722,10 @@ pub async fn run_link(
 
     let settings = &port.settings;
     if settings.test.is_none() {
-        eprintln!(
-            "siphon-sigtran: WARNING: m2pa link `{}` runs without a signalling link test \
-             (switched off, in no linkset, or no adjacent_pc): it is available as soon as it is aligned",
-            slot.id
+        tracing::warn!(
+            target: "siphon_sigtran",
+            link = %slot.id,
+            "m2pa: link runs without a signalling link test (switched off, in no linkset, or no adjacent_pc): available as soon as aligned"
         );
     }
     let mut runner = Runner {
@@ -713,9 +763,10 @@ pub async fn run_link(
             }
             _ = superseded.changed() => {
                 taken_over = true;
-                eprintln!(
-                    "siphon-sigtran: m2pa link `{}`: a new association took the link over",
-                    slot.id
+                tracing::info!(
+                    target: "siphon_sigtran",
+                    link = %slot.id,
+                    "m2pa: a new association took the link over"
                 );
                 break;
             }
@@ -755,9 +806,11 @@ pub async fn run_link(
     let lost = runner.link.abandon();
     if lost > 0 {
         metrics::m2pa_discard(Discard::TxLostOnFailure, lost as u64);
-        eprintln!(
-            "siphon-sigtran: m2pa link `{}`: {lost} unacknowledged or unsent message(s) lost with the link",
-            slot.id
+        tracing::error!(
+            target: "siphon_sigtran",
+            link = %slot.id,
+            count = lost,
+            "m2pa: unacknowledged or unsent messages lost with the link"
         );
     }
     port.set_aligned(false);
@@ -839,9 +892,10 @@ async fn idle_command(
         LinkCommand::Fail => {}
         LinkCommand::Direct(_) => {
             metrics::m2pa_discard(Discard::TxNotInService, 1);
-            eprintln!(
-                "siphon-sigtran: m2pa link `{}` has no association: a message bound to it was not sent",
-                slot.id
+            tracing::warn!(
+                target: "siphon_sigtran",
+                link = %slot.id,
+                "m2pa: link has no association: a message bound to it was not sent"
             );
         }
     }

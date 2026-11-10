@@ -909,13 +909,15 @@ impl Dialogue {
                 Ok(())
             }
             Err(e) => {
-                log_error(format_args!(
-                    "{} not sent on dialogue otid={} dtid={} (dpc {}): {e}",
-                    msg.message_type(),
-                    hex(&self.our_tid),
-                    hex(&self.peer_tid),
-                    self.addressing.dpc,
-                ));
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    message_type = %msg.message_type(),
+                    originating_transaction = %hex(&self.our_tid),
+                    destination_transaction = %hex(&self.peer_tid),
+                    dpc = self.addressing.dpc,
+                    error = %e,
+                    "tcap: message not sent on dialogue"
+                );
                 Err(self.fail(e))
             }
         }
@@ -1393,9 +1395,10 @@ impl DialogueEngine {
                 // so say which one it was.
                 None => {
                     metrics::tcap_discard(TcapDiscard::UnknownTransaction);
-                    eprintln!(
-                        "siphon-sigtran: discarded an End for transaction {}, which is not open here (never was, or already ended or timed out)",
-                        hex(our_tid)
+                    tracing::debug!(
+                        target: "siphon_sigtran",
+                        transaction = %hex(our_tid),
+                        "tcap: discarded an End for a transaction which is not open here (never was, or already ended or timed out)"
                     );
                     Vec::new()
                 }
@@ -1444,9 +1447,10 @@ impl DialogueEngine {
             // Table 7/Q.774, ABORT with an unassigned destination transaction
             // ID: Discard.
             metrics::tcap_discard(TcapDiscard::UnknownTransaction);
-            eprintln!(
-                "siphon-sigtran: discarded an Abort for transaction {}, which is not open here",
-                hex(&abort.dtid)
+            tracing::debug!(
+                target: "siphon_sigtran",
+                transaction = %hex(&abort.dtid),
+                "tcap: discarded an Abort for a transaction which is not open here"
             );
             return;
         };
@@ -1962,11 +1966,13 @@ fn send_abort(abort: &Abort, a: &Addressing) -> Vec<Msu> {
         }
         Err(e) => {
             metrics::tcap_send_error();
-            log_error(format_args!(
-                "Abort not sent for dtid={} (dpc {}): {e}",
-                hex(&abort.dtid),
-                a.dpc
-            ));
+            tracing::error!(
+                target: "siphon_sigtran",
+                transaction = %hex(&abort.dtid),
+                dpc = a.dpc,
+                error = %e,
+                "tcap: Abort not sent"
+            );
             Vec::new()
         }
     }
@@ -2048,12 +2054,6 @@ pub fn tid_lane(tid: &[u8]) -> u64 {
     })
 }
 
-/// The crate has no logging framework: the operator-facing log is stderr, and
-/// an error is marked as one.
-fn log_error(message: std::fmt::Arguments<'_>) {
-    eprintln!("siphon-sigtran: ERROR: {message}");
-}
-
 /// Whether delivering this XUDT here uses up its hop counter. Q.714 2.3.1: a
 /// called party address that routes on its subsystem number is handed to the
 /// subsystem as it is; one that routes on a global title is translated first,
@@ -2070,9 +2070,12 @@ fn hop_counter_violated(xudt: &ExtendedUnitData) -> bool {
 /// "hop counter violation" (Q.714 2.8.6) when it asked to be returned.
 fn hop_counter_violation(inbound: &Msu, ingress_assoc: &str, xudt: ExtendedUnitData) -> Vec<Msu> {
     metrics::record_loop(LoopKind::HopCounter);
-    eprintln!(
-        "siphon-sigtran: loop dropped (hop-counter): OPC {} DPC {} received on `{ingress_assoc}`, exhausted at the translation to a local subsystem",
-        inbound.opc, inbound.dpc
+    tracing::warn!(
+        target: "siphon_sigtran",
+        opc = inbound.opc,
+        dpc = inbound.dpc,
+        association = %ingress_assoc,
+        "loop dropped (hop-counter): exhausted at the translation to a local subsystem"
     );
     let cause = ReturnCause::HopCounterViolation;
     crate::transport::sccp_return(inbound, &SccpMessage::Xudt(xudt), cause, None)
@@ -2085,12 +2088,15 @@ fn hop_counter_violation(inbound: &Msu, ingress_assoc: &str, xudt: ExtendedUnitD
 /// no reassembly), an LUDT, a service message.
 fn not_unitdata(inbound: &Msu, ingress_assoc: &str, what: impl std::fmt::Display) {
     metrics::rx_discard(RxDiscard::NotUnitdata);
-    eprintln!(
-        "siphon-sigtran: dropped a message received on `{ingress_assoc}` ({}): OPC {} DPC {} SI {}, {what}",
-        RxDiscard::NotUnitdata.label(),
-        inbound.opc,
-        inbound.dpc,
-        inbound.si
+    tracing::warn!(
+        target: "siphon_sigtran",
+        association = %ingress_assoc,
+        reason = RxDiscard::NotUnitdata.label(),
+        opc = inbound.opc,
+        dpc = inbound.dpc,
+        si = inbound.si,
+        detail = %what,
+        "dropped a received message"
     );
 }
 
