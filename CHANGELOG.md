@@ -7,6 +7,8 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [7.1.0] — 2026-11-10
+
 ### Changed
 
 - Logging goes through `tracing` (target `siphon_sigtran`, structured fields,
