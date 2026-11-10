@@ -154,9 +154,13 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
     if let Some(our_pc) = node_pc {
         if msu.opc == our_pc {
             metrics::record_loop(LoopKind::OwnOpc);
-            eprintln!(
-                "siphon-sigtran: loop dropped (own-opc): OPC {} == node PC, DPC {} SI {} in on {inbound_assoc}",
-                msu.opc, msu.dpc, msu.si
+            tracing::warn!(
+                target: "siphon_sigtran",
+                opc = msu.opc,
+                dpc = msu.dpc,
+                si = msu.si,
+                association = %inbound_assoc,
+                "loop dropped (own-opc): OPC equals node point code"
             );
             return;
         }
@@ -247,15 +251,22 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
             if let Some(gt) = &rewrite_cdpa_gt {
                 match rewrite_called_gt(&out.payload, gt) {
                     Some(rewritten) => out.payload = rewritten,
-                    None => eprintln!(
-                        "siphon-sigtran: rewrite_cdpa_gt re-encode failed, forwarding unchanged"
-                    ),
+                    None => {
+                        tracing::error!(
+                            target: "siphon_sigtran",
+                            "rewrite_cdpa_gt re-encode failed, forwarding unchanged"
+                        )
+                    }
                 }
             }
             send_via(&via, &out, &ctx.registry).await;
         }
         RouteDecision::RouteTo { dpc, via: None, .. } => {
-            eprintln!("siphon-sigtran: no MTP3 route to translated DPC {dpc}, returning on error");
+            tracing::warn!(
+                target: "siphon_sigtran",
+                dpc = dpc,
+                "no MTP3 route to translated DPC, returning on error"
+            );
             return_undeliverable(&msu, ReturnCause::MtpFailure, ctx, inbound_src.as_ref()).await;
         }
         RouteDecision::Local => {
@@ -274,14 +285,20 @@ pub async fn dispatch(msu: Msu, ctx: &TaskCtx, inbound_assoc: &str) {
                 .await;
         }
         RouteDecision::CrossTenant { tenant, .. } => {
-            eprintln!(
-                "siphon-sigtran: cross-tenant hand-off to `{tenant}` not wired on the transport \
-                 yet, returning on error"
+            tracing::error!(
+                target: "siphon_sigtran",
+                tenant = %tenant,
+                "cross-tenant hand-off not wired on the transport yet, returning on error"
             );
             return_undeliverable(&msu, ReturnCause::SccpFailure, ctx, inbound_src.as_ref()).await;
         }
         RouteDecision::Drop { reason } => {
-            eprintln!("siphon-sigtran: dropping MSU to {}: {reason}", msu.dpc);
+            tracing::warn!(
+                target: "siphon_sigtran",
+                dpc = msu.dpc,
+                reason = %reason,
+                "dropping MSU"
+            );
             // Q.704 2.4.1: "When a signalling transfer point detects that a
             // received message cannot be delivered to its destination point,
             // it sends in response a transfer-prohibited message as specified
@@ -351,13 +368,15 @@ async fn refused_by_admission(
         }
     };
     metrics::admission_refused(refusal.cause.reason(), action);
-    eprintln!(
-        "siphon-sigtran: admission refused a new dialogue ({}, reason `{}`), {}: OPC {} DPC {} in on {inbound_assoc}",
-        refusal.kind.label(),
-        refusal.cause.reason(),
-        action.label(),
-        msu.opc,
-        msu.dpc
+    tracing::warn!(
+        target: "siphon_sigtran",
+        kind = refusal.kind.label(),
+        reason = refusal.cause.reason(),
+        action = action.label(),
+        opc = msu.opc,
+        dpc = msu.dpc,
+        association = %inbound_assoc,
+        "admission refused a new dialogue"
     );
     true
 }
@@ -371,10 +390,14 @@ fn is_reflection(inbound_src: Option<&Destination>, via: &Destination) -> bool {
 /// Count and log a dropped route-reflection loop.
 fn loop_reflect(via: &Destination, msu: &Msu, inbound_assoc: &str) {
     metrics::record_loop(LoopKind::RouteReflect);
-    eprintln!(
-        "siphon-sigtran: loop dropped (route-reflect): egress {via} == inbound {inbound_assoc}, \
-         OPC {} DPC {} SI {}",
-        msu.opc, msu.dpc, msu.si
+    tracing::warn!(
+        target: "siphon_sigtran",
+        via = %via,
+        association = %inbound_assoc,
+        opc = msu.opc,
+        dpc = msu.dpc,
+        si = msu.si,
+        "loop dropped (route-reflect): egress equals inbound"
     );
 }
 
@@ -392,32 +415,49 @@ fn apply_isup_screen(screen: &IsupScreen, msu: &Msu, inbound_assoc: &str) -> boo
     match verdict {
         Screened::Pass => false,
         Screened::PassUndecoded { error } => {
-            eprintln!(
-                "siphon-sigtran: isup screen could not decode SI=5 MSU \
-                 (OPC {} DPC {} in on {inbound_assoc}): {error}; passing per default allow",
-                msu.opc, msu.dpc
+            tracing::warn!(
+                target: "siphon_sigtran",
+                opc = msu.opc,
+                dpc = msu.dpc,
+                si = 5,
+                association = %inbound_assoc,
+                error = %error,
+                "isup: screen could not decode MSU; passing per default allow"
             );
             false
         }
         Screened::BlockRule { rule } => {
-            eprintln!(
-                "siphon-sigtran: isup screened (drop): rule `{rule}`, OPC {} DPC {} SI {} in on {inbound_assoc}",
-                msu.opc, msu.dpc, msu.si
+            tracing::warn!(
+                target: "siphon_sigtran",
+                rule = %rule,
+                opc = msu.opc,
+                dpc = msu.dpc,
+                si = msu.si,
+                association = %inbound_assoc,
+                "isup: screened (drop) by rule"
             );
             true
         }
         Screened::BlockDefault => {
-            eprintln!(
-                "siphon-sigtran: isup screened (drop): default action, OPC {} DPC {} SI {} in on {inbound_assoc}",
-                msu.opc, msu.dpc, msu.si
+            tracing::warn!(
+                target: "siphon_sigtran",
+                opc = msu.opc,
+                dpc = msu.dpc,
+                si = msu.si,
+                association = %inbound_assoc,
+                "isup: screened (drop) by default action"
             );
             true
         }
         Screened::BlockUndecoded { error } => {
-            eprintln!(
-                "siphon-sigtran: isup screened (drop): undecodable SI=5 MSU per default block \
-                 (OPC {} DPC {} in on {inbound_assoc}): {error}",
-                msu.opc, msu.dpc
+            tracing::warn!(
+                target: "siphon_sigtran",
+                opc = msu.opc,
+                dpc = msu.dpc,
+                si = 5,
+                association = %inbound_assoc,
+                error = %error,
+                "isup: screened (drop): undecodable MSU per default block"
             );
             true
         }
@@ -471,7 +511,11 @@ async fn hop_counter_guard(
             // Re-encoding a message we just decoded should not fail; if it
             // somehow does, forward the original rather than drop a good message.
             Err(e) => {
-                eprintln!("siphon-sigtran: hop-counter re-encode failed ({e}), forwarding as-is");
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    error = %e,
+                    "hop-counter re-encode failed, forwarding as-is"
+                );
                 HopGuard::Forward(msu.payload.clone())
             }
         };
@@ -479,9 +523,11 @@ async fn hop_counter_guard(
 
     // Exhausted → routing loop. Drop, count, and return a violation if asked.
     metrics::record_loop(LoopKind::HopCounter);
-    eprintln!(
-        "siphon-sigtran: loop dropped (hop-counter): OPC {} DPC {} exhausted at GTT",
-        msu.opc, msu.dpc
+    tracing::warn!(
+        target: "siphon_sigtran",
+        opc = msu.opc,
+        dpc = msu.dpc,
+        "loop dropped (hop-counter): exhausted at GTT"
     );
     if let Some(src) = inbound_src {
         let our_pc = ctx.router.node_point_code(&ctx.tenant);
@@ -631,19 +677,20 @@ async fn send_now(via: &Destination, msu: &Msu, registry: &Registry) {
             Adaptation::Sua => match framing::wrap_sua(msu, sel.routing_context.unwrap_or(0)) {
                 Ok(b) => (b, SUA_DATA_STREAM, PPID_SUA),
                 Err(e) => {
-                    eprintln!("siphon-sigtran: sua framing failed: {e}");
+                    tracing::error!(target: "siphon_sigtran", error = %e, "sua: framing failed");
                     continue;
                 }
             },
             Adaptation::M2pa => {
-                eprintln!(
-                    "siphon-sigtran: application-server egress selected an m2pa association (invalid config), dropping"
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    "application-server egress selected an m2pa association (invalid config), dropping"
                 );
                 continue;
             }
         };
         if let Err(e) = sel.assoc.send(&bytes, stream, ppid).await {
-            eprintln!("siphon-sigtran: egress send on {via} failed: {e}");
+            tracing::error!(target: "siphon_sigtran", via = %via, error = %e, "egress send failed");
         } else {
             metrics::msu(metrics::Dir::Tx, msu.si);
         }
@@ -653,9 +700,11 @@ async fn send_now(via: &Destination, msu: &Msu, registry: &Registry) {
 /// A route was chosen and nothing on it carries traffic: counted and logged.
 fn no_egress(via: &Destination, msu: &Msu) {
     metrics::mtp3_discard(Mtp3Discard::NoEgress, 1);
-    eprintln!(
-        "siphon-sigtran: no active egress for {via} (dpc {}), message dropped",
-        msu.dpc
+    tracing::warn!(
+        target: "siphon_sigtran",
+        via = %via,
+        dpc = msu.dpc,
+        "no active egress, message dropped"
     );
 }
 
@@ -669,9 +718,10 @@ pub(crate) async fn release_destination(dpc: u32, ctx: &TaskCtx) {
                 Some(via) => send_now(&via, &msu, &ctx.registry).await,
                 None => {
                     metrics::mtp3_discard(Mtp3Discard::NoRoute, 1);
-                    eprintln!(
-                        "siphon-sigtran: dpc {} became inaccessible during rerouting, held message dropped",
-                        msu.dpc
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        dpc = msu.dpc,
+                        "destination became inaccessible during rerouting, held message dropped"
                     );
                 }
             }
@@ -687,9 +737,11 @@ pub(crate) async fn reroute(raw: Vec<u8>, ctx: &TaskCtx, from: &super::registry:
         Ok(decoded) => decoded,
         Err(error) => {
             metrics::mtp3_discard(Mtp3Discard::NoAlternative, 1);
-            eprintln!(
-                "siphon-sigtran: a message held by `{}` cannot be read back ({error}), dropped",
-                from.id
+            tracing::error!(
+                target: "siphon_sigtran",
+                link = %from.id,
+                error = %error,
+                "held message cannot be read back, dropped"
             );
             return;
         }
@@ -731,9 +783,11 @@ pub(crate) async fn reroute(raw: Vec<u8>, ctx: &TaskCtx, from: &super::registry:
         // discarded".
         None => {
             metrics::mtp3_discard(Mtp3Discard::NoAlternative, 1);
-            eprintln!(
-                "siphon-sigtran: no alternative to `{}` for dpc {}, message dropped",
-                from.id, msu.dpc
+            tracing::warn!(
+                target: "siphon_sigtran",
+                link = %from.id,
+                dpc = msu.dpc,
+                "no alternative link, message dropped"
             );
         }
     }
@@ -744,22 +798,26 @@ pub(crate) async fn reroute(raw: Vec<u8>, ctx: &TaskCtx, from: &super::registry:
 /// off the link is logged here.
 pub(crate) fn send_on_link(slot: &super::registry::AssocSlot, msu: &Msu) {
     let Some(link) = slot.link() else {
-        eprintln!(
-            "siphon-sigtran: `{}` is not an m2pa link, MSU for dpc {} dropped",
-            slot.id, msu.dpc
+        tracing::error!(
+            target: "siphon_sigtran",
+            association = %slot.id,
+            dpc = msu.dpc,
+            "m2pa: association is not a link, MSU dropped"
         );
         return;
     };
     match framing::mtp3_msu(msu) {
         Ok(raw) => {
             if !link.offer(raw) {
-                eprintln!(
-                    "siphon-sigtran: m2pa link `{}`: transmit queue full, MSU for dpc {} dropped",
-                    slot.id, msu.dpc
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    link = %slot.id,
+                    dpc = msu.dpc,
+                    "m2pa: transmit queue full, MSU dropped"
                 );
             }
         }
-        Err(e) => eprintln!("siphon-sigtran: m2pa framing failed: {e}"),
+        Err(e) => tracing::error!(target: "siphon_sigtran", error = %e, "m2pa: framing failed"),
     }
 }
 

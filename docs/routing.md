@@ -299,7 +299,7 @@ What a refusal does:
   is discarded.
 
 Every refusal is counted in `sigtran_admission_refused_total{reason,action}`,
-`action` being `returned`, `discarded` or `aborted`, and logged on stderr.
+`action` being `returned`, `discarded` or `aborted`, and logged at warn level.
 
 ## MAP/CAP operations { #operations }
 
@@ -415,7 +415,7 @@ or an acknowledgement of a test that is not running), and for M3UA
 `unexpected` (a message the peer's role or the ASP's state does not allow),
 `parameter` (a parameter missing, of a wrong length or with an invalid value)
 and `management` (signalling network management in a DATA message). Each is
-also a line on stderr naming the association. Alert on any of them moving.
+also a log line at warn level naming the association. Alert on any of them moving.
 
 The dialogue engine reads a UDT and an XUDT that holds a whole message (no
 segmentation parameter, or one that says first segment, none remaining), and
@@ -429,8 +429,8 @@ endpoint aborted ([who a listening association accepts](configuration.md#peer-id
 `unlisted-address` (the peer presented a listed address and one that is not),
 `peer-port` (the addresses of an association with another `peer_port`),
 `duplicate` (the association is established already and stayed so) and
-`closed` (the peer was gone before its addresses were read). Each is a line on
-stderr with the addresses, at most one a second per endpoint. `unknown-peer`
+`closed` (the peer was gone before its addresses were read). Each is a log line at
+warn level with the addresses, at most one a second per endpoint. `unknown-peer`
 moving is someone who is not configured knocking; `duplicate` moving is a peer
 that dials while its association is up, or one that came back from another
 port before the old association had failed.

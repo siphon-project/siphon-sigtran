@@ -233,12 +233,21 @@ pub(super) async fn send_management(assoc: &SctpAssociation, id: &str, message: 
         Ok(Ok(_)) => count(Dir::Tx, message),
         Ok(Err(error)) => {
             metrics::m3ua_discard(Discard::NotSent, 1);
-            eprintln!("siphon-sigtran: m3ua `{id}`: {name} not sent: {error}");
+            tracing::error!(
+                target: "siphon_sigtran",
+                association = %id,
+                message_type = name,
+                error = %error,
+                "m3ua: message not sent"
+            );
         }
         Err(_) => {
             metrics::m3ua_discard(Discard::NotSent, 1);
-            eprintln!(
-                "siphon-sigtran: m3ua `{id}`: {name} not sent, the association does not take it"
+            tracing::error!(
+                target: "siphon_sigtran",
+                association = %id,
+                message_type = name,
+                "m3ua: message not sent, the association does not take it"
             );
         }
     }
@@ -413,10 +422,21 @@ impl Layer {
                     let Some((name, _)) = registry.server(server) else {
                         continue;
                     };
-                    eprintln!(
-                        "siphon-sigtran: m3ua: application server `{name}` is {}",
-                        state.label()
-                    );
+                    if state == AsState::Active {
+                        tracing::info!(
+                            target: "siphon_sigtran",
+                            application_server = %name,
+                            state = state.label(),
+                            "m3ua: application server is active"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "siphon_sigtran",
+                            application_server = %name,
+                            state = state.label(),
+                            "m3ua: application server is not active"
+                        );
+                    };
                     if state == AsState::Active {
                         let via = Destination::ApplicationServer(name.to_string());
                         for msu in &queued {
@@ -427,9 +447,11 @@ impl Layer {
                         }
                     } else if !queued.is_empty() {
                         metrics::m3ua_discard(Discard::PendingExpired, queued.len() as u64);
-                        eprintln!(
-                            "siphon-sigtran: m3ua: {} messages queued for `{name}` dropped, no ASP became active",
-                            queued.len()
+                        tracing::error!(
+                            target: "siphon_sigtran",
+                            count = queued.len(),
+                            application_server = %name,
+                            "m3ua: queued messages dropped, no ASP became active"
                         );
                     }
                 }
@@ -716,8 +738,10 @@ pub(super) async fn run_layer(
                 }
                 Err(RecvError::Lagged(missed)) => {
                     metrics::m3ua_event(Event::ChangesLagged);
-                    eprintln!(
-                        "siphon-sigtran: m3ua: {missed} destination changes missed, the ASPs are told the state as it is"
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        count = missed,
+                        "m3ua: destination changes missed, the ASPs are told the state as it is"
                     );
                     layer.resync().await;
                 }
@@ -732,7 +756,11 @@ pub(super) async fn run_layer(
                     let Timer::Recovery(server) = timer;
                     metrics::m3ua_event(Event::RecoveryExpired);
                     if let Some((name, _)) = layer.ctx.registry.server(server) {
-                        eprintln!("siphon-sigtran: m3ua: T(r) of application server `{name}` ran out");
+                        tracing::warn!(
+                            target: "siphon_sigtran",
+                            application_server = %name,
+                            "m3ua: T(r) ran out"
+                        );
                     }
                     let actions = layer.machine.handle(Input::Timeout(timer));
                     layer.perform(actions, &[]).await;
@@ -850,18 +878,21 @@ impl Peer {
         self.asking.at = None;
         if !self.asking.up {
             metrics::m3ua_event(Event::AckTimeout);
-            eprintln!(
-                "siphon-sigtran: m3ua `{}`: ASP Up not acknowledged, sent again",
-                self.id()
+            tracing::warn!(
+                target: "siphon_sigtran",
+                association = %self.id(),
+                "m3ua: ASP Up not acknowledged, sent again"
             );
             self.ask_up().await;
             return;
         }
         for context in self.asking.contexts.clone() {
             metrics::m3ua_event(Event::AckTimeout);
-            eprintln!(
-                "siphon-sigtran: m3ua `{}`: ASP Active for routing context {context} not acknowledged, sent again",
-                self.id()
+            tracing::warn!(
+                target: "siphon_sigtran",
+                association = %self.id(),
+                routing_context = context,
+                "m3ua: ASP Active not acknowledged, sent again"
             );
             self.ask_active(context).await;
         }
@@ -927,9 +958,10 @@ impl Peer {
                 // initiate procedures to return itself to its previous
                 // state." It asks again when T(ack) runs out, not at once: a
                 // gateway that cannot serve says so every time.
-                eprintln!(
-                    "siphon-sigtran: m3ua `{}`: the gateway made this ASP inactive",
-                    self.id()
+                tracing::warn!(
+                    target: "siphon_sigtran",
+                    association = %self.id(),
+                    "m3ua: the gateway made this ASP inactive"
                 );
                 for context in self.about(message) {
                     if !self.asking.contexts.contains(&context) {
@@ -952,9 +984,10 @@ impl Peer {
                 // consider itself to be in the ASP-DOWN state", and then
                 // return to where it was: ASP Up goes out when T(ack) runs
                 // out.
-                eprintln!(
-                    "siphon-sigtran: m3ua `{}`: the gateway took this ASP down",
-                    self.id()
+                tracing::warn!(
+                    target: "siphon_sigtran",
+                    association = %self.id(),
+                    "m3ua: the gateway took this ASP down"
                 );
                 self.asking.up = false;
                 self.asking.contexts.clear();
@@ -990,12 +1023,13 @@ impl Peer {
             return;
         };
         let known = Status::from_code(status);
-        eprintln!(
-            "siphon-sigtran: m3ua `{}`: notified {} (status {}/{})",
-            self.id(),
-            known.map_or("of something this node does not know", Status::label),
-            status.0,
-            status.1
+        tracing::info!(
+            target: "siphon_sigtran",
+            association = %self.id(),
+            state = known.map_or("unknown", Status::label),
+            status_type = status.0,
+            status_information = status.1,
+            "m3ua: notification received"
         );
         let contexts = self.about(message);
         match known {
@@ -1132,20 +1166,23 @@ impl Peer {
                 let sent = self.beat.to_be_bytes();
                 if self.slot.m3ua.beat_ms > 0 && message.heartbeat_data() != Some(&sent[..]) {
                     metrics::m3ua_event(Event::BeatMismatch);
-                    eprintln!(
-                        "siphon-sigtran: m3ua `{}`: a heartbeat acknowledgement that does not return what was sent",
-                        self.id()
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        association = %self.id(),
+                        "m3ua: heartbeat acknowledgement does not return what was sent"
                     );
                 }
             }
             // Never answered (3.8.1).
             MessageType::Error => {
                 let code = message.error_code().unwrap_or(0);
-                eprintln!(
-                    "siphon-sigtran: m3ua `{}`: the peer answered with Error {code:#04x} ({}), routing contexts {:?}",
-                    self.id(),
-                    error_name(code),
-                    message.routing_contexts()
+                tracing::warn!(
+                    target: "siphon_sigtran",
+                    association = %self.id(),
+                    error_code = code,
+                    error = error_name(code),
+                    routing_contexts = ?message.routing_contexts(),
+                    "m3ua: peer answered with Error"
                 );
             }
             MessageType::Duna
@@ -1446,9 +1483,13 @@ impl Peer {
                         },
                     );
                 }
-                eprintln!(
-                    "siphon-sigtran: m3ua `{}`: user part {user} of dpc {pc} is unavailable (cause {cause})",
-                    self.id()
+                tracing::debug!(
+                    target: "siphon_sigtran",
+                    association = %self.id(),
+                    user_part = user,
+                    dpc = pc,
+                    cause = cause,
+                    "m3ua: DUPU user part unavailable noted"
                 );
             }
             _ => {}
@@ -1546,9 +1587,12 @@ impl Peer {
             Ok(payload) => payload,
             Err(error) => {
                 metrics::mtp3_discard(Mtp3Discard::NoPath, 1);
-                eprintln!(
-                    "siphon-sigtran: m3ua `{}`: transfer-controlled for dpc {pc} not encoded: {error}",
-                    self.id()
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    association = %self.id(),
+                    dpc = pc,
+                    error = %error,
+                    "m3ua: transfer-controlled not encoded"
                 );
                 return;
             }
@@ -1579,9 +1623,12 @@ impl Peer {
             }
             None => {
                 metrics::mtp3_discard(Mtp3Discard::NoPath, 1);
-                eprintln!(
-                    "siphon-sigtran: m3ua `{}`: no route to dpc {concerned} for a transfer-controlled about dpc {pc}",
-                    self.id()
+                tracing::warn!(
+                    target: "siphon_sigtran",
+                    association = %self.id(),
+                    dpc = concerned,
+                    affected_dpc = pc,
+                    "m3ua: no route for a transfer-controlled"
                 );
             }
         }
@@ -1602,10 +1649,11 @@ impl Peer {
         // stopped".
         if self.silent >= 2 {
             metrics::m3ua_event(Event::BeatTimeout);
-            eprintln!(
-                "siphon-sigtran: m3ua `{}`: nothing from the peer for {} ms, the association is aborted",
-                self.id(),
-                2 * self.slot.m3ua.beat_ms
+            tracing::warn!(
+                target: "siphon_sigtran",
+                association = %self.id(),
+                elapsed_milliseconds = 2 * self.slot.m3ua.beat_ms,
+                "m3ua: nothing from the peer, the association is aborted"
             );
             let _ = self.assoc.abort().await;
             return false;
@@ -1787,9 +1835,12 @@ pub(super) async fn management_for_server(name: &str, msu: &Msu, registry: &Regi
     if !sent {
         metrics::m3ua_discard(Discard::Management, 1);
         let what = message.as_ref().map_or("unreadable", |m| m.name());
-        eprintln!(
-            "siphon-sigtran: m3ua: signalling network management ({what}) for dpc {} is not transferred to application server `{name}`",
-            msu.dpc
+        tracing::warn!(
+            target: "siphon_sigtran",
+            message_type = what,
+            dpc = msu.dpc,
+            application_server = %name,
+            "m3ua: signalling network management is not transferred to application server"
         );
     }
 }

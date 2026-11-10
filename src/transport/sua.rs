@@ -351,7 +351,10 @@ async fn handle_ssnm(msg: &SuaMessage, ctx: &TaskCtx, reply: &SctpAssociation) {
             }
         }
         MessageType::Dupu => {
-            eprintln!("siphon-sigtran: SUA DUPU (destination user part unavailable) noted");
+            tracing::debug!(
+                target: "siphon_sigtran",
+                "sua: DUPU (destination user part unavailable) noted"
+            );
         }
         _ => {}
     }

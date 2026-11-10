@@ -212,10 +212,15 @@ where
     loop {
         match tokio::time::timeout(TURN_STALL, &mut running).await {
             Ok(done) => return done,
-            Err(_) => eprintln!(
-                "siphon-sigtran: ERROR: a dialogue {what} handler on lane {lane} has run for {}s; the dialogues of that lane wait for it",
-                started.elapsed().as_secs()
-            ),
+            Err(_) => {
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    handler = what,
+                    lane = lane,
+                    elapsed_seconds = started.elapsed().as_secs(),
+                    "dialogue handler is taking too long; the dialogues of that lane wait for it"
+                )
+            }
         }
     }
 }
@@ -382,11 +387,11 @@ impl TransportHandle {
                     .peer_ips()
                     .map_err(|e| TransportError::Config(e.to_string()))?;
                 if addrs.is_empty() {
-                    eprintln!(
-                        "siphon-sigtran: WARNING: association `{}` listens on {local} without \
-                         `peer_addrs`: WHOEVER CONNECTS FIRST IS TAKEN FOR ITS PEER. List the \
-                         addresses of the peer.",
-                        assoc.id
+                    tracing::warn!(
+                        target: "siphon_sigtran",
+                        association = %assoc.id,
+                        local = %local,
+                        "association listens without peer_addrs: whoever connects first is taken for its peer; list the addresses of the peer"
                     );
                 }
                 // A link nobody has connected to yet still has its queue
@@ -546,8 +551,11 @@ impl TransportHandle {
                                         send_reply(&registry, &ingress, &out).await;
                                     }
                                 }
-                                Err(error) => eprintln!(
-                                    "siphon-sigtran: ERROR: a dialogue handler on `{ingress}` panicked: {error}"
+                                Err(error) => tracing::error!(
+                                    target: "siphon_sigtran",
+                                    association = %ingress,
+                                    error = %error,
+                                    "dialogue handler panicked"
                                 ),
                             }
                         }
@@ -563,8 +571,10 @@ impl TransportHandle {
                                             .await;
                                     }
                                 }
-                                Err(error) => eprintln!(
-                                    "siphon-sigtran: ERROR: a dialogue timeout handler panicked: {error}"
+                                Err(error) => tracing::error!(
+                                    target: "siphon_sigtran",
+                                    error = %error,
+                                    "dialogue timeout handler panicked"
                                 ),
                             }
                         }
@@ -656,15 +666,19 @@ impl TransportHandle {
                             Ok(Ok((_tid, frames))) => frames,
                             Ok(Err(_)) => continue,
                             Err(error) => {
-                                eprintln!(
-                                    "siphon-sigtran: ERROR: an originating dialogue handler panicked: {error}"
+                                tracing::error!(
+                                    target: "siphon_sigtran",
+                                    error = %error,
+                                    "originating dialogue handler panicked"
                                 );
                                 continue;
                             }
                         };
                         let Some(via) = resolve_egress(&router, &tenant, dpc) else {
-                            eprintln!(
-                                "siphon-sigtran: originated dialogue to dpc {dpc} has no MTP3 route, dropped"
+                            tracing::warn!(
+                                target: "siphon_sigtran",
+                                dpc = dpc,
+                                "originated dialogue has no MTP3 route, dropped"
                             );
                             continue;
                         };
@@ -747,15 +761,14 @@ impl Endpoint {
             .unwrap_or_else(|e| e.into_inner())
             .event(Instant::now());
         if let Some(left_out) = line {
-            let more = if left_out > 0 {
-                format!(" ({left_out} more refused here since the last line)")
-            } else {
-                String::new()
-            };
-            eprintln!(
-                "siphon-sigtran: refused an association from {from} on {} ({}): {detail}{more}",
-                self.local,
-                reason.label()
+            tracing::warn!(
+                target: "siphon_sigtran",
+                remote = %from,
+                local = %self.local,
+                reason = reason.label(),
+                detail = %detail,
+                suppressed_refusals = left_out,
+                "refused an association"
             );
         }
         // An abort that cannot be sent leaves the close of the socket, which
@@ -791,9 +804,11 @@ async fn accept_loop(
                     // could not be taken (no descriptor left, a peer that
                     // was gone already) says nothing about the next.
                     if failures.event(Instant::now()).is_some() {
-                        eprintln!(
-                            "siphon-sigtran: accept on {} failed: {error}",
-                            endpoint.local
+                        tracing::error!(
+                            target: "siphon_sigtran",
+                            local = %endpoint.local,
+                            error = %error,
+                            "accept failed"
                         );
                     }
                     tokio::select! {
@@ -880,9 +895,12 @@ async fn admit(
     // Not an egress by being accepted: the adaptation layer makes it one.
     ctx.registry.quiesce(slot);
     slot.set_sender(assoc.clone());
-    eprintln!(
-        "siphon-sigtran: association `{}` accepted from {presented:?} on {}",
-        slot.id, endpoint.local
+    tracing::info!(
+        target: "siphon_sigtran",
+        association = %slot.id,
+        peer = ?presented,
+        local = %endpoint.local,
+        "association accepted"
     );
     match slot.adaptation {
         Adaptation::M3ua => m3ua::run_sg(assoc, slot.clone(), ctx, shutdown).await,
@@ -896,9 +914,12 @@ async fn admit(
 /// received message is never dropped without both.
 pub(crate) fn discard(reason: metrics::RxDiscard, assoc: &str, detail: impl std::fmt::Display) {
     metrics::rx_discard(reason);
-    eprintln!(
-        "siphon-sigtran: dropped a message received on `{assoc}` ({}): {detail}",
-        reason.label()
+    tracing::warn!(
+        target: "siphon_sigtran",
+        association = %assoc,
+        reason = reason.label(),
+        detail = %detail,
+        "dropped a received message"
     );
 }
 
@@ -959,9 +980,10 @@ async fn send_sweep_abort(
     } else if let Some(via) = resolve_egress(router, tenant, msu.dpc) {
         forward::send_via(&via, msu, registry).await;
     } else {
-        eprintln!(
-            "siphon-sigtran: swept dialogue abort to dpc {} has no egress association, dropped",
-            msu.dpc
+        tracing::warn!(
+            target: "siphon_sigtran",
+            dpc = msu.dpc,
+            "swept dialogue abort has no egress association, dropped"
         );
     }
 }
@@ -970,11 +992,19 @@ async fn send_sweep_abort(
 /// (the ingress association of the request), framing it for that adaptation.
 async fn send_reply(registry: &Registry, assoc_id: &str, msu: &Msu) {
     let Some(slot) = registry.slot(assoc_id) else {
-        eprintln!("siphon-sigtran: dialogue reply for unknown association `{assoc_id}`");
+        tracing::warn!(
+            target: "siphon_sigtran",
+            association = %assoc_id,
+            "dialogue reply for unknown association"
+        );
         return;
     };
     let Some(sender) = slot.sender() else {
-        eprintln!("siphon-sigtran: dialogue reply but `{assoc_id}` has no live sender");
+        tracing::warn!(
+            target: "siphon_sigtran",
+            association = %assoc_id,
+            "dialogue reply has no live sender"
+        );
         return;
     };
     let (bytes, stream, ppid) = match slot.adaptation {
@@ -994,14 +1024,23 @@ async fn send_reply(registry: &Registry, assoc_id: &str, msu: &Msu) {
             match framing::wrap_sua(msu, rc) {
                 Ok(b) => (b, 1u16, 4u32),
                 Err(e) => {
-                    eprintln!("siphon-sigtran: dialogue reply sua framing failed: {e}");
+                    tracing::error!(
+                        target: "siphon_sigtran",
+                        error = %e,
+                        "sua: dialogue reply framing failed"
+                    );
                     return;
                 }
             }
         }
     };
     if let Err(e) = sender.send(&bytes, stream, ppid).await {
-        eprintln!("siphon-sigtran: dialogue reply send on `{assoc_id}` failed: {e}");
+        tracing::error!(
+            target: "siphon_sigtran",
+            association = %assoc_id,
+            error = %e,
+            "dialogue reply send failed"
+        );
     } else {
         metrics::msu(metrics::Dir::Tx, msu.si);
     }
@@ -1141,13 +1180,12 @@ async fn dial_association(dialled: Dialled, ctx: TaskCtx, mut shutdown: watch::R
             match action {
                 dial::Action::Log(line) => match line {
                     dial::Line::Established { failed } => {
-                        let after = if failed > 0 {
-                            format!(" after {failed} attempt(s) that failed")
-                        } else {
-                            String::new()
-                        };
-                        eprintln!(
-                            "siphon-sigtran: association `{id}` is established with {peer:?}{after}"
+                        tracing::info!(
+                            target: "siphon_sigtran",
+                            association = %id,
+                            peer = ?peer,
+                            failed_attempts = failed,
+                            "association is established"
                         );
                     }
                     dial::Line::Failing {
@@ -1155,29 +1193,39 @@ async fn dial_association(dialled: Dialled, ctx: TaskCtx, mut shutdown: watch::R
                         quiet,
                         next,
                     } => {
-                        let more = if quiet > 0 {
-                            format!(" ({quiet} more attempt(s) failed since the last line)")
-                        } else {
-                            String::new()
-                        };
-                        eprintln!(
-                            "siphon-sigtran: association `{id}`: dialling {peer:?} failed ({}): {error}; \
-                             the next attempt is in {next:?}{more}",
-                            reason.label()
+                        tracing::warn!(
+                            target: "siphon_sigtran",
+                            association = %id,
+                            peer = ?peer,
+                            reason = reason.label(),
+                            error = %error,
+                            retry_after = ?next,
+                            suppressed_failures = quiet,
+                            "dialling failed; another attempt is scheduled"
                         );
                     }
-                    dial::Line::Lost { up, next } => eprintln!(
-                        "siphon-sigtran: association `{id}` ended after {up:?}; it is dialled again in {next:?}"
-                    ),
+                    dial::Line::Lost { up, next } => {
+                        tracing::warn!(
+                            target: "siphon_sigtran",
+                            association = %id,
+                            uptime = ?up,
+                            retry_after = ?next,
+                            "association ended; it will be dialled again"
+                        )
+                    }
                 },
                 dial::Action::Connect => {
                     metrics::set_dial_backoff(&id, Duration::ZERO);
                     metrics::dial_attempt(&id);
                     let connect = async {
-                        let addresses = dns::resolve(resolver.as_ref(), &peer, port).await
+                        let addresses = dns::resolve(resolver.as_ref(), &peer, port)
+                            .await
                             .map_err(async_sctp::SctpError::Io)?;
                         if addresses.is_empty() {
-                            return Err(async_sctp::SctpError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "DNS returned no addresses")));
+                            return Err(async_sctp::SctpError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "DNS returned no addresses",
+                            )));
                         }
                         SctpAssociation::connect_from(&local, &addresses, &sctp).await
                     };
@@ -1235,9 +1283,10 @@ async fn serve_dialled(
 ) {
     let Some(occupancy) = slot.occupy(&association) else {
         // Only this task dials the association: it cannot have one already.
-        eprintln!(
-            "siphon-sigtran: association `{}` has an association already, the new one is closed",
-            slot.id
+        tracing::warn!(
+            target: "siphon_sigtran",
+            association = %slot.id,
+            "association already exists, the new one is closed"
         );
         return;
     };

@@ -38,7 +38,7 @@
 //!
 //! Each refusal is counted in
 //! `sigtran_admission_refused_total{reason,action}` (`action` is `returned`,
-//! `discarded` or `aborted`) and logged on stderr.
+//! `discarded` or `aborted`) and logged at warn level.
 //!
 //! # Example
 //!

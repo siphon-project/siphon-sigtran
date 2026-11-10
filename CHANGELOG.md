@@ -7,6 +7,14 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Logging goes through `tracing` (target `siphon_sigtran`, structured fields,
+  error/warn/info/debug levels) instead of plain lines on stderr, the same as
+  the other siphon extensions. Under siphon the lines now carry the host's
+  timestamps and format, follow `RUST_LOG`, and reach the log tail. Filter with
+  `RUST_LOG=siphon_sigtran=debug` and the like.
+
 ## [7.0.0] — 2026-11-09
 
 ### Added

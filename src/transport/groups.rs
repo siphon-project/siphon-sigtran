@@ -57,9 +57,11 @@ pub(super) async fn run(
         let addresses: BTreeSet<_> = match answer {
             Ok(Ok(addresses)) => addresses.into_iter().collect(),
             error => {
-                eprintln!(
-                    "siphon-sigtran: DNS refresh for `{}` failed: {error:?}",
-                    a.id
+                tracing::error!(
+                    target: "siphon_sigtran",
+                    association = %a.id,
+                    error = ?error,
+                    "DNS refresh failed"
                 );
                 continue;
             }
@@ -93,7 +95,11 @@ pub(super) async fn run(
             let local = match local_addrs(&a) {
                 Ok(local) => local,
                 Err(error) => {
-                    eprintln!("siphon-sigtran: local addresses: {error}");
+                    tracing::error!(
+                        target: "siphon_sigtran",
+                        error = %error,
+                        "local addresses could not be resolved"
+                    );
                     break;
                 }
             };
