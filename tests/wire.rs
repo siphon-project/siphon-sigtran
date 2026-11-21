@@ -3501,3 +3501,158 @@ async fn wire_instance_group_routes_a_dtid_to_its_instance_and_shares_begins() {
     }
     handle.shutdown();
 }
+
+/// Holds a termination lane while awaiting a dialogue opened through the
+/// transport's origination seam, just as an async script turn does.
+struct AwaitOrigin {
+    sender: tokio::sync::mpsc::UnboundedSender<Origination>,
+}
+impl TerminationHandler for AwaitOrigin {
+    fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sender
+            .send(Origination {
+                req: OutgoingBegin {
+                    application_context: AC_SRI_SM.to_vec(),
+                    called: SccpAddress::with_ssn(SubsystemNumber::Hlr, Some(2000)),
+                    calling: SccpAddress::with_ssn(SubsystemNumber::Hlr, Some(1000)),
+                    opc: 1000,
+                    dpc: 2000,
+                    ni: 0,
+                    sls: 0,
+                    ingress_assoc: "hlr".into(),
+                },
+                handler: Arc::new(AwaitedOrigin { resolved: tx }),
+            })
+            .unwrap();
+        // Bound the blocking wait as well as the wire wait so a regression
+        // cannot strand a blocking thread during runtime shutdown.
+        if rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+            WireHlr.on_begin(dlg, op);
+        }
+    }
+}
+struct AwaitedOrigin {
+    resolved: std::sync::mpsc::Sender<bool>,
+}
+impl TerminationHandler for AwaitedOrigin {
+    fn rust_only_origination(&self) -> bool {
+        true
+    }
+    fn on_start(&self, dlg: &mut Dialogue) {
+        dlg.invoke_with(
+            gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+            Some(sri_sm_arg("15550101")),
+            siphon_sigtran::dialogue::OperationClass::One,
+            Some(Duration::from_millis(300)),
+        )
+        .unwrap();
+        dlg.send().unwrap();
+    }
+    fn on_continue(&self, dlg: &mut Dialogue, peer: &PeerTurn) {
+        self.resolved.send(false).unwrap();
+        if !peer.is_end {
+            dlg.end().unwrap();
+        }
+    }
+    fn on_invoke_timeout(&self, dlg: &mut Dialogue, _: &siphon_sigtran::dialogue::InvokeTimeout) {
+        self.resolved.send(true).unwrap();
+        dlg.abort().unwrap();
+    }
+}
+
+fn old_lane(tid: &[u8]) -> u64 {
+    tid.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    }) % 32
+}
+
+async fn await_origin_on_colliding_lane(answer: bool) {
+    let Some(mut handle) = start_node(ORIGINATION_NODE, "wire_await_origin").await else {
+        return;
+    };
+    let mut engine = DialogueEngine::new(Tcap::default());
+    engine.register(
+        6,
+        gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+        Arc::new(AwaitOrigin {
+            sender: handle.origin_sender(),
+        }),
+    );
+    let engine = Arc::new(engine);
+    handle.serve_dialogues(engine.clone());
+    handle.serve_originations(engine.clone());
+    let mut peer = AspPeer::connect(handle.bound_addr("hlr").unwrap(), 100)
+        .await
+        .expect("SCTP peer connects");
+    assert!(
+        wait_route(
+            handle.router(),
+            2000,
+            &Destination::ApplicationServer("hlr".into())
+        )
+        .await
+    );
+
+    // A fresh engine allocates responder TID 1, then originator TID 2.
+    // Find a peer OTID sharing the latter's original FNV-1a lane.
+    let peer_tid = (0..256u32)
+        .map(u32::to_be_bytes)
+        .find(|tid| old_lane(tid) == old_lane(&0x8000_0002u32.to_be_bytes()))
+        .unwrap();
+    let begin = tcap_begin_tid(
+        &peer_tid,
+        Some(aarq(&AC_SRI_SM)),
+        vec![Component::Invoke(Invoke {
+            invoke_id: 1,
+            linked_id: None,
+            operation_code: OperationCode::Local(
+                gsm_map::types::op_codes::SEND_ROUTING_INFO_FOR_SM,
+            ),
+            parameter: Some(Any::new(sri_sm_arg("15550101"))),
+        })],
+    );
+    peer.send_in(&m3ua_sccp(
+        &sccp_udt_to_ssn(SubsystemNumber::Hlr, &begin),
+        2000,
+        1000,
+        0,
+    ))
+    .await;
+    let frame = peer.recv_out().await.expect("originated Begin goes out");
+    let tid = otid_of_begin(&frame).expect("originated OTID");
+    assert_eq!(
+        old_lane(&tid),
+        old_lane(&peer_tid),
+        "collision must be deterministic"
+    );
+    if answer {
+        peer.send_in(&m3ua_sccp(&sri_sm_reply_end(&tid), 2000, 1000, 0))
+            .await;
+    }
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = peer.recv_out().await.expect("handler reply");
+            if decode_sri_sm_reply(&frame).is_some() {
+                break;
+            }
+        }
+    })
+    .await;
+    peer.close();
+    handle.shutdown();
+    assert!(
+        completed.is_ok(),
+        "awaiting handler never replied on the colliding lane (answer={answer})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_awaited_origination_answer_escapes_handler_lane() {
+    await_origin_on_colliding_lane(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wire_awaited_origination_timer_escapes_handler_lane() {
+    await_origin_on_colliding_lane(false).await;
+}

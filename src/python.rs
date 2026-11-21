@@ -1988,6 +1988,9 @@ impl OriginationHandler {
 }
 
 impl TerminationHandler for OriginationHandler {
+    fn rust_only_origination(&self) -> bool {
+        true
+    }
     fn on_start(&self, dialogue: &mut CoreDialogue) {
         // A failure is logged by the engine with the dialogue's identifiers and
         // comes back to the awaiting caller through `on_closed`.

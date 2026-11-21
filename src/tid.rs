@@ -17,7 +17,9 @@
 //!
 //! The marker bit is always set (it keeps an id of ours apart from a small
 //! peer OTID). With `bits == 0` there is no instance field and the layout is
-//! the marker followed by a 31-bit counter.
+//! the marker followed by a 31-bit counter. The dialogue engine reserves bit
+//! 14 of that counter for Rust-only originations, leaving 30 - `bits` counter
+//! bits per class. Instance extraction is unchanged.
 
 /// The widest instance field: it leaves a 15-bit counter per instance.
 pub const MAX_INSTANCE_BITS: u8 = 16;
@@ -33,6 +35,30 @@ pub fn compose(bits: u8, instance: u32, counter: u32) -> u32 {
     let counter_mask = (1u32 << counter_bits) - 1;
     let instance_mask = (1u32 << bits) - 1;
     MARKER | ((instance & instance_mask) << counter_bits) | (counter & counter_mask)
+}
+
+// Bit 14 is in the counter even with the widest (16-bit) instance field.
+// Reserving it leaves 30 - instance_bits counter bits for each lane class.
+const ORIGINATION: u32 = 1 << 14;
+
+/// Compose an engine TID, reserving bit 14 for Rust-only originations. The
+/// instance layout is unchanged. Ordinary counters skip the reserved bit.
+pub(crate) fn compose_dialogue(bits: u8, instance: u32, counter: u32, origination: bool) -> u32 {
+    let counter = (counter & (ORIGINATION - 1)) | ((counter & !(ORIGINATION - 1)) << 1);
+    compose(
+        bits,
+        instance,
+        counter | if origination { ORIGINATION } else { 0 },
+    )
+}
+
+/// Recognise the reserved class without consulting live dialogue state, so
+/// late answers use the same lanes as answers to a live dialogue.
+pub(crate) fn is_origination(tid: &[u8]) -> bool {
+    let Ok(raw) = <[u8; 4]>::try_from(tid) else {
+        return false;
+    };
+    u32::from_be_bytes(raw) & (MARKER | ORIGINATION) == MARKER | ORIGINATION
 }
 
 /// The instance index carried in a transaction id, or `None` when the id is not
@@ -51,6 +77,26 @@ pub fn instance_of(tid: &[u8], bits: u8) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialogue_counters_reserve_the_lane_bit_and_preserve_instances() {
+        for bits in 0..=MAX_INSTANCE_BITS {
+            let instance = (1u32 << bits) - 1;
+            for counter in [0, 1, 0x3fff, 0x4000, 0x7fff, u32::MAX] {
+                for originated in [false, true] {
+                    let tid = compose_dialogue(bits, instance, counter, originated).to_be_bytes();
+                    assert_eq!(is_origination(&tid), originated);
+                    assert_eq!(instance_of(&tid, bits), Some(instance));
+                }
+            }
+            assert_ne!(
+                compose_dialogue(bits, instance, 0x3fff, false),
+                compose_dialogue(bits, instance, 0x4000, false)
+            );
+        }
+        assert!(!is_origination(&[0x40, 0, 0x40, 0]));
+        assert!(!is_origination(&[0x80, 0x40, 0]));
+    }
 
     #[test]
     fn without_an_instance_field_the_id_is_the_marker_and_the_counter() {

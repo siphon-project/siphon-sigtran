@@ -441,6 +441,14 @@ pub struct DialogueClosed {
 /// The Python addon layer implements this over the `gsm_map` / `gsm_cap`
 /// decorators; the crate's tests exercise it with small in-Rust handlers.
 pub trait TerminationHandler: Send + Sync {
+    /// Whether dialogues opened with this handler use the Rust-only origination
+    /// lanes. Opt in only for short callbacks that never call or attach to
+    /// Python, and never wait for another dialogue. Ignored for inbound Begins.
+    /// Script callbacks, including loopback origination callbacks, keep `false`.
+    fn rust_only_origination(&self) -> bool {
+        false
+    }
+
     /// The first operation opened a responder dialogue, in a Begin or in a
     /// Continue after a dialogue handshake. Drive the answer: `reply` + `end` for a single response, or `invoke` + `send` to
     /// hold it open for a follow-up leg. A responder must override this; the
@@ -1069,16 +1077,17 @@ impl DialogueEngine {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn alloc_tid(&self) -> Tid {
+    fn alloc_tid(&self, origination: bool) -> Tid {
         let mut inner = self.lock();
         inner.tid_counter = inner.tid_counter.wrapping_add(1);
         // A 4-octet id. The high bit marks it as ours so it never collides with
         // a small peer OTID we might store under the same map; the next
         // `instance_bits` bits carry this instance's index (see `crate::tid`).
-        crate::tid::compose(
+        crate::tid::compose_dialogue(
             self.config.instance_bits,
             self.config.instance,
             inner.tid_counter,
+            origination,
         )
         .to_be_bytes()
         .to_vec()
@@ -1290,7 +1299,7 @@ impl DialogueEngine {
             }
         };
 
-        let our_tid = self.alloc_tid();
+        let our_tid = self.alloc_tid(false);
         let mut dlg = Dialogue::new(
             Role::Responder,
             our_tid,
@@ -1526,7 +1535,7 @@ impl DialogueEngine {
         req: OutgoingBegin,
         handler: Arc<dyn TerminationHandler>,
     ) -> Result<(Tid, Vec<Msu>), DialogueError> {
-        let our_tid = self.alloc_tid();
+        let our_tid = self.alloc_tid(handler.rust_only_origination());
         let addressing = Addressing {
             out_called: req.called,
             out_calling: req.calling,
@@ -2081,7 +2090,8 @@ fn xudt_as_unitdata(xudt: ExtendedUnitData) -> UnitData {
 }
 
 /// The lane of [`crate::transport::TransportHandle::serve_dialogues`] an inbound
-/// MSU belongs on: a hash of the transaction ID of its dialogue at this node.
+/// MSU belongs on: 0..32 for script handlers, 32..36 for Rust-only originations.
+/// Begins always use the script lanes, regardless of the peer's chosen OTID.
 ///
 /// A Begin opens a dialogue under the peer's OTID; everything after it (a
 /// Continue, End or Abort for a dialogue this node answered or opened) names
@@ -2100,11 +2110,25 @@ pub fn dialogue_lane(inbound: &Msu) -> u64 {
         Ok(SccpMessage::Xudt(xudt)) => xudt.data,
         _ => return 0,
     };
-    let tid: Vec<u8> = match tcap::decode(&data) {
-        Ok(TcapMessage::Begin(begin)) => begin.otid.to_vec(),
-        Ok(TcapMessage::Continue(cont)) => cont.dtid.to_vec(),
-        Ok(TcapMessage::End(end)) => end.dtid.to_vec(),
-        Ok(TcapMessage::Abort(abort)) => abort.dtid.to_vec(),
+    let tid: Vec<u8> = match tcap::decode_detailed(&data) {
+        Decoded::Complete(TcapMessage::Begin(begin)) => {
+            return hash_tid(&begin.otid) % DIALOGUE_LANES as u64;
+        }
+        Decoded::Complete(TcapMessage::Continue(cont)) => cont.dtid.to_vec(),
+        Decoded::Complete(TcapMessage::End(end)) => end.dtid.to_vec(),
+        Decoded::Complete(TcapMessage::Abort(abort)) => abort.dtid.to_vec(),
+        Decoded::Problem(problem) => {
+            if problem.message_type == Some(tcap::transaction::MessageType::Begin) {
+                return problem
+                    .otid
+                    .as_ref()
+                    .map_or(0, |tid| hash_tid(tid) % DIALOGUE_LANES as u64);
+            }
+            match problem.dtid {
+                Some(tid) => tid.to_vec(),
+                None => return 0,
+            }
+        }
         _ => return 0,
     };
     tid_lane(&tid)
@@ -2114,8 +2138,21 @@ pub fn dialogue_lane(inbound: &Msu) -> u64 {
 /// the destination transaction id of every message the peer sends after the
 /// Begin. [`dialogue_lane`] of those messages is the same, so the timers of a
 /// dialogue (see [`DialogueEngine::claim_expired`]) run on the lane its
-/// messages arrive on, one after the other.
+/// messages arrive on, one after the other. Returns a lane index, not a hash.
 pub fn tid_lane(tid: &[u8]) -> u64 {
+    if crate::tid::is_origination(tid) {
+        DIALOGUE_LANES as u64 + hash_tid(tid) % ORIGINATION_LANES as u64
+    } else {
+        hash_tid(tid) % DIALOGUE_LANES as u64
+    }
+}
+
+/// Lanes that may run script handlers.
+pub(crate) const DIALOGUE_LANES: usize = 32;
+/// Additional lanes reserved for Rust-only origination callbacks.
+pub(crate) const ORIGINATION_LANES: usize = 4;
+
+fn hash_tid(tid: &[u8]) -> u64 {
     // FNV-1a: stable, and good enough to spread transaction IDs.
     tid.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -2573,6 +2610,76 @@ mod tests {
                 .encode()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn termination_and_origination_tid_lanes_are_disjoint() {
+        for bits in 0..=crate::tid::MAX_INSTANCE_BITS {
+            for counter in [1, 2, 0x3fff, 0x4000, 0x7fff, u32::MAX] {
+                let engine = DialogueEngine::new(Tcap {
+                    instance_bits: bits,
+                    instance: 0,
+                    ..Tcap::default()
+                });
+                engine.lock().tid_counter = counter.wrapping_sub(1);
+                let ordinary = engine.alloc_tid(false);
+                engine.lock().tid_counter = counter.wrapping_sub(1);
+                let originated = engine.alloc_tid(true);
+                assert!(tid_lane(&ordinary) < 32);
+                assert!((32..36).contains(&tid_lane(&originated)));
+            }
+        }
+    }
+
+    #[test]
+    fn peer_begin_cannot_select_a_rust_only_lane() {
+        let tid = crate::tid::compose_dialogue(0, 0, 2, true).to_be_bytes();
+        let begin = carried(TcapMessage::Begin(Begin {
+            otid: tid.to_vec().into(),
+            dialogue_portion: None,
+            components: None,
+        }));
+        assert!(dialogue_lane(&begin) < DIALOGUE_LANES as u64);
+    }
+
+    #[test]
+    fn damaged_origination_answer_keeps_its_lane() {
+        let tid = crate::tid::compose_dialogue(0, 0, 2, true).to_be_bytes();
+        // An End with a readable DTID and an invalid component portion.
+        let mut data = vec![0x64, 10, 0x49, 4];
+        data.extend(tid);
+        data.extend([0x6c, 2, 0xff, 0]);
+        let frame = inbound(UnitData::new(hlr(), msc(), data).encode().unwrap());
+        assert_eq!(dialogue_lane(&frame), tid_lane(&tid));
+    }
+
+    #[test]
+    fn unknown_origination_tid_keeps_q774_handling() {
+        let tid = crate::tid::compose_dialogue(0, 0, 2, true).to_be_bytes();
+        let engine = DialogueEngine::new(Tcap::default());
+        let cont = carried(TcapMessage::Continue(TcapContinue {
+            otid: OTID.to_vec().into(),
+            dtid: tid.to_vec().into(),
+            dialogue_portion: None,
+            components: None,
+        }));
+        assert_eq!(dialogue_lane(&cont), tid_lane(&tid));
+        let frames = engine.deliver(&cont, "peer");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            refusal(&frames[0]),
+            (
+                "udt",
+                OTID.to_vec(),
+                Some(PAbortCause::UNRECOGNIZED_TRANSACTION_ID)
+            )
+        );
+        let end = carried(TcapMessage::End(End {
+            dtid: tid.to_vec().into(),
+            dialogue_portion: None,
+            components: None,
+        }));
+        assert!(engine.deliver(&end, "peer").is_empty());
     }
 
     /// The messages of one dialogue that can be in flight together land on one
