@@ -610,6 +610,16 @@ impl PyIncomingOp {
         self.decode_mo_field(py, MoField::Ui)
     }
 
+    /// Whether a MO-ForwardSM or MT-ForwardSM says more messages follow in
+    /// this dialogue (moreMessagesToSend, of a version 1 or 2 forwardSM and
+    /// of MT-ForwardSM): the handler answers this part with a Continue and
+    /// gets the next as a `PeerTurn`. False for another operation; raises
+    /// `MistypedParameter` as `sm_rp_oa` does.
+    #[getter]
+    fn more_messages_to_send(&self) -> PyResult<bool> {
+        forward_sm_more(self.operation_code, self.argument.as_deref())
+    }
+
     /// The `calledPartyNumber` of a CAMEL initialDP: the dialled number of a
     /// forwarded or terminating call. `None` when the argument carries none
     /// (a mobile-originated call carries `called_party_bcd_number` instead), or
@@ -1188,6 +1198,22 @@ impl PyPeerTurn {
         self.comps.iter().find(|c| c.kind == kind)
     }
 
+    fn forward_sm<'py>(
+        &self,
+        py: Python<'py>,
+        field: MoField,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let Some(invoke) = self.first_of("invoke") else {
+            return Ok(None);
+        };
+        forward_sm_field(
+            py,
+            invoke.operation_code.unwrap_or(-1),
+            invoke.parameter.as_deref(),
+            field,
+        )
+    }
+
     fn first_reject(&self) -> Option<&PeerComp> {
         self.first_of("reject")
             .or_else(|| self.first_of("local-reject"))
@@ -1372,6 +1398,40 @@ impl PyPeerTurn {
             .map(|p| PyBytes::new(py, p))
     }
 
+    /// The sm-RP-OA of the first Invoke of this turn when it is a further
+    /// MO-ForwardSM or MT-ForwardSM of the dialogue (the next part of a
+    /// concatenated message); `None` otherwise. Raises `MistypedParameter`
+    /// when the argument does not decode. Answer it with
+    /// `dlg.reply_to(turn.invoke_id, ...)`.
+    #[getter]
+    fn sm_rp_oa<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        self.forward_sm(py, MoField::Oa)
+    }
+
+    /// The sm-RP-DA of such an Invoke. As `sm_rp_oa`.
+    #[getter]
+    fn sm_rp_da<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        self.forward_sm(py, MoField::Da)
+    }
+
+    /// The sm-RP-UI of such an Invoke. As `sm_rp_oa`.
+    #[getter]
+    fn sm_rp_ui<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        self.forward_sm(py, MoField::Ui)
+    }
+
+    /// Whether such an Invoke says more messages follow. As `sm_rp_oa`.
+    #[getter]
+    fn more_messages_to_send(&self) -> PyResult<bool> {
+        let Some(invoke) = self.first_of("invoke") else {
+            return Ok(false);
+        };
+        forward_sm_more(
+            invoke.operation_code.unwrap_or(-1),
+            invoke.parameter.as_deref(),
+        )
+    }
+
     /// The raw BER argument of the first `Invoke` the peer sent, if present.
     #[getter]
     fn argument<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
@@ -1439,57 +1499,108 @@ impl PyIncomingOp {
     }
 
     /// One field of a MO-ForwardSM (46) or MT-ForwardSM (44) argument. `None`
-    /// for any other operation. The decode is `gsm_map::decode`: an argument
-    /// with a member that cannot be read, or with octets after it, is a
-    /// mistyped parameter and raises, where it used to read as "no such field";
-    /// a member a later release added after the extension marker is skipped
-    /// (TS 29.002 17.1.4).
+    /// for any other operation. See [`forward_sm_field`].
     fn decode_mo_field<'py>(
         &self,
         py: Python<'py>,
         field: MoField,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        use gsm_map::operations::{mo_forward_sm::MoForwardSmArg, mt_forward_sm::MtForwardSmArg};
-        use gsm_map::{SmRpDa, SmRpOa};
-
-        let mt = match self.operation_code {
-            c if c == gsm_map::op_codes::MO_FORWARD_SM => false,
-            c if c == gsm_map::op_codes::MT_FORWARD_SM => true,
-            _ => return Ok(None),
-        };
-        let what = if mt {
-            "the mt-forwardSM argument"
-        } else {
-            "the mo-forwardSM argument"
-        };
-        let bytes = self
-            .argument
-            .as_ref()
-            .ok_or_else(|| mistyped(what, "the Invoke carries no argument"))?;
-        let (da, oa, ui): (SmRpDa, SmRpOa, OctetString) = if mt {
-            let a: MtForwardSmArg = gsm_map::decode(bytes).map_err(|e| mistyped(what, e))?;
-            (a.sm_rp_da, a.sm_rp_oa, a.sm_rp_ui)
-        } else {
-            let a: MoForwardSmArg = gsm_map::decode(bytes).map_err(|e| mistyped(what, e))?;
-            (a.sm_rp_da, a.sm_rp_oa, a.sm_rp_ui)
-        };
-
-        Ok(match field {
-            MoField::Ui => Some(PyBytes::new(py, ui.as_ref())),
-            MoField::Da => match da {
-                SmRpDa::Imsi(b) | SmRpDa::Lmsi(b) | SmRpDa::ServiceCentreAddressDa(b) => {
-                    Some(PyBytes::new(py, b.as_ref()))
-                }
-                SmRpDa::NoSmRpDa(()) => None,
-            },
-            MoField::Oa => match oa {
-                SmRpOa::MsIsdn(b) | SmRpOa::ServiceCentreAddressOa(b) => {
-                    Some(PyBytes::new(py, b.as_ref()))
-                }
-                SmRpOa::NoSmRpOa(()) => None,
-            },
-        })
+        forward_sm_field(py, self.operation_code, self.argument.as_deref(), field)
     }
+}
+
+/// The members of a MO-ForwardSM (46) or MT-ForwardSM (44) argument:
+/// sm-RP-DA, sm-RP-OA, sm-RP-UI and whether more messages follow in the same
+/// dialogue. `None` for any other operation.
+///
+/// Operation 46 is mo-ForwardSM in version 3 and forwardSM in versions 1 and
+/// 2, whose argument is shaped as the version 3 MT-ForwardSM one: with
+/// moreMessagesToSend, which an MSC sets on every part of a concatenated
+/// message but the last and sends the next part in a Continue of the same
+/// dialogue (TS 29.002 clause 12.2, and 12.9 of version 2). An argument of 46
+/// that carries that member is read in the forwardSM form, any other in the
+/// version 3 one, and failing that in the forwardSM one. The decode is
+/// `gsm_map::decode`: a member that cannot be read, or octets after the
+/// argument, are a mistyped parameter; a member a later release added after
+/// the extension marker is skipped (TS 29.002 17.1.4).
+type ForwardSmFields = (gsm_map::SmRpDa, gsm_map::SmRpOa, OctetString, bool);
+
+fn forward_sm_fields(
+    operation_code: i64,
+    argument: Option<&[u8]>,
+) -> PyResult<Option<ForwardSmFields>> {
+    use gsm_map::operations::{mo_forward_sm::MoForwardSmArg, mt_forward_sm::MtForwardSmArg};
+    let mt = match operation_code {
+        c if c == gsm_map::op_codes::MO_FORWARD_SM => false,
+        c if c == gsm_map::op_codes::MT_FORWARD_SM => true,
+        _ => return Ok(None),
+    };
+    let what = if mt {
+        "the mt-forwardSM argument"
+    } else {
+        "the mo-forwardSM argument"
+    };
+    let bytes = argument.ok_or_else(|| mistyped(what, "the Invoke carries no argument"))?;
+    let forward = |bytes: &[u8]| {
+        gsm_map::decode::<MtForwardSmArg>(bytes).map(|a| {
+            (
+                a.sm_rp_da,
+                a.sm_rp_oa,
+                a.sm_rp_ui,
+                a.more_messages_to_send.is_some(),
+            )
+        })
+    };
+    let fields = if mt {
+        forward(bytes).map_err(|e| mistyped(what, e))?
+    } else {
+        // A version 3 reading skips a NULL after sm-RP-UI as an extension
+        // addition (17.1.4), so the forwardSM shape is read first: only there
+        // is that NULL a member, moreMessagesToSend, and no member of the
+        // version 3 argument has its form.
+        match (forward(bytes), gsm_map::decode::<MoForwardSmArg>(bytes)) {
+            (Ok(fields @ (_, _, _, true)), _) => fields,
+            (_, Ok(a)) => (a.sm_rp_da, a.sm_rp_oa, a.sm_rp_ui, false),
+            (Ok(fields), Err(_)) => fields,
+            // The version 3 error is the one reported when neither reads.
+            (Err(_), Err(v3)) => return Err(mistyped(what, v3)),
+        }
+    };
+    Ok(Some(fields))
+}
+
+/// One member of [`forward_sm_fields`] as the getters give it.
+fn forward_sm_field<'py>(
+    py: Python<'py>,
+    operation_code: i64,
+    argument: Option<&[u8]>,
+    field: MoField,
+) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    use gsm_map::{SmRpDa, SmRpOa};
+    let Some((da, oa, ui, _more)) = forward_sm_fields(operation_code, argument)? else {
+        return Ok(None);
+    };
+    Ok(match field {
+        MoField::Ui => Some(PyBytes::new(py, ui.as_ref())),
+        MoField::Da => match da {
+            SmRpDa::Imsi(b) | SmRpDa::Lmsi(b) | SmRpDa::ServiceCentreAddressDa(b) => {
+                Some(PyBytes::new(py, b.as_ref()))
+            }
+            SmRpDa::NoSmRpDa(()) => None,
+        },
+        MoField::Oa => match oa {
+            SmRpOa::MsIsdn(b) | SmRpOa::ServiceCentreAddressOa(b) => {
+                Some(PyBytes::new(py, b.as_ref()))
+            }
+            SmRpOa::NoSmRpOa(()) => None,
+        },
+    })
+}
+
+/// Whether a MO-ForwardSM or MT-ForwardSM argument says more messages follow
+/// in the dialogue; false for any other operation.
+fn forward_sm_more(operation_code: i64, argument: Option<&[u8]>) -> PyResult<bool> {
+    Ok(forward_sm_fields(operation_code, argument)?.is_some_and(|(_, _, _, more)| more))
 }
 
 // ── The dialogue handle (command buffer) ─────────────────────────────────────

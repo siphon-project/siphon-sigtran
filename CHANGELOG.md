@@ -14,6 +14,11 @@ All notable changes are documented here. The format follows
   The first Invoke in a later Continue reaches the normal opening handler;
   idle handshakes use the dialogue timeout. Accepted handshakes are counted in
   `sigtran_dialogue_handshakes_total`.
+- A concatenated short message an MSC sends in one dialogue reaches the
+  handler part by part. `more_messages_to_send` on `IncomingOp` and
+  `PeerTurn`; `PeerTurn.sm_rp_oa`, `sm_rp_da` and `sm_rp_ui` read a further
+  MO-ForwardSM or MT-ForwardSM that arrives in a Continue, answered with
+  `dlg.reply_to(turn.invoke_id, ...)`.
 
 ### Fixed
 
@@ -22,6 +27,9 @@ All notable changes are documented here. The format follows
   originations use reserved transaction ids and four Rust-only lanes for both
   answers and timers, so neither queues behind the waiting script. Terminating
   dialogues and `node.originate` callbacks keep their 32 script lanes.
+- The version 1 and 2 forwardSM (operation 46 with moreMessagesToSend) no
+  longer reads as a version 3 MO-ForwardSM with the flag skipped as an
+  extension.
 
 ## [7.1.0] — 2026-11-10
 
