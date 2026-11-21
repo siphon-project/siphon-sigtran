@@ -16,11 +16,14 @@
 //! `tcap` / `sccp` / `gsm_map` / `gsm_cap` codecs), not a re-encoding of the
 //! request.
 //!
-//! # The three shapes
+//! # Dialogue shapes
 //!
 //! * **Single request/response** (SRI-SM, initialDP): a `Begin(AARQ, Invoke)`
 //!   arrives, the handler replies, the reply is an `End(AARE, ReturnResultLast)`
 //!   echoing the peer's transaction id.
+//! * **Dialogue handshake**: a `Begin(AARQ)` without an Invoke is answered
+//!   with `Continue(AARE)` when termination is registered. The first Invoke
+//!   in a later Continue enters `on_begin` with the original addressing.
 //! * **Held-open, multi-leg** (updateLocation with an insertSubscriberData leg):
 //!   the handler answers a `Begin` with a `Continue(AARE, Invoke)` and keeps the
 //!   dialogue open; the peer's follow-up `Continue`/`End` re-enters the handler
@@ -438,8 +441,8 @@ pub struct DialogueClosed {
 /// The Python addon layer implements this over the `gsm_map` / `gsm_cap`
 /// decorators; the crate's tests exercise it with small in-Rust handlers.
 pub trait TerminationHandler: Send + Sync {
-    /// A `Begin` opened a responder dialogue with this first operation. Drive the
-    /// answer: `reply` + `end` for a single response, or `invoke` + `send` to
+    /// The first operation opened a responder dialogue, in a Begin or in a
+    /// Continue after a dialogue handshake. Drive the answer: `reply` + `end` for a single response, or `invoke` + `send` to
     /// hold it open for a follow-up leg. A responder must override this; the
     /// default answers nothing (which the engine turns into an abort so the peer
     /// is never left hanging). An originating-only handler leaves it defaulted.
@@ -963,7 +966,8 @@ pub struct OutgoingBegin {
 
 /// The stored per-dialogue state between legs.
 struct Record {
-    handler: Arc<dyn TerminationHandler>,
+    /// None until a responder receives its first Invoke.
+    handler: Option<Arc<dyn TerminationHandler>>,
     dialogue: Dialogue,
     ingress_assoc: String,
     last_activity: Instant,
@@ -1129,8 +1133,8 @@ impl DialogueEngine {
         // to no dialogue), it goes back where the message came from.
         let reply_to = Addressing::reverse(&udt, inbound, form);
         match tcap::decode_detailed(&udt.data) {
-            Decoded::Complete(msg) => self.on_message(msg, None, &reply_to, &udt, ingress_assoc),
-            Decoded::Problem(problem) => self.on_problem(*problem, &reply_to, &udt, ingress_assoc),
+            Decoded::Complete(msg) => self.on_message(msg, None, &reply_to, ingress_assoc),
+            Decoded::Problem(problem) => self.on_problem(*problem, &reply_to, ingress_assoc),
         }
     }
 
@@ -1141,11 +1145,10 @@ impl DialogueEngine {
         msg: TcapMessage,
         rejected: Option<Rejected>,
         reply_to: &Addressing,
-        udt: &UnitData,
         ingress_assoc: &str,
     ) -> Vec<Msu> {
         match msg {
-            TcapMessage::Begin(b) => self.on_begin(b, rejected, reply_to, udt, ingress_assoc),
+            TcapMessage::Begin(b) => self.on_begin(b, rejected, reply_to, ingress_assoc),
             TcapMessage::Continue(c) => {
                 let components = c.components.unwrap_or_default();
                 self.on_turn(
@@ -1174,7 +1177,6 @@ impl DialogueEngine {
         &self,
         problem: DecodeProblem,
         reply_to: &Addressing,
-        udt: &UnitData,
         ingress_assoc: &str,
     ) -> Vec<Msu> {
         // A fault in a component: the message stands up to that component.
@@ -1194,9 +1196,7 @@ impl DialogueEngine {
                 reject: problem.reject(),
             };
             return match problem.partial {
-                Some(partial) => {
-                    self.on_message(partial, Some(rejected), reply_to, udt, ingress_assoc)
-                }
+                Some(partial) => self.on_message(partial, Some(rejected), reply_to, ingress_assoc),
                 None => {
                     metrics::tcap_discard(TcapDiscard::Undecodable);
                     Vec::new()
@@ -1238,7 +1238,6 @@ impl DialogueEngine {
         b: Begin,
         rejected: Option<Rejected>,
         reply_to: &Addressing,
-        udt: &UnitData,
         ingress_assoc: &str,
     ) -> Vec<Msu> {
         let peer_tid = b.otid.clone();
@@ -1291,7 +1290,6 @@ impl DialogueEngine {
             }
         };
 
-        let called_ssn = udt.called_party.ssn.map(|s| s.value()).unwrap_or(0);
         let our_tid = self.alloc_tid();
         let mut dlg = Dialogue::new(
             Role::Responder,
@@ -1311,26 +1309,51 @@ impl DialogueEngine {
             components.push(rejected.stage(&mut dlg, false));
         }
 
-        // The dialogue belongs to the handler of its first Invoke.
-        let first = components.iter().position(
-            |c| matches!(c, PeerComponent::Invoke { operation_code, .. } if *operation_code >= 0),
-        );
-        let Some(first) = first else {
+        if first_invoke(&components).is_none() {
             if !dlg.rejects.is_empty() {
-                // Nothing in the Begin could be dispatched, and the component
-                // sub-layer has a Reject to send. With no TC-user to hand the
-                // dialogue to, the engine ends it (Q.774 3.2.2.2, b): "to end
-                // the dialogue using the basic scenario", which "triggers
-                // transmission of the stored Reject component(s)").
+                // With no operation to dispatch, end with the stored Rejects.
                 let _ = dlg.end();
                 return std::mem::take(&mut dlg.out);
             }
-            // A Begin without an Invoke opens nothing a MAP/CAP user serves:
-            // the TC-user side of this engine aborts it.
+            // TS 29.002 clause 15 (dialogue handshake): accept MAP-OPEN before
+            // the first component arrives. The normal flush builds the AARE.
+            if ac.is_some()
+                && !components
+                    .iter()
+                    .any(|c| matches!(c, PeerComponent::Invoke { .. }))
+                && (!self.handlers.is_empty() || !self.fallback_handlers.is_empty())
+            {
+                if dlg.send().is_ok() {
+                    metrics::dialogue_handshake();
+                }
+                return self.finish_turn(dlg, None, ingress_assoc, Turn::Begin, Instant::now());
+            }
+            metrics::abort(AbortSource::Local);
+            let _ = dlg.abort();
+            return std::mem::take(&mut dlg.out);
+        }
+        self.dispatch_opening(dlg, components, ingress_assoc)
+    }
+
+    /// The same opening operation whether carried in Begin or after MAP-OPEN.
+    fn dispatch_opening(
+        &self,
+        mut dlg: Dialogue,
+        mut components: Vec<PeerComponent>,
+        ingress_assoc: &str,
+    ) -> Vec<Msu> {
+        let Some(first) = first_invoke(&components) else {
+            // No local operation can be dispatched, as for an unserved Begin.
             metrics::abort(AbortSource::Local);
             let _ = dlg.abort();
             return std::mem::take(&mut dlg.out);
         };
+        let called_ssn = dlg
+            .addressing
+            .out_calling
+            .ssn
+            .map(|s| s.value())
+            .unwrap_or(0);
         let PeerComponent::Invoke {
             invoke_id,
             operation_code: op,
@@ -1358,15 +1381,21 @@ impl DialogueEngine {
             operation_code: op,
             invoke_id,
             argument,
-            application_context: ac,
+            application_context: (!dlg.ac.is_empty()).then(|| dlg.ac.clone()),
             called_ssn,
-            calling_gt: gt_digits(&udt.calling_party),
-            called_gt: gt_digits(&udt.called_party),
+            calling_gt: gt_digits(&dlg.addressing.out_called),
+            called_gt: gt_digits(&dlg.addressing.out_calling),
             further: components,
         };
         handler.on_begin(&mut dlg, &incoming);
 
-        self.finish_turn(dlg, handler, ingress_assoc, Turn::Begin, Instant::now())
+        self.finish_turn(
+            dlg,
+            Some(handler),
+            ingress_assoc,
+            Turn::Begin,
+            Instant::now(),
+        )
     }
 
     fn on_turn(
@@ -1423,6 +1452,22 @@ impl DialogueEngine {
         if let Some(rejected) = rejected {
             components.push(rejected.stage(&mut dlg, is_end));
         }
+        let Some(handler) = handler else {
+            if is_end {
+                return Vec::new();
+            }
+            if components
+                .iter()
+                .any(|c| matches!(c, PeerComponent::Invoke { .. }))
+            {
+                return self.dispatch_opening(dlg, components, &ingress_assoc);
+            }
+            // Keep waiting on an empty turn; send component-layer Rejects now.
+            if !dlg.rejects.is_empty() {
+                let _ = dlg.send();
+            }
+            return self.finish_turn(dlg, None, &ingress_assoc, Turn::Continue, Instant::now());
+        };
         let peer = PeerTurn { is_end, components };
 
         if is_end {
@@ -1433,11 +1478,17 @@ impl DialogueEngine {
             dlg.rejects.clear();
             dlg.closed = Some(CloseReason::PeerEnded);
             handler.on_continue(&mut dlg, &peer);
-            self.closed(&handler, &dlg, CloseReason::PeerEnded);
+            self.closed(&Some(handler), &dlg, CloseReason::PeerEnded);
             return Vec::new();
         }
         handler.on_continue(&mut dlg, &peer);
-        self.finish_turn(dlg, handler, &ingress_assoc, Turn::Continue, Instant::now())
+        self.finish_turn(
+            dlg,
+            Some(handler),
+            &ingress_assoc,
+            Turn::Continue,
+            Instant::now(),
+        )
     }
 
     /// An Abort from the peer: release the dialogue and tell its handler what
@@ -1495,6 +1546,7 @@ impl DialogueEngine {
             &self.config,
         );
         handler.on_start(&mut dlg);
+        let handler = Some(handler);
 
         let frames = std::mem::take(&mut dlg.out);
         if let Some(reason) = dlg.closed {
@@ -1516,7 +1568,7 @@ impl DialogueEngine {
     fn finish_turn(
         &self,
         mut dlg: Dialogue,
-        handler: Arc<dyn TerminationHandler>,
+        handler: Option<Arc<dyn TerminationHandler>>,
         ingress_assoc: &str,
         turn: Turn,
         last_activity: Instant,
@@ -1554,7 +1606,7 @@ impl DialogueEngine {
     fn store(
         &self,
         dialogue: Dialogue,
-        handler: Arc<dyn TerminationHandler>,
+        handler: Option<Arc<dyn TerminationHandler>>,
         ingress_assoc: &str,
         last_activity: Instant,
     ) {
@@ -1572,8 +1624,15 @@ impl DialogueEngine {
 
     /// Tell a handler its dialogue ended. Every path that drops a dialogue the
     /// handler was given goes through here, once.
-    fn closed(&self, handler: &Arc<dyn TerminationHandler>, dlg: &Dialogue, reason: CloseReason) {
-        handler.on_closed(&dlg.closed_event(reason));
+    fn closed(
+        &self,
+        handler: &Option<Arc<dyn TerminationHandler>>,
+        dlg: &Dialogue,
+        reason: CloseReason,
+    ) {
+        if let Some(handler) = handler {
+            handler.on_closed(&dlg.closed_event(reason));
+        }
     }
 
     /// Run the timers. For every dialogue with an expired invocation timer the
@@ -1674,7 +1733,9 @@ impl DialogueEngine {
                 operation_code: invoke.op,
                 class: invoke.class,
             };
-            handler.on_invoke_timeout(&mut dlg, &timeout);
+            if let Some(handler) = &handler {
+                handler.on_invoke_timeout(&mut dlg, &timeout);
+            }
             if dlg.closed == Some(CloseReason::Aborted) {
                 dlg.closed = Some(CloseReason::InvokeTimeout {
                     invoke_id: invoke.id,
@@ -1702,6 +1763,13 @@ impl DialogueEngine {
             .map(|m| (ingress_assoc.clone(), m))
             .collect()
     }
+}
+
+/// The first operation whose local code can be dispatched.
+fn first_invoke(components: &[PeerComponent]) -> Option<usize> {
+    components.iter().position(
+        |c| matches!(c, PeerComponent::Invoke { operation_code, .. } if *operation_code >= 0),
+    )
 }
 
 /// Whether an invocation timer of the dialogue has expired, or the dialogue
@@ -2132,6 +2200,310 @@ fn gt_digits(addr: &SccpAddress) -> Option<String> {
 mod tests {
     use super::*;
     use sccp::SubsystemNumber;
+
+    const HANDSHAKE_AC: &[u32] = &[0, 4, 0, 0, 1, 0, 21, 3];
+
+    #[derive(Default)]
+    struct HandshakeHandler(Mutex<Vec<IncomingOp>>);
+
+    impl TerminationHandler for HandshakeHandler {
+        fn on_begin(&self, dlg: &mut Dialogue, op: &IncomingOp) {
+            assert_eq!(dlg.application_context(), HANDSHAKE_AC);
+            self.0.lock().unwrap().push(op.clone());
+            dlg.reply(op.operation_code, Some(vec![0x30, 0]));
+            dlg.end().unwrap();
+        }
+
+        fn on_continue(&self, _: &mut Dialogue, _: &PeerTurn) {
+            panic!("the first Invoke must be an opening operation");
+        }
+    }
+
+    fn handshake_begin() -> Msu {
+        let party = |digits: &str, ssn| {
+            SccpAddress::with_gt(
+                sccp::GlobalTitle::Gt0100 {
+                    translation_type: 0,
+                    numbering_plan: 1,
+                    encoding_scheme: 1,
+                    nature_of_address: 4,
+                    digits: digits.to_string(),
+                },
+                Some(ssn),
+            )
+        };
+        let begin = TcapMessage::Begin(Begin {
+            otid: OTID.to_vec().into(),
+            dialogue_portion: Some(DialoguePortion::aarq(Oid::new(HANDSHAKE_AC).unwrap())),
+            components: None,
+        });
+        inbound(
+            UnitData::new(
+                party("15550100", SubsystemNumber::Hlr),
+                party("15550170", SubsystemNumber::Msc),
+                tcap::encode(&begin).unwrap(),
+            )
+            .encode()
+            .unwrap(),
+        )
+    }
+
+    fn decoded(msu: &Msu) -> TcapMessage {
+        let SccpMessage::Udt(udt) = SccpMessage::decode(&msu.payload).unwrap() else {
+            panic!("expected UDT");
+        };
+        tcap::decode(&udt.data).unwrap()
+    }
+
+    fn handshake_open(engine: &DialogueEngine) -> Tid {
+        let out = engine.deliver(&handshake_begin(), "ingress");
+        assert_eq!(out.len(), 1);
+        let TcapMessage::Continue(cont) = decoded(&out[0]) else {
+            panic!("expected handshake Continue, got {:?}", decoded(&out[0]));
+        };
+        assert_eq!(cont.dtid.as_ref(), OTID);
+        assert_ne!(cont.otid.as_ref(), OTID);
+        assert!(!cont.otid.is_empty());
+        assert!(cont.components.is_none());
+        assert_eq!(
+            cont.dialogue_portion,
+            Some(DialoguePortion::aare_accept(
+                Oid::new(HANDSHAKE_AC).unwrap()
+            ))
+        );
+        assert_eq!(engine.open_dialogues(), 1);
+        cont.otid.to_vec()
+    }
+
+    fn handshake_engine() -> (DialogueEngine, Arc<HandshakeHandler>) {
+        let mut engine = DialogueEngine::new(Tcap::default());
+        let handler = Arc::new(HandshakeHandler::default());
+        engine.register(6, 46, handler.clone());
+        (engine, handler)
+    }
+
+    #[test]
+    fn handshake_dispatches_first_continue_invoke_as_begin() {
+        let (engine, handler) = handshake_engine();
+        let before = metrics::dialogue_handshakes();
+        let tid = handshake_open(&engine);
+        assert!(metrics::dialogue_handshakes() > before);
+        let mut cont = TcapContinue {
+            otid: OTID.to_vec().into(),
+            dtid: tid.into(),
+            dialogue_portion: None,
+            components: None,
+        };
+        assert!(engine
+            .deliver(&carried(TcapMessage::Continue(cont.clone())), "ingress")
+            .is_empty());
+        assert_eq!(engine.open_dialogues(), 1);
+        let arg = vec![0x30, 0];
+        cont.components = Some(vec![
+            Component::Invoke(Invoke {
+                invoke_id: 7,
+                linked_id: None,
+                operation_code: OperationCode::Local(46),
+                parameter: Some(Any::new(arg.clone())),
+            }),
+            Component::Invoke(Invoke {
+                invoke_id: 8,
+                linked_id: None,
+                operation_code: OperationCode::Local(46),
+                parameter: Some(Any::new(arg.clone())),
+            }),
+        ]);
+        let out = engine.deliver(&carried(TcapMessage::Continue(cont)), "ingress");
+        let seen = handler.0.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].operation_code, 46);
+        assert_eq!(seen[0].invoke_id, 7);
+        assert_eq!(seen[0].calling_gt.as_deref(), Some("15550170"));
+        assert_eq!(seen[0].called_gt.as_deref(), Some("15550100"));
+        assert_eq!(seen[0].called_ssn, 6);
+        assert_eq!(
+            seen[0].further,
+            vec![PeerComponent::Invoke {
+                invoke_id: 8,
+                operation_code: 46,
+                argument: Some(arg.clone()),
+            }]
+        );
+        assert_eq!(seen[0].argument, Some(arg));
+        assert_eq!(seen[0].application_context.as_deref(), Some(HANDSHAKE_AC));
+        assert_eq!(out.len(), 1);
+        let TcapMessage::End(end) = decoded(&out[0]) else {
+            panic!("expected End");
+        };
+        assert!(end.dialogue_portion.is_none());
+        assert!(
+            matches!(&end.components.unwrap()[0], Component::ReturnResultLast(r) if r.invoke_id == 7)
+        );
+        assert_eq!(engine.open_dialogues(), 0);
+    }
+
+    #[test]
+    fn handshake_without_termination_aborts() {
+        let engine = DialogueEngine::new(Tcap::default());
+        let out = engine.deliver(&handshake_begin(), "ingress");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(decoded(&out[0]), TcapMessage::Abort(_)));
+        assert_eq!(engine.open_dialogues(), 0);
+    }
+
+    #[test]
+    fn handshake_peer_end_closes_without_handler() {
+        let (engine, handler) = handshake_engine();
+        let tid = handshake_open(&engine);
+        let out = engine.deliver(
+            &carried(TcapMessage::End(End {
+                dtid: tid.into(),
+                dialogue_portion: None,
+                components: None,
+            })),
+            "ingress",
+        );
+        assert!(out.is_empty());
+        assert_eq!(engine.open_dialogues(), 0);
+        assert!(handler.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn handshake_idle_timeout_aborts() {
+        let (engine, handler) = handshake_engine();
+        handshake_open(&engine);
+        let out = engine
+            .sweep(Instant::now() + Duration::from_millis(engine.config().dialogue_timer_ms + 1));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "ingress");
+        assert!(matches!(decoded(&out[0].1), TcapMessage::Abort(_)));
+        assert_eq!(engine.open_dialogues(), 0);
+        assert!(handler.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn handshake_unknown_operation_uses_begin_abort_path() {
+        let (engine, handler) = handshake_engine();
+        let tid = handshake_open(&engine);
+        let out = engine.deliver(
+            &carried(TcapMessage::Continue(TcapContinue {
+                otid: OTID.to_vec().into(),
+                dtid: tid.into(),
+                dialogue_portion: None,
+                components: Some(vec![Component::Invoke(Invoke {
+                    invoke_id: 1,
+                    linked_id: None,
+                    operation_code: OperationCode::Local(99),
+                    parameter: None,
+                })]),
+            })),
+            "ingress",
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(decoded(&out[0]), TcapMessage::Abort(_)));
+        assert_eq!(engine.open_dialogues(), 0);
+        assert!(handler.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn handshake_global_operation_is_not_an_empty_turn() {
+        let (engine, handler) = handshake_engine();
+        let tid = handshake_open(&engine);
+        let global = Component::Invoke(Invoke {
+            invoke_id: 1,
+            linked_id: None,
+            operation_code: OperationCode::Global(
+                Oid::new(&[0, 4, 0, 0, 1, 0, 46]).unwrap().to_owned(),
+            ),
+            parameter: None,
+        });
+        let out = engine.deliver(
+            &carried(TcapMessage::Continue(TcapContinue {
+                otid: OTID.to_vec().into(),
+                dtid: tid.into(),
+                dialogue_portion: None,
+                components: Some(vec![global.clone()]),
+            })),
+            "ingress",
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(decoded(&out[0]), TcapMessage::Abort(_)));
+        assert_eq!(engine.open_dialogues(), 0);
+        assert!(handler.0.lock().unwrap().is_empty());
+        let TcapMessage::Begin(mut begin) = decoded(&handshake_begin()) else {
+            unreachable!()
+        };
+        begin.components = Some(vec![global]);
+        let out = engine.deliver(&carried(TcapMessage::Begin(begin)), "ingress");
+        assert!(matches!(decoded(&out[0]), TcapMessage::Abort(_)));
+        assert_eq!(engine.open_dialogues(), 0);
+    }
+
+    #[test]
+    fn handshake_peer_aborts_release_dialogue() {
+        for provider in [false, true] {
+            let (engine, handler) = handshake_engine();
+            let tid = handshake_open(&engine);
+            let abort = if provider {
+                Abort::p_abort(tid.into(), PAbortCause::RESOURCE_LIMITATION)
+            } else {
+                Abort::u_abort(
+                    tid.into(),
+                    Some(DialoguePortion::abrt(TcapAbortSource::DialogueServiceUser)),
+                )
+            };
+            assert!(engine
+                .deliver(&carried(TcapMessage::Abort(abort)), "ingress")
+                .is_empty());
+            assert_eq!(engine.open_dialogues(), 0);
+            assert!(handler.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn handshake_requires_aarq_and_preserves_component_rejection() {
+        let (engine, _) = handshake_engine();
+        let out = engine.deliver(
+            &carried(TcapMessage::Begin(Begin {
+                otid: OTID.to_vec().into(),
+                dialogue_portion: None,
+                components: None,
+            })),
+            "ingress",
+        );
+        assert!(matches!(decoded(&out[0]), TcapMessage::Abort(_)));
+        let TcapMessage::Begin(mut begin) = decoded(&handshake_begin()) else {
+            unreachable!()
+        };
+        begin.components = Some(vec![Component::ReturnResultLast(ReturnResult {
+            invoke_id: 1,
+            result: None,
+        })]);
+        let out = engine.deliver(&carried(TcapMessage::Begin(begin)), "ingress");
+        let TcapMessage::End(end) = decoded(&out[0]) else {
+            panic!("expected Reject in End");
+        };
+        assert!(matches!(&end.components.unwrap()[0], Component::Reject(_)));
+        assert_eq!(engine.open_dialogues(), 0);
+    }
+
+    #[test]
+    fn handshake_accepts_with_fallback_and_no_invoke_components() {
+        let mut engine = DialogueEngine::new(Tcap::default());
+        engine.register_fallback(146, 0, Arc::new(HandshakeHandler::default()));
+        let TcapMessage::Begin(mut begin) = decoded(&handshake_begin()) else {
+            unreachable!()
+        };
+        begin.components = Some(vec![Component::Reject(Reject {
+            invoke_id: Some(1),
+            problem: Problem::Invoke(InvokeProblem::UNRECOGNIZED_OPERATION),
+        })]);
+        let out = engine.deliver(&carried(TcapMessage::Begin(begin)), "ingress");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(decoded(&out[0]), TcapMessage::Continue(_)));
+        assert_eq!(engine.open_dialogues(), 1);
+        engine.sweep(Instant::now() + Duration::from_secs(3600));
+    }
 
     fn dialogue() -> Dialogue {
         let party = SccpAddress::with_ssn(SubsystemNumber::Hlr, None);

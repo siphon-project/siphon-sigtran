@@ -7,6 +7,14 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Dialogue handshakes for MAP/CAP termination: a Begin with an AARQ and no
+  Invoke is accepted with an AARE in a Continue when termination is registered.
+  The first Invoke in a later Continue reaches the normal opening handler;
+  idle handshakes use the dialogue timeout. Accepted handshakes are counted in
+  `sigtran_dialogue_handshakes_total`.
+
 ## [7.1.0] — 2026-11-10
 
 ### Changed
