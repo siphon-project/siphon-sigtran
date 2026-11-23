@@ -187,7 +187,7 @@ jobs:
         run: cargo test --test abnormal --test strict_decode
 
       - name: Wire tests (siphon extension)
-        run: cargo test --features python --test wire_python --test wire_global_title
+        run: cargo test --features python --test wire_python --test wire_python_hlr --test wire_global_title
 
       # The CAMEL call a script decides through the typed views, dissected by
       # Wireshark with assertions on the fields.

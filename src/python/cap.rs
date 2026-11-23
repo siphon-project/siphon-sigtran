@@ -98,7 +98,7 @@ fn decimal_tbcd(octets: &[u8]) -> Result<String, String> {
 }
 
 /// An IMSI as its digits. `IMSI ::= TBCD-STRING (SIZE (3..8))`.
-fn imsi_digits(what: &str, imsi: &[u8]) -> PyResult<String> {
+pub(super) fn imsi_digits(what: &str, imsi: &[u8]) -> PyResult<String> {
     if !(3..=8).contains(&imsi.len()) {
         return Err(mistyped(what, "an IMSI is 3 to 8 octets"));
     }
@@ -107,7 +107,7 @@ fn imsi_digits(what: &str, imsi: &[u8]) -> PyResult<String> {
 
 /// The digits of an ISDN-AddressString: one octet of nature of address and
 /// numbering plan, then the digits as a TBCD-STRING.
-fn address_digits(what: &str, address: &[u8]) -> PyResult<String> {
+pub(super) fn address_digits(what: &str, address: &[u8]) -> PyResult<String> {
     let (_nature_and_plan, digits) = address
         .split_first()
         .ok_or_else(|| mistyped(what, "an address string is at least one octet"))?;

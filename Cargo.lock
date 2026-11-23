@@ -1093,9 +1093,9 @@ dependencies = [
 
 [[package]]
 name = "gsm_map"
-version = "4.0.0"
+version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b756ee6565fd9c7823c15123b61b81fbadca469f64de4243a8d16f5620ba2995"
+checksum = "2a173efa7020aecf812d88eced087f34e044cba3ba114b5356e68e6d827f58cb"
 dependencies = [
  "hex",
  "rasn",

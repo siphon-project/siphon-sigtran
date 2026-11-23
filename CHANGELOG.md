@@ -19,6 +19,36 @@ All notable changes are documented here. The format follows
   `PeerTurn`; `PeerTurn.sm_rp_oa`, `sm_rp_da` and `sm_rp_ui` read a further
   MO-ForwardSM or MT-ForwardSM that arrives in a Continue, answered with
   `dlg.reply_to(turn.invoke_id, ...)`.
+- The HLR side of MAP location management and call handling (TS 29.002
+  clauses 8 and 10). `update-gprs-location` and `send-routing-info` join the
+  `@gsm_map.on_operation` vocabulary. An opening operation reads its argument
+  as an object: `update_location`, `update_gprs_location`,
+  `send_authentication_info` (version 3 form), `purge_ms` and
+  `send_routing_info` (with `suppress_t_csi` and the GMSC's CAMEL phases).
+- `gsm_map.insert_subscriber_data` takes the subscriber data a VLR or SGSN
+  needs: category, subscriber status, teleservices, bearer services, general
+  operator determined barring by name, O-CSI and VT-CSI triggers with their
+  CAMEL phase, GPRS PDP contexts and the network access mode. `imsi` and
+  `msisdn` work as before.
+- `gsm_map.cancel_location` and `gsm_map.provide_roaming_number` invokes,
+  `gsm_map.update_gprs_location_res`, and `gsm_map.send_routing_info_res` with
+  either the roaming number or the T-CSI for the GMSC. `PeerTurn.roaming_number`
+  reads a VLR's provideRoamingNumber answer.
+- `timeout=` on `gsm_map.begin`, `gsm_cap.begin` and `inap.begin`: the
+  invocation timer of the opening operation in seconds, instead of the node's
+  `tcap.invoke_timer_ms`.
+- `dlg.refuse(error_code)`: a returnError answering the opening invoke from any
+  turn of the dialogue, the counterpart of `dlg.reply` (an HLR whose
+  insertSubscriberData is refused answers the updateLocation with it).
+- Version 3 application contexts on `gsm_map.AC`: `network_loc_up`,
+  `gprs_location_update`, `location_cancellation`, `ms_purging`,
+  `info_retrieval`, `subscriber_data_mngt`, `location_info_retrieval` and
+  `roaming_number_enquiry`.
+
+### Changed
+
+- Requires `gsm_map` 4.1, for the typed CAMEL subscription, GPRS subscription
+  and routing information.
 
 ### Fixed
 
