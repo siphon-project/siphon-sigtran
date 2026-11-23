@@ -15,6 +15,14 @@ All notable changes are documented here. The format follows
   idle handshakes use the dialogue timeout. Accepted handshakes are counted in
   `sigtran_dialogue_handshakes_total`.
 
+### Fixed
+
+- A script handler awaiting `gsm_map.begin`, `gsm_cap.begin` or `inap.begin`
+  no longer waits forever when the originated dialogue shares its lane. These
+  originations use reserved transaction ids and four Rust-only lanes for both
+  answers and timers, so neither queues behind the waiting script. Terminating
+  dialogues and `node.originate` callbacks keep their 32 script lanes.
+
 ## [7.1.0] — 2026-11-10
 
 ### Changed

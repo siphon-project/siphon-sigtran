@@ -93,7 +93,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::{Adaptation, Association, Config, Role, DEFAULT_TENANT};
-use crate::dialogue::{DialogueEngine, OutgoingBegin, TerminationHandler};
+use crate::dialogue::{
+    DialogueEngine, OutgoingBegin, TerminationHandler, DIALOGUE_LANES, ORIGINATION_LANES,
+};
 use crate::metrics;
 use crate::mtp3::management::{Management, Timers, Topology};
 use crate::mtp3::route::Destination;
@@ -173,9 +175,6 @@ pub enum TransportError {
 /// Transport result alias.
 pub type Result<T> = std::result::Result<T, TransportError>;
 
-/// Lanes [`TransportHandle::serve_dialogues`] terminates dialogues on: how many
-/// handlers can run at once.
-const DIALOGUE_LANES: usize = 32;
 /// Deliveries a lane holds before the transport waits for it.
 const LANE_DEPTH: usize = 256;
 
@@ -528,8 +527,10 @@ impl TransportHandle {
         // The timers of a dialogue run on its lane too (see `tid_lane`): a
         // timeout callback is a handler like any other, and the task below,
         // which hands every inbound message to its lane, never waits for one.
-        let mut lanes = Vec::with_capacity(DIALOGUE_LANES);
-        for lane in 0..DIALOGUE_LANES {
+        // Rust-only originations have separate lanes: an answer or timeout
+        // must be able to resolve a script waiting on its termination lane.
+        let mut lanes = Vec::with_capacity(DIALOGUE_LANES + ORIGINATION_LANES);
+        for lane in 0..DIALOGUE_LANES + ORIGINATION_LANES {
             let (lane_tx, mut lane_rx) = mpsc::channel::<LaneWork>(LANE_DEPTH);
             let engine = Arc::clone(&engine);
             let registry = registry.clone();
@@ -591,8 +592,7 @@ impl TransportHandle {
                     _ = shutdown.changed() => break,
                     maybe = rx.recv() => {
                         let Some(delivery) = maybe else { break };
-                        let lane = (crate::dialogue::dialogue_lane(&delivery.msu)
-                            % DIALOGUE_LANES as u64) as usize;
+                        let lane = crate::dialogue::dialogue_lane(&delivery.msu) as usize;
                         if lanes[lane].send(LaneWork::Deliver(delivery)).await.is_err() {
                             break;
                         }
@@ -603,8 +603,7 @@ impl TransportHandle {
                         // its earlier work to get through: the dialogue is given
                         // back and claimed again on a later tick, never dropped.
                         for tid in engine.claim_expired(Instant::now()) {
-                            let lane = (crate::dialogue::tid_lane(&tid)
-                                % DIALOGUE_LANES as u64) as usize;
+                            let lane = crate::dialogue::tid_lane(&tid) as usize;
                             if let Err(
                                 mpsc::error::TrySendError::Full(LaneWork::Timers(tid))
                                 | mpsc::error::TrySendError::Closed(LaneWork::Timers(tid)),
@@ -1438,3 +1437,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod origination_tests;
