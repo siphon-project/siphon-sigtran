@@ -7,6 +7,8 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [7.2.0] — 2026-11-23
+
 ### Added
 
 - Dialogue handshakes for MAP/CAP termination: a Begin with an AARQ and no
