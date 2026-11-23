@@ -66,6 +66,7 @@ use crate::transport::framing::{Msu, SI_SCCP};
 use crate::transport::{Origination, TransportHandle};
 
 mod cap;
+mod mobility;
 #[cfg(test)]
 mod thread_tests;
 mod turn;
@@ -608,6 +609,56 @@ impl PyIncomingOp {
     #[getter]
     fn sm_rp_ui<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
         self.decode_mo_field(py, MoField::Ui)
+    }
+
+    /// The argument of an updateLocation (TS 29.002 clause 8.1.2) as an
+    /// [`UpdateLocation`](mobility::PyUpdateLocation): `imsi`, `msc_number`,
+    /// `vlr_number`, `lmsi`, `skip_subscriber_data_update`. `None` for
+    /// another operation; raises `MistypedParameter` when the argument does
+    /// not decode.
+    #[getter]
+    fn update_location(&self, py: Python<'_>) -> PyResult<Option<mobility::PyUpdateLocation>> {
+        mobility::update_location(py, self)
+    }
+
+    /// The argument of an updateGprsLocation (clause 8.1.7): `imsi`,
+    /// `sgsn_number`, `sgsn_address`, `skip_subscriber_data_update`. As
+    /// `update_location`.
+    #[getter]
+    fn update_gprs_location(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Option<mobility::PyUpdateGprsLocation>> {
+        mobility::update_gprs_location(py, self)
+    }
+
+    /// The argument of a sendAuthenticationInfo (clause 8.5.2), version 3:
+    /// `imsi`, `number_of_requested_vectors`, `requesting_node_type`,
+    /// `re_synchronisation` (`(rand, auts)` or None),
+    /// `immediate_response_preferred`. As `update_location`; the version 2
+    /// form (an IMSI alone) raises `MistypedParameter`.
+    #[getter]
+    fn send_authentication_info(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Option<mobility::PySendAuthenticationInfo>> {
+        mobility::send_authentication_info(py, self)
+    }
+
+    /// The argument of a purgeMS (clause 8.1.6): `imsi`, `vlr_number`,
+    /// `sgsn_number`. As `update_location`.
+    #[getter]
+    fn purge_ms(&self) -> PyResult<Option<mobility::PyPurgeMs>> {
+        mobility::purge_ms(self)
+    }
+
+    /// The argument of a sendRoutingInfo (clause 10.1.1): `msisdn`,
+    /// `interrogation_type`, `gmsc_address`, `call_reference_number`,
+    /// `suppress_t_csi`, `supported_camel_phases`, `or_interrogation`. As
+    /// `update_location`.
+    #[getter]
+    fn send_routing_info(&self, py: Python<'_>) -> PyResult<Option<mobility::PySendRoutingInfo>> {
+        mobility::send_routing_info(py, self)
     }
 
     /// Whether a MO-ForwardSM or MT-ForwardSM says more messages follow in
@@ -1390,6 +1441,14 @@ impl PyPeerTurn {
         self.event.abort_cause
     }
 
+    /// The roaming number of a provideRoamingNumber result (TS 29.002 clause
+    /// 10.2.2), as its digits; `None` when the turn carries no such result.
+    /// Raises `MistypedParameter` when the result does not decode.
+    #[getter]
+    fn roaming_number(&self) -> PyResult<Option<String>> {
+        mobility::roaming_number(self)
+    }
+
     /// The raw BER result parameter of the first `returnResultLast`, if present.
     #[getter]
     fn result<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
@@ -1626,6 +1685,9 @@ enum DlgCmd {
         id: i8,
         code: i64,
     },
+    Refuse {
+        code: i64,
+    },
     Reject {
         id: Option<i8>,
         problem: Problem,
@@ -1714,6 +1776,12 @@ impl PyDialogue {
             result: result.param.clone(),
         });
         Ok(())
+    }
+
+    /// Stage a `ReturnError` answering the opening invoke, from any turn of
+    /// the dialogue: the counterpart of `reply` for an operation that failed.
+    fn refuse(&self, error_code: i64) {
+        self.push(DlgCmd::Refuse { code: error_code });
     }
 
     /// Stage a `ReturnError` answering a specific invoke id.
@@ -1884,6 +1952,10 @@ fn replay(dlg: &mut CoreDialogue, cmds: Vec<DlgCmd>) -> Result<(), crate::dialog
             DlgCmd::Error { id, code } => {
                 dlg.error(id, code);
                 ("error", Ok(()))
+            }
+            DlgCmd::Refuse { code } => {
+                dlg.refuse(code);
+                ("refuse", Ok(()))
             }
             DlgCmd::Reject { id, problem } => {
                 dlg.reject(id, problem);
@@ -2082,6 +2154,7 @@ struct OriginationHandler {
     op: i64,
     arg: Option<Vec<u8>>,
     class: OperationClass,
+    timeout: Option<Duration>,
     responder: Mutex<Option<oneshot::Sender<Result<PeerTurn, String>>>>,
 }
 
@@ -2106,7 +2179,7 @@ impl TerminationHandler for OriginationHandler {
         // A failure is logged by the engine with the dialogue's identifiers and
         // comes back to the awaiting caller through `on_closed`.
         if dialogue
-            .invoke_with(self.op, self.arg.clone(), self.class, None)
+            .invoke_with(self.op, self.arg.clone(), self.class, self.timeout)
             .is_ok()
         {
             let _ = dialogue.send();
@@ -2242,7 +2315,13 @@ fn origination_begin<'py>(
     ac: &MapAcHandle,
     opc: Option<u32>,
     sls: u8,
+    timeout: Option<f64>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // The invocation timer of the opening operation; None is the node's
+    // `tcap.invoke_timer_ms`.
+    let timeout = timeout
+        .map(|t| seconds_arg(t, "invoke timeout"))
+        .transpose()?;
     let tx = ORIGIN_TX
         .get()
         .ok_or_else(|| err("sigtran node not started: no transport to originate over"))?
@@ -2268,6 +2347,7 @@ fn origination_begin<'py>(
         op: invoke.op,
         arg: invoke.arg.resolve(&ac.arcs).map_err(err)?,
         class: invoke.class,
+        timeout,
         responder: Mutex::new(Some(resp_tx)),
     });
     let req = OutgoingBegin {
@@ -2596,7 +2676,8 @@ impl GsmMap {
     ///
     /// Known names: `mo-forward-sm`, `mt-forward-sm`, `sri-sm`,
     /// `report-sm-delivery-status`, `ready-for-sm`, `update-location`,
-    /// `cancel-location`, `purge-ms`, `send-auth-info`, `provide-subscriber-info`.
+    /// `update-gprs-location`, `cancel-location`, `purge-ms`, `send-auth-info`,
+    /// `send-routing-info`, `provide-subscriber-info`.
     /// An unknown name raises `SigtranError` at decoration time.
     #[pyo3(signature = (arg=None))]
     fn on_operation<'py>(
@@ -2614,7 +2695,11 @@ impl GsmMap {
     /// context `ac`, and `await`s the peer's first response as a
     /// [`PeerTurn`](PyPeerTurn). The calling party defaults to our own point code
     /// and network indicator with the `called_gt` digits unless overridden.
-    #[pyo3(signature = (invoke, *, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0))]
+    /// `timeout` is the invocation timer of the opening operation in seconds
+    /// (the node's `tcap.invoke_timer_ms` when omitted). A class 1 operation
+    /// the peer has not answered when it expires aborts the dialogue, and the
+    /// `await` raises `SigtranError` saying so.
+    #[pyo3(signature = (invoke, *, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn begin<'py>(
         &self,
@@ -2628,6 +2713,7 @@ impl GsmMap {
         ac: PyRef<'_, MapAcHandle>,
         opc: Option<u32>,
         sls: u8,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         origination_begin(
             py,
@@ -2640,6 +2726,7 @@ impl GsmMap {
             &ac,
             opc,
             sls,
+            timeout,
         )
     }
 
@@ -2761,22 +2848,124 @@ impl GsmMap {
         staged_map_res(gsm_map::op_codes::READY_FOR_SM, &ReadyForSmRes::default())
     }
 
-    /// Stage an insertSubscriberData invoke: the HLR pushes subscriber data to
-    /// the VLR inside a held-open updateLocation. `imsi` / `msisdn` are the TBCD
-    /// address bytes.
-    #[pyo3(signature = (*, imsi=None, msisdn=None))]
-    fn insert_subscriber_data(
+    /// Stage an insertSubscriberData invoke (TS 29.002 clause 8.8.1): the HLR
+    /// pushes subscriber data to the VLR or SGSN, inside a held-open
+    /// updateLocation or updateGprsLocation or in a dialogue of its own.
+    /// `imsi` / `msisdn` are digit strings or encoded bytes. `category` is the
+    /// one octet of Q.763; `subscriber_status` `service-granted` or
+    /// `operator-determined-barring`; `teleservices` / `bearer_services` the
+    /// one-octet codes (TS 29.002 MAP-TS-Code, MAP-BS-Code); `odb` the names
+    /// of the general barrings to set (`all-og-calls-barred`, ...). `o_csi`
+    /// and `vt_csi` are lists of triggers, each a dict with `trigger`
+    /// (`collected-info` / `route-select-failure` for O-CSI,
+    /// `term-attempt-authorized` / `t-busy` / `t-no-answer` for VT-CSI),
+    /// `service_key`, `gsmscf` (digits) and `default_call_handling`
+    /// (`continue`, the default, or `release`); `camel_phase` (1 to 4) is
+    /// their camelCapabilityHandling. `gprs` is a list of PDP contexts, each
+    /// a dict with `context_id`, `apn`, `qos_subscribed` and the optional
+    /// members `pdp_type`, `pdp_address`, `ext_qos_subscribed`,
+    /// `ext2_qos_subscribed`, `ext3_qos_subscribed`, `ext4_qos_subscribed`,
+    /// `ext_pdp_type`, `charging_characteristics`, `vplmn_address_allowed`
+    /// and `ambr` (`(uplink, downlink)` bits per second). `network_access_mode` is
+    /// `packet-and-circuit`, `only-circuit` or `only-packet`.
+    #[pyo3(signature = (*, imsi=None, msisdn=None, category=None, subscriber_status=None,
+        teleservices=None, bearer_services=None, odb=None, o_csi=None, vt_csi=None,
+        camel_phase=None, gprs=None, network_access_mode=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_subscriber_data<'py>(
         &self,
-        imsi: Option<Bound<'_, PyAny>>,
-        msisdn: Option<Bound<'_, PyAny>>,
+        imsi: Option<Bound<'py, PyAny>>,
+        msisdn: Option<Bound<'py, PyAny>>,
+        category: Option<u8>,
+        subscriber_status: Option<String>,
+        teleservices: Option<Vec<u8>>,
+        bearer_services: Option<Vec<u8>>,
+        odb: Option<Vec<String>>,
+        o_csi: Option<Bound<'py, PyAny>>,
+        vt_csi: Option<Bound<'py, PyAny>>,
+        camel_phase: Option<i64>,
+        gprs: Option<Bound<'py, PyAny>>,
+        network_access_mode: Option<String>,
     ) -> PyResult<StagedInvoke> {
-        use gsm_map::operations::subscriber_data::{op_codes, InsertSubscriberDataArg};
-        let arg = InsertSubscriberDataArg {
-            imsi: imsi.as_ref().map(imsi_arg).transpose()?.map(Into::into),
-            msisdn: msisdn.as_ref().map(isdn_addr).transpose()?.map(Into::into),
-            ..InsertSubscriberDataArg::default()
-        };
-        staged_map_invoke(op_codes::INSERT_SUBSCRIBER_DATA, &arg)
+        mobility::insert_subscriber_data(
+            imsi,
+            msisdn,
+            mobility::SubscriberData {
+                category,
+                subscriber_status,
+                teleservices,
+                bearer_services,
+                odb,
+                o_csi,
+                vt_csi,
+                camel_phase,
+                gprs,
+                network_access_mode,
+            },
+        )
+    }
+
+    /// Build an updateGprsLocation result carrying the `hlr_number` (TS 29.002
+    /// clause 8.1.7), sent once the SGSN has taken the subscriber data.
+    #[pyo3(signature = (*, hlr_number))]
+    fn update_gprs_location_res(&self, hlr_number: &Bound<'_, PyAny>) -> PyResult<StagedResult> {
+        mobility::update_gprs_location_res(hlr_number)
+    }
+
+    /// Stage a cancelLocation invoke (clause 8.1.3) for the VLR or SGSN that
+    /// no longer serves `imsi`: `cancellation_type` `update-procedure` (the
+    /// default: the subscriber registered elsewhere), `subscription-withdraw`
+    /// or `initial-attach-procedure`. Sent in a dialogue of its own with
+    /// `gsm_map.begin(..., ac=gsm_map.AC.location_cancellation)`.
+    #[pyo3(signature = (*, imsi, cancellation_type="update-procedure"))]
+    fn cancel_location(
+        &self,
+        imsi: &Bound<'_, PyAny>,
+        cancellation_type: &str,
+    ) -> PyResult<StagedInvoke> {
+        mobility::cancel_location(imsi, cancellation_type)
+    }
+
+    /// Stage a provideRoamingNumber invoke (clause 10.2.1) asking the VLR
+    /// serving `imsi` (its MSC, `msc_number`) for a roaming number, for a
+    /// call the GMSC asked to route with sendRoutingInfo. Sent with
+    /// `gsm_map.begin(..., ac=gsm_map.AC.roaming_number_enquiry)`; the VLR's
+    /// answer is read with `PeerTurn.roaming_number`.
+    #[pyo3(signature = (*, imsi, msc_number, msisdn=None, gmsc_address=None,
+        call_reference_number=None))]
+    fn provide_roaming_number(
+        &self,
+        imsi: &Bound<'_, PyAny>,
+        msc_number: &Bound<'_, PyAny>,
+        msisdn: Option<Bound<'_, PyAny>>,
+        gmsc_address: Option<Bound<'_, PyAny>>,
+        call_reference_number: Option<Vec<u8>>,
+    ) -> PyResult<StagedInvoke> {
+        mobility::provide_roaming_number(
+            imsi,
+            msc_number,
+            msisdn,
+            gmsc_address,
+            call_reference_number,
+        )
+    }
+
+    /// Build a sendRoutingInfo result (clause 10.1.2): `roaming_number` (the
+    /// MSRN a VLR gave) for the GMSC to route the call to, or `t_csi`
+    /// (triggers as for `insert_subscriber_data`, `camel_phase` their
+    /// camelCapabilityHandling) for the GMSC to ask the gsmSCF first; one of
+    /// the two. `imsi` and `vmsc_address` are optional.
+    #[pyo3(signature = (*, imsi=None, roaming_number=None, t_csi=None, camel_phase=None,
+        vmsc_address=None))]
+    fn send_routing_info_res<'py>(
+        &self,
+        imsi: Option<Bound<'py, PyAny>>,
+        roaming_number: Option<Bound<'py, PyAny>>,
+        t_csi: Option<Bound<'py, PyAny>>,
+        camel_phase: Option<i64>,
+        vmsc_address: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<StagedResult> {
+        mobility::send_routing_info_res(imsi, roaming_number, t_csi, camel_phase, vmsc_address)
     }
 
     /// Stage an MO-ForwardSM invoke: relay a mobile-originated `tpdu` from
@@ -2867,6 +3056,55 @@ impl MapAc {
             )),
         }
     }
+
+    /// networkLocUp (updateLocation, insertSubscriberData), version 3.
+    #[getter]
+    fn network_loc_up(&self) -> MapAcHandle {
+        mobility::context_v3(gsm_map::application_context::network_loc_up_context)
+    }
+
+    /// gprsLocationUpdate (updateGprsLocation), version 3.
+    #[getter]
+    fn gprs_location_update(&self) -> MapAcHandle {
+        mobility::context_v3(gsm_map::application_context::gprs_location_update_context)
+    }
+
+    /// locationCancellation (cancelLocation), version 3.
+    #[getter]
+    fn location_cancellation(&self) -> MapAcHandle {
+        mobility::context_v3(gsm_map::application_context::location_cancellation_context)
+    }
+
+    /// msPurging (purgeMS), version 3.
+    #[getter]
+    fn ms_purging(&self) -> MapAcHandle {
+        mobility::context_v3(gsm_map::application_context::ms_purging_context)
+    }
+
+    /// infoRetrieval (sendAuthenticationInfo), version 3.
+    #[getter]
+    fn info_retrieval(&self) -> MapAcHandle {
+        mobility::context_v3(gsm_map::application_context::info_retrieval_context)
+    }
+
+    /// subscriberDataMngt (insertSubscriberData outside a location update),
+    /// version 3.
+    #[getter]
+    fn subscriber_data_mngt(&self) -> MapAcHandle {
+        mobility::context_v3(gsm_map::application_context::subscriber_data_mngt_context)
+    }
+
+    /// locationInfoRetrieval (sendRoutingInfo), version 3.
+    #[getter]
+    fn location_info_retrieval(&self) -> MapAcHandle {
+        mobility::context_v3(gsm_map::application_context::location_info_retrieval_context)
+    }
+
+    /// roamingNumberEnquiry (provideRoamingNumber), version 3.
+    #[getter]
+    fn roaming_number_enquiry(&self) -> MapAcHandle {
+        mobility::context_v3(gsm_map::application_context::roaming_number_enquiry_context)
+    }
 }
 
 /// `gsm_cap.AC`, CAMEL CAP application-context helpers.
@@ -2949,7 +3187,7 @@ impl GsmCap {
     /// `called_ssn` at point code `dpc` under application context `ac`, and
     /// `await`s the peer's first response as a [`PeerTurn`](PyPeerTurn). Same shape
     /// as `gsm_map.begin(...)`; the operation is carried by the staged invoke.
-    #[pyo3(signature = (invoke, *, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0))]
+    #[pyo3(signature = (invoke, *, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn begin<'py>(
         &self,
@@ -2963,6 +3201,7 @@ impl GsmCap {
         ac: PyRef<'_, MapAcHandle>,
         opc: Option<u32>,
         sls: u8,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         origination_begin(
             py,
@@ -2975,6 +3214,7 @@ impl GsmCap {
             &ac,
             opc,
             sls,
+            timeout,
         )
     }
 
@@ -3212,7 +3452,7 @@ impl Inap {
     /// `called_ssn` at point code `dpc` under application context `ac`, and
     /// `await`s the peer's first response as a [`PeerTurn`](PyPeerTurn). Same shape
     /// as `gsm_map.begin(...)`; the operation is carried by the staged invoke.
-    #[pyo3(signature = (invoke, *, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0))]
+    #[pyo3(signature = (invoke, *, called_gt, called_ssn, calling_gt, calling_ssn, dpc, ac, opc=None, sls=0, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn begin<'py>(
         &self,
@@ -3226,6 +3466,7 @@ impl Inap {
         ac: PyRef<'_, MapAcHandle>,
         opc: Option<u32>,
         sls: u8,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         origination_begin(
             py,
@@ -3238,6 +3479,7 @@ impl Inap {
             &ac,
             opc,
             sls,
+            timeout,
         )
     }
 
@@ -3723,6 +3965,11 @@ fn map_op_table() -> OpTable {
         ),
         ("ready-for-sm", gsm_map::op_codes::READY_FOR_SM),
         ("update-location", gsm_map::op_codes::UPDATE_LOCATION),
+        (
+            "update-gprs-location",
+            gsm_map::op_codes::UPDATE_GPRS_LOCATION,
+        ),
+        ("send-routing-info", gsm_map::op_codes::SEND_ROUTING_INFO),
         ("cancel-location", gsm_map::op_codes::CANCEL_LOCATION),
         ("purge-ms", gsm_map::op_codes::PURGE_MS),
         (
@@ -4467,6 +4714,7 @@ fn add_contents(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StagedInvoke>()?;
     m.add_class::<StagedResult>()?;
     cap::add_classes(m)?;
+    mobility::add_classes(m)?;
 
     // Module functions.
     // Nothing here may carry a name the host gives one of its own namespaces:

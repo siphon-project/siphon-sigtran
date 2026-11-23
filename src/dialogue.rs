@@ -749,6 +749,15 @@ impl Dialogue {
         }));
     }
 
+    /// Stage a `ReturnError` answering the opening invoke: the counterpart of
+    /// [`Self::reply`] for an operation that failed, from whichever turn of
+    /// the dialogue finds it failed (an HLR whose insertSubscriberData was
+    /// refused answers the updateLocation it is part of).
+    pub fn refuse(&mut self, error_code: i64) {
+        let invoke_id = self.reply_invoke_id;
+        self.error(invoke_id, error_code);
+    }
+
     /// Stage a `ReturnError` answering a specific invoke id.
     pub fn error(&mut self, invoke_id: InvokeId, error_code: i64) {
         self.pending.push(Component::ReturnError(ReturnError {
