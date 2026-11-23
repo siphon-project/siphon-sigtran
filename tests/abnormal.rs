@@ -1866,3 +1866,43 @@ fn a_hop_counter_that_runs_out_at_our_own_title_is_a_violation() {
             .hex("sccp.return_cause", "0c");
     }
 }
+
+#[test]
+fn handshake_continue_accepts_then_end_returns_result_on_wire() {
+    let handler = Probe::new()
+        .on_begin(|dlg, op| {
+            assert_eq!(op.operation_code, 46);
+            dlg.reply(46, None);
+            dlg.end().unwrap();
+        })
+        .arc();
+    let mut engine = DialogueEngine::new(Tcap::default());
+    engine.register(6, 46, handler.clone());
+    let ac = [4, 0, 0, 1, 0, 21, 3];
+    let peer = [0x11, 0x22, 0x33, 0x44];
+    let opening = inbound(&begin(&peer, Some(&aarq(&ac)), &[]));
+    let accept = engine.deliver(&opening, "ingress");
+    assert_eq!(accept.len(), 1);
+    let TcapMessage::Continue(c) = decode(&accept[0]) else {
+        panic!("expected Continue");
+    };
+    let argument = [
+        0x30, 0x18, 0x84, 5, 0x91, 0x51, 0x55, 0x10, 0x00, 0x82, 5, 0x91, 0x51, 0x55, 0x10, 0x07,
+        0x04, 8, 0x01, 0, 2, 0x91, 0x21, 0, 4, 0,
+    ];
+    let request = inbound(&cont(&peer, &c.otid, &[invoke(7, 46, Some(&argument))]));
+    let result = engine.deliver(&request, "ingress");
+    assert_eq!(result.len(), 1);
+    assert_eq!(engine.open_dialogues(), 0);
+    if let Some(d) = dissect_all(&[&opening, &accept[0], &request, &result[0]]) {
+        d.present("tcap.continue_element")
+            .present("tcap.dialogueResponse_element")
+            .show("tcap.result", "0")
+            .show("tcap.aare_application_context_name", "0.4.0.0.1.0.21.3")
+            .present("tcap.end_element")
+            .present("gsm_old.returnResultLast_element");
+    }
+    if let Some(d) = dissect(&result[0]) {
+        d.show("gsm_old.invokeID", "7");
+    }
+}

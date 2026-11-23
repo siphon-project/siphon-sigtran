@@ -1080,3 +1080,69 @@ fn free_threaded(test: &str) -> bool {
     let _ = writeln!(std::io::stderr(), "{message}");
     false
 }
+
+#[test]
+fn handshake_delayed_mo_invoke_reaches_python_as_opening_operation() {
+    if !free_threaded("handshake_delayed_mo_invoke_reaches_python_as_opening_operation") {
+        return;
+    }
+    let _node = NODE.lock().unwrap_or_else(|e| e.into_inner());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = Python::attach(|py| -> PyResult<()> {
+            mount(py)?;
+            let globals = PyDict::new(py);
+            let opening = common::inbound_to(sccp::SubsystemNumber::Msc,
+                &common::begin(&[0x11, 0x22, 0x33, 0x44],
+                    Some(&common::aarq(&[4, 0, 0, 1, 0, 21, 3])), &[]));
+            globals.set_item("opening", pyo3::types::PyBytes::new(py, &opening.payload))?;
+            let code = CString::new(r#"
+import gc
+import threading
+import siphon
+from siphon import gsm_map
+node = siphon.configure('node: {point_code: 1000, variant: ITU}\nassociations: []\nsccp: {local_ssns: [8]}')
+seen = []
+@gsm_map.on_operation('mo-forward-sm')
+def handler(dlg, arg):
+    thread = threading.Thread(target=gc.collect)
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert arg.is_peer_turn is False
+    assert arg.operation_code == 46
+    assert arg.calling_gt == '15550170' and arg.called_gt == '15550100'
+    seen.append(bytes(arg.sm_rp_ui))
+    dlg.reply(gsm_map.mo_forward_sm_res())
+    dlg.end()
+accepted = node.deliver(opening, opc=4000, dpc=1000)
+assert len(accepted) == 1
+response = node.decode(accepted[0])
+assert response.kind == 'continue'
+our_tid = bytes(response.otid)
+"#).unwrap();
+            py.run(code.as_c_str(), Some(&globals), None)?;
+            let tid: Vec<u8> = globals.get_item("our_tid")?.unwrap().extract()?;
+            let argument = [0x30, 18, 0x84, 5, 0x91, 0x51, 0x55, 0x10, 0,
+                0x82, 5, 0x91, 0x51, 0x55, 0x10, 0x07, 0x04, 2, 0xaa, 0xbb];
+            let request = common::inbound_to(sccp::SubsystemNumber::Msc,
+                &common::cont(&[0x11, 0x22, 0x33, 0x44], &tid,
+                    &[common::invoke(7, 46, Some(&argument))]));
+            globals.set_item("request", pyo3::types::PyBytes::new(py, &request.payload))?;
+            let code = CString::new(r#"
+result = node.deliver(request, opc=4000, dpc=1000)
+assert seen == [b'\xaa\xbb']
+assert len(result) == 1
+end = node.decode(result[0])
+assert end.kind == 'end' and end.result_invoke_id == 7
+assert node.open_dialogues() == 0
+"#).unwrap();
+            py.run(code.as_c_str(), Some(&globals), None)
+        }).map_err(|e| e.to_string());
+        let _ = tx.send(outcome);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("handshake script timed out")
+        .expect("handshake script");
+    assert!(Python::attach(gil_disabled));
+}

@@ -240,6 +240,7 @@ pub fn gtt_errors(reason: GttError) -> u64 {
 // ── Dialogue / TCAP counters (dialogue engine) ───────────────────────────────
 
 static ACTIVE_DIALOGUES: AtomicI64 = AtomicI64::new(0);
+static DIALOGUE_HANDSHAKES: AtomicU64 = AtomicU64::new(0);
 static DIALOGUE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
 /// Who aborted a dialogue, for [`abort`]: the coarse view (the detailed one is
@@ -295,6 +296,16 @@ pub fn dialogue_timeout() {
 /// The count of timed-out dialogues.
 pub fn dialogue_timeouts() -> u64 {
     DIALOGUE_TIMEOUTS.load(Ordering::Relaxed)
+}
+
+/// Count a responder handshake accepted before its first Invoke.
+pub fn dialogue_handshake() {
+    DIALOGUE_HANDSHAKES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Responder handshakes accepted before their first Invoke.
+pub fn dialogue_handshakes() -> u64 {
+    DIALOGUE_HANDSHAKES.load(Ordering::Relaxed)
 }
 
 /// Count one abort from the given source.
@@ -1717,6 +1728,19 @@ pub fn render() -> String {
         tcap_send_errors(),
     );
 
+    help(
+        &mut out,
+        "sigtran_dialogue_handshakes_total",
+        "Responder dialogues accepted before their first Invoke.",
+        "counter",
+    );
+    line(
+        &mut out,
+        "sigtran_dialogue_handshakes_total",
+        &[],
+        dialogue_handshakes(),
+    );
+
     // Labelled families.
     let guard = labelled();
     if let Some(m) = guard.as_ref() {
@@ -2072,6 +2096,7 @@ mod tests {
             "sigtran_gtt_errors_total",
             "sigtran_active_dialogues",
             "sigtran_dialogue_timeouts_total",
+            "sigtran_dialogue_handshakes_total",
             "sigtran_abort_total",
             "sigtran_content_unscreened_total",
             "sigtran_tcap_abort_total",
