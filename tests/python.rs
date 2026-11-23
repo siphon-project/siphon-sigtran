@@ -1146,3 +1146,88 @@ assert node.open_dialogues() == 0
         .expect("handshake script");
     assert!(Python::attach(gil_disabled));
 }
+
+/// A concatenated short message an MSC sends in one dialogue (TS 29.002
+/// clause 12.2, version 2 forwardSM with moreMessagesToSend): the first part
+/// opens it, the handler answers it with a Continue, and the next part comes
+/// as an Invoke in the MSC's Continue. The version 2 argument below is written
+/// by hand from the ASN.1, never by this crate's encoder: ForwardSM-Arg ::=
+/// SEQUENCE { sm-RP-DA, sm-RP-OA, sm-RP-UI, moreMessagesToSend NULL, ... }.
+const CONTINUED: &str = r#"
+import siphon
+from siphon import gsm_map
+
+node = siphon.configure("""
+node: { point_code: 1000, variant: ITU }
+associations:
+  - { id: msc, adaptation: m3ua, role: server, addrs: [10.1.0.10], port: 2905 }
+application_servers:
+  - { name: msc, traffic_mode: override, routing_context: 100, asps: [msc] }
+mtp3_routes:
+  - { dpc: 2000, as: msc, priority: 1 }
+sccp:
+  local_ssns: [8]
+""")
+
+def tlv(tag, content):
+    return bytes([tag, len(content)]) + content
+
+SC = bytes([0x91, 0x51, 0x55, 0x10, 0x00])          # +15550100
+MSISDN = bytes([0x91, 0x51, 0x55, 0x10, 0x10])      # +15550101
+PART_1 = bytes.fromhex("41010b912120550541f300000a050003420201e8329bfd06")
+PART_2 = bytes.fromhex("41020b912120550541f300000a050003420202e8329bfd06")
+FORWARD_SM_V2 = tlv(0x30, tlv(0x84, SC) + tlv(0x82, MSISDN) + tlv(0x04, PART_1) + tlv(0x05, b""))
+
+seen = []
+
+@gsm_map.on_operation("mo-forward-sm")
+def on_forward(dlg, event):
+    if event.is_peer_turn:
+        if event.is_invoke:
+            seen.append((bytes(event.sm_rp_oa), bytes(event.sm_rp_ui), event.more_messages_to_send))
+            dlg.reply_to(event.invoke_id, gsm_map.mo_forward_sm_res())
+            if event.more_messages_to_send:
+                dlg.send()
+            else:
+                dlg.end()
+        return
+    seen.append((bytes(event.sm_rp_oa), bytes(event.sm_rp_ui), event.more_messages_to_send))
+    assert bytes(event.sm_rp_da) == SC
+    dlg.reply(gsm_map.mo_forward_sm_res())
+    if event.more_messages_to_send:
+        dlg.send()
+    else:
+        dlg.end()
+
+first = node.decode(node.deliver(node.assemble_begin(op="mo-forward-sm", called_gt="15550100", called_ssn=8,
+    calling_gt="15550180", arg=FORWARD_SM_V2), opc=2000, dpc=1000)[0])
+assert first.kind == "continue", first.kind             # held open: more follow
+assert first.result_invoke_id == 1
+second = node.assemble_continue(dtid=first.otid, invoke_id=2,
+    staged=gsm_map.mo_forward_sm(sc_addr="15550100", msisdn="15550101", tpdu=PART_2))
+last = node.decode(node.deliver(second, opc=2000, dpc=1000)[0])
+assert last.kind == "end", last.kind                    # the last part closes it
+assert last.result_invoke_id == 2, last.result_invoke_id
+assert seen == [(MSISDN, PART_1, True), (MSISDN, PART_2, False)], seen
+assert node.open_dialogues() == 0
+
+# The version 3 form has no moreMessagesToSend.
+v3 = node.assemble_begin(op="mo-forward-sm", called_gt="15550100", called_ssn=8, calling_gt="15550180",
+    arg=tlv(0x30, tlv(0x84, SC) + tlv(0x82, MSISDN) + tlv(0x04, PART_2)))
+assert node.decode(node.deliver(v3, opc=2000, dpc=1000)[0]).kind == "end"
+assert seen[-1] == (MSISDN, PART_2, False)
+"#;
+
+#[test]
+fn a_concatenated_message_in_one_dialogue_reaches_the_handler_part_by_part() {
+    let _node = NODE.lock().unwrap_or_else(|e| e.into_inner());
+    Python::attach(|py| {
+        mount(py).expect("mount the addon namespaces");
+        let globals = PyDict::new(py);
+        let code = CString::new(CONTINUED).expect("no NUL");
+        if let Err(err) = py.run(code.as_c_str(), Some(&globals), None) {
+            err.print(py);
+            panic!("the continued-dialogue script failed: {err}");
+        }
+    });
+}
